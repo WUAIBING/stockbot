@@ -1,0 +1,48 @@
+name: Sync DO Repo
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview sync without changing /opt/stockbot.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stockbot-sync-do-repo
+  cancel-in-progress: false
+
+jobs:
+  sync-do-repo:
+    runs-on:
+      - self-hosted
+      - linux
+      - stockbot-do
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Sync checkout to /opt/stockbot
+        shell: bash
+        env:
+          SYNC_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh"
+          "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
+
+      - name: Show synced revision
+        shell: bash
+        run: |
+          echo "GitHub SHA: $GITHUB_SHA"
+          echo "Synced docs:"
+          ls -la /opt/stockbot/docs | head -n 20

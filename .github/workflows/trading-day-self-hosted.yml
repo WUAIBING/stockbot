@@ -42,18 +42,23 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Sync checkout to DO repo
+        shell: bash
+        run: |
+          chmod +x "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh"
+          "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
+
       - name: Prepare runtime environment
         shell: bash
         run: |
-          repo_root="$GITHUB_WORKSPACE"
+          repo_root="/opt/stockbot"
           workbuddy_root="$repo_root/workbuddy"
           skill_root="$workbuddy_root/skills/a-share-analyst"
-          persistent_root="/opt/stockbot"
-          data_dir="$persistent_root/workbuddy/a-share-analyst"
-          pool_dir="$persistent_root/workbuddy_pool"
+          data_dir="$repo_root/workbuddy/a-share-analyst"
+          pool_dir="$repo_root/workbuddy_pool"
           python_exe="${{ vars.TLFZ_PYTHON_EXE }}"
           if [ -z "$python_exe" ]; then
-            python_exe="$persistent_root/.venv/bin/python"
+            python_exe="$repo_root/.venv/bin/python"
           fi
           mkdir -p "$data_dir" "$pool_dir"
           {
@@ -73,7 +78,7 @@ jobs:
       - name: Run full trading-day schedule
         shell: bash
         run: |
-          args=("$GITHUB_WORKSPACE/workbuddy/skills/a-share-analyst/github_actions_trade_day.py")
+          args=("/opt/stockbot/workbuddy/skills/a-share-analyst/github_actions_trade_day.py")
           trade_date="${{ github.event.inputs.trade_date }}"
           start_from_slot="${{ github.event.inputs.start_from_slot }}"
           if [ -n "$trade_date" ]; then
