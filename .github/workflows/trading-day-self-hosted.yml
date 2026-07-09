@@ -92,5 +92,5 @@ jobs:
           name: trading-day-${{ github.run_id }}
           if-no-files-found: warn
           path: |
-            workbuddy/a-share-analyst/automation_status/**
-            workbuddy/a-share-analyst/*latest*.json
+            /opt/stockbot/workbuddy/a-share-analyst/automation_status/**
+            /opt/stockbot/workbuddy/a-share-analyst/*latest*.json
