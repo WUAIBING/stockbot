@@ -1,0 +1,137 @@
+name: Manual Phase Self-Hosted
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Phase to execute through v10_auto_runner.py.
+        required: true
+        default: workbuddy-status
+        type: choice
+        options:
+          - opening-data
+          - workbuddy-refresh
+          - workbuddy-buy
+          - workbuddy-sell
+          - workbuddy-smart-sell
+          - workbuddy-status
+          - prewarm
+          - decision
+          - buy
+          - buy-watch
+          - add-position
+          - smart-sell
+          - sell
+          - status
+          - midday-node
+          - midday-gate
+          - midday-review
+          - close-node
+          - report
+      trigger_slot:
+        description: Logical trigger slot like 14:30 or manual.
+        required: false
+        default: manual
+        type: string
+      task_name:
+        description: Optional task name shown in status logs.
+        required: false
+        default: ''
+        type: string
+      with_email:
+        description: Whether to send phase email if supported.
+        required: true
+        default: false
+        type: boolean
+      max_attempts:
+        description: Watch-mode retry ceiling.
+        required: true
+        default: '12'
+        type: string
+      interval_seconds:
+        description: Watch-mode retry interval in seconds.
+        required: true
+        default: '30'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stockbot-manual-phase
+  cancel-in-progress: false
+
+jobs:
+  run-manual-phase:
+    runs-on:
+      - self-hosted
+      - linux
+      - stockbot-do
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare runtime environment
+        shell: bash
+        run: |
+          repo_root="$GITHUB_WORKSPACE"
+          workbuddy_root="$repo_root/workbuddy"
+          skill_root="$workbuddy_root/skills/a-share-analyst"
+          persistent_root="/opt/stockbot"
+          data_dir="$persistent_root/workbuddy/a-share-analyst"
+          pool_dir="$persistent_root/workbuddy_pool"
+          python_exe="${{ vars.TLFZ_PYTHON_EXE }}"
+          if [ -z "$python_exe" ]; then
+            python_exe="$persistent_root/.venv/bin/python"
+          fi
+          mkdir -p "$data_dir" "$pool_dir"
+          {
+            echo "TLFZ_ARKCLAW_ROOT=$repo_root"
+            echo "TLFZ_WORKBUDDY_ROOT=$workbuddy_root"
+            echo "TLFZ_WORKBUDDY_SKILL_ROOT=$skill_root"
+            echo "TLFZ_WORKBUDDY_DATA_DIR=$data_dir"
+            echo "TLFZ_WORKBUDDY_POOL_DIR=$pool_dir"
+            echo "TLFZ_PYTHON_EXE=$python_exe"
+          } >> "$GITHUB_ENV"
+          "$python_exe" --version
+
+      - name: Run selected phase
+        shell: bash
+        run: |
+          phase="${{ github.event.inputs.phase }}"
+          trigger_slot="${{ github.event.inputs.trigger_slot }}"
+          task_name="${{ github.event.inputs.task_name }}"
+          if [ -z "$trigger_slot" ]; then
+            trigger_slot="manual"
+          fi
+          if [ -z "$task_name" ]; then
+            task_name="GHA-Manual-$phase"
+          fi
+          safe_phase="$(printf '%s' "$phase" | tr -cs '[:alnum:]' '-' | sed 's/^-//; s/-$//' | tr '[:upper:]' '[:lower:]')"
+          run_id="gha-manual-${{ github.run_id }}-$safe_phase"
+          args=(
+            "$GITHUB_WORKSPACE/workbuddy/skills/a-share-analyst/v10_auto_runner.py"
+            --phase "$phase"
+            --task-name "$task_name"
+            --trigger-slot "$trigger_slot"
+            --run-id "$run_id"
+            --max-attempts "${{ github.event.inputs.max_attempts }}"
+            --interval-seconds "${{ github.event.inputs.interval_seconds }}"
+          )
+          if [ "${{ github.event.inputs.with_email }}" = "true" ]; then
+            args+=(--with-email)
+          fi
+          "$TLFZ_PYTHON_EXE" "${args[@]}"
+
+      - name: Upload runtime artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-phase-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            workbuddy/a-share-analyst/automation_status/**
+            workbuddy/a-share-analyst/*latest*.json

@@ -1,0 +1,96 @@
+name: Trading Day Self-Hosted
+
+on:
+  schedule:
+    # 09:25 China Standard Time, Monday-Friday.
+    - cron: '25 1 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      trade_date:
+        description: Optional market trade date (YYYY-MM-DD).
+        required: false
+        default: ''
+        type: string
+      start_from_slot:
+        description: Optional HH:MM slot to skip earlier tasks.
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: Print the resolved plan without executing tasks.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stockbot-trading-day
+  cancel-in-progress: false
+
+jobs:
+  run-trading-day:
+    runs-on:
+      - self-hosted
+      - linux
+      - stockbot-do
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prepare runtime environment
+        shell: bash
+        run: |
+          repo_root="$GITHUB_WORKSPACE"
+          workbuddy_root="$repo_root/workbuddy"
+          skill_root="$workbuddy_root/skills/a-share-analyst"
+          persistent_root="/opt/stockbot"
+          data_dir="$persistent_root/workbuddy/a-share-analyst"
+          pool_dir="$persistent_root/workbuddy_pool"
+          python_exe="${{ vars.TLFZ_PYTHON_EXE }}"
+          if [ -z "$python_exe" ]; then
+            python_exe="$persistent_root/.venv/bin/python"
+          fi
+          mkdir -p "$data_dir" "$pool_dir"
+          {
+            echo "TLFZ_ARKCLAW_ROOT=$repo_root"
+            echo "TLFZ_WORKBUDDY_ROOT=$workbuddy_root"
+            echo "TLFZ_WORKBUDDY_SKILL_ROOT=$skill_root"
+            echo "TLFZ_WORKBUDDY_DATA_DIR=$data_dir"
+            echo "TLFZ_WORKBUDDY_POOL_DIR=$pool_dir"
+            echo "TLFZ_PYTHON_EXE=$python_exe"
+          } >> "$GITHUB_ENV"
+          "$python_exe" --version
+          echo "Repo root: $repo_root"
+          echo "Persistent data dir: $data_dir"
+
+      - name: Run full trading-day schedule
+        shell: bash
+        run: |
+          args=("$GITHUB_WORKSPACE/workbuddy/skills/a-share-analyst/github_actions_trade_day.py")
+          trade_date="${{ github.event.inputs.trade_date }}"
+          start_from_slot="${{ github.event.inputs.start_from_slot }}"
+          if [ -n "$trade_date" ]; then
+            args+=(--trade-date "$trade_date")
+          fi
+          if [ -n "$start_from_slot" ]; then
+            args+=(--start-from-slot "$start_from_slot")
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          "$TLFZ_PYTHON_EXE" "${args[@]}"
+
+      - name: Upload runtime artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-day-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            workbuddy/a-share-analyst/automation_status/**
+            workbuddy/a-share-analyst/*latest*.json
