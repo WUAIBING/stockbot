@@ -1,0 +1,28 @@
+{
+  "version": "workbuddy_evolution_policy_v1",
+  "candidate_pool_size": 20,
+  "rolling_window_days": 20,
+  "tiers": {
+    "prototype": {
+      "top100_hit_rate_min": 0.1,
+      "top30_hit_rate_min": 0.03,
+      "recommended_action": "observe"
+    },
+    "pass": {
+      "top100_hit_rate_min": 0.15,
+      "top30_hit_rate_min": 0.05,
+      "recommended_action": "promote"
+    },
+    "priority": {
+      "top100_hit_rate_min": 0.18,
+      "top30_hit_rate_min": 0.06,
+      "recommended_action": "promote"
+    }
+  },
+  "failure_policy": {
+    "single_window_fail_action": "downgrade",
+    "consecutive_fail_5_days_action": "downgrade",
+    "consecutive_fail_10_days_action": "split_or_restrict",
+    "consecutive_fail_20_days_action": "retire"
+  }
+}

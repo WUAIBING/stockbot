@@ -1,0 +1,5 @@
+numpy>=1.24
+pandas>=2.0
+pytdx>=1.72
+xlrd>=2.0.1
+openpyxl>=3.1

@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime data directories
+/workbuddy/a-share-analyst/*
+!/workbuddy/a-share-analyst/README.md
+/workbuddy_pool/*
+!/workbuddy_pool/README.md
+/workbuddy_distill/artifacts/*
+!/workbuddy_distill/artifacts/README.md
+/workbuddy_distill/raw_top100/*
+!/workbuddy_distill/raw_top100/README.md
+/workbuddy_distill/evaluations/*
+!/workbuddy_distill/evaluations/README.md
+
+# Generated local wrappers and temp outputs
+/workbuddy/skills/a-share-analyst/.workbuddy/
+/workbuddy/skills/a-share-analyst/task_wrappers/*
+!/workbuddy/skills/a-share-analyst/task_wrappers/README.md
+/workbuddy/skills/a-share-analyst/*.log
+/workbuddy/skills/a-share-analyst/*dryrun*.txt
+/workbuddy/skills/a-share-analyst/tmp_*.json
