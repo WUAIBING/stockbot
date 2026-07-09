@@ -22,7 +22,6 @@ fi
 RSYNC_ARGS=(
   -a
   --delete
-  --delete-excluded
   --itemize-changes
   --human-readable
   --exclude=.git/
