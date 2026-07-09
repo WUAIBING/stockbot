@@ -63,6 +63,8 @@ jobs:
             echo "TLFZ_WORKBUDDY_DATA_DIR=$data_dir"
             echo "TLFZ_WORKBUDDY_POOL_DIR=$pool_dir"
             echo "TLFZ_PYTHON_EXE=$python_exe"
+            echo "MX_APIKEY=${{ secrets.MX_APIKEY }}"
+            echo "MX_API_URL=${{ vars.MX_API_URL }}"
           } >> "$GITHUB_ENV"
           "$python_exe" --version
           echo "Repo root: $repo_root"
