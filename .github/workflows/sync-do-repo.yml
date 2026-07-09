@@ -37,8 +37,7 @@ jobs:
         env:
           SYNC_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
         run: |
-          chmod +x "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh"
-          "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
+          bash "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
 
       - name: Show synced revision
         shell: bash

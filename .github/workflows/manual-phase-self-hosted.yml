@@ -77,8 +77,7 @@ jobs:
       - name: Sync checkout to DO repo
         shell: bash
         run: |
-          chmod +x "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh"
-          "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
+          bash "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
 
       - name: Prepare runtime environment
         shell: bash
