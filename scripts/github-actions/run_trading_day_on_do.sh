@@ -7,7 +7,8 @@ SKILL_ROOT="${TLFZ_WORKBUDDY_SKILL_ROOT:-$WORKBUDDY_ROOT/skills/a-share-analyst}
 DATA_DIR="${TLFZ_WORKBUDDY_DATA_DIR:-$REPO_ROOT/workbuddy/a-share-analyst}"
 POOL_DIR="${TLFZ_WORKBUDDY_POOL_DIR:-$REPO_ROOT/workbuddy_pool}"
 PYTHON_EXE="${TLFZ_PYTHON_EXE:-$REPO_ROOT/.venv/bin/python}"
-LOCK_FILE="${TLFZ_TRADING_DAY_LOCK_FILE:-/tmp/stockbot-trading-day.lock}"
+STATUS_DIR="${TLFZ_TRADING_DAY_STATUS_DIR:-$DATA_DIR/automation_status}"
+LOCK_FILE="${TLFZ_TRADING_DAY_LOCK_FILE:-$STATUS_DIR/stockbot-trading-day.lock}"
 SECRET_FILE="${STOCKBOT_MX_APIKEY_FILE:-$REPO_ROOT/.mx_apikey}"
 TRIGGER_SOURCE="${STOCKBOT_TRIGGER_SOURCE:-do-systemd}"
 
@@ -28,7 +29,7 @@ export TLFZ_WORKBUDDY_POOL_DIR="$POOL_DIR"
 export TLFZ_PYTHON_EXE="$PYTHON_EXE"
 export MX_API_URL="${MX_API_URL:-https://mkapi2.dfcfs.com/finskillshub}"
 
-mkdir -p "$DATA_DIR" "$POOL_DIR"
+mkdir -p "$DATA_DIR" "$POOL_DIR" "$STATUS_DIR"
 
 if [[ ! -x "$PYTHON_EXE" ]]; then
   echo "[ERROR] Python executable not found or not executable: $PYTHON_EXE"
