@@ -9,16 +9,47 @@ if [[ -z "$REPO_ROOT" ]]; then
   exit 1
 fi
 
-if [[ -z "$PYTHON_CANDIDATE" ]]; then
-  PYTHON_CANDIDATE="$REPO_ROOT/.venv/bin/python"
+declare -a candidate_specs=()
+if [[ -n "$PYTHON_CANDIDATE" ]]; then
+  candidate_specs+=("$PYTHON_CANDIDATE")
 fi
+candidate_specs+=(
+  "$REPO_ROOT/.venv/bin/python"
+  "python3"
+  "python"
+)
 
-if [[ ! -x "$PYTHON_CANDIDATE" ]]; then
-  echo "[ERROR] Python executable not found or not executable: $PYTHON_CANDIDATE" >&2
-  exit 1
-fi
+declare -a attempted_candidates=()
+declare -a failure_reasons=()
 
-"$PYTHON_CANDIDATE" - <<'PY'
+for candidate_spec in "${candidate_specs[@]}"; do
+  [[ -n "$candidate_spec" ]] || continue
+
+  resolved_candidate=""
+  if [[ "$candidate_spec" == */* || "$candidate_spec" == *\\* ]]; then
+    if [[ -x "$candidate_spec" ]]; then
+      resolved_candidate="$candidate_spec"
+    else
+      attempted_candidates+=("$candidate_spec")
+      failure_reasons+=("[missing] $candidate_spec")
+      continue
+    fi
+  else
+    if command -v "$candidate_spec" >/dev/null 2>&1; then
+      resolved_candidate="$(command -v "$candidate_spec")"
+    else
+      attempted_candidates+=("$candidate_spec")
+      failure_reasons+=("[missing] $candidate_spec")
+      continue
+    fi
+  fi
+
+  if [[ " ${attempted_candidates[*]} " == *" $resolved_candidate "* ]]; then
+    continue
+  fi
+  attempted_candidates+=("$resolved_candidate")
+
+  if resolved_path="$("$resolved_candidate" - <<'PY'
 import importlib
 import sys
 
@@ -38,3 +69,25 @@ if missing:
 
 print(sys.executable)
 PY
+  )"; then
+    printf '%s\n' "$resolved_path"
+    exit 0
+  fi
+
+  failure_reasons+=("[invalid] $resolved_candidate")
+done
+
+echo "[ERROR] No usable Python runtime found for stockbot workflows." >&2
+if [[ ${#attempted_candidates[@]} -gt 0 ]]; then
+  echo "[ERROR] Attempted candidates:" >&2
+  for candidate in "${attempted_candidates[@]}"; do
+    echo "  - $candidate" >&2
+  done
+fi
+if [[ ${#failure_reasons[@]} -gt 0 ]]; then
+  echo "[ERROR] Candidate failures:" >&2
+  for reason in "${failure_reasons[@]}"; do
+    echo "  - $reason" >&2
+  done
+fi
+exit 1
