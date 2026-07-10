@@ -104,6 +104,44 @@ def _debug_emit_event(hypothesis_id: str, location: str, msg: str, data: dict) -
 _configure_stdio()
 
 
+# #region debug-point B:main-strategy-chain-helper
+def _main_strategy_chain_emit(hypothesis_id: str, location: str, msg: str, data: dict) -> None:
+    env_path = Path(__file__).resolve().parent / '.dbg' / 'main-strategy-chain.env'
+    url = 'http://127.0.0.1:7777/event'
+    session_id = 'main-strategy-chain'
+    try:
+        if env_path.exists():
+            content = env_path.read_text(encoding='utf-8', errors='replace')
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if line.startswith('DEBUG_SERVER_URL='):
+                    url = line.split('=', 1)[1].strip() or url
+                elif line.startswith('DEBUG_SESSION_ID='):
+                    session_id = line.split('=', 1)[1].strip() or session_id
+    except Exception:
+        pass
+    payload = {
+        'sessionId': session_id,
+        'runId': os.environ.get('TRAE_DEBUG_RUN_ID', 'pre-fix'),
+        'hypothesisId': hypothesis_id,
+        'location': location,
+        'msg': msg,
+        'data': data,
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+            ),
+            timeout=0.8,
+        ).read()
+    except Exception:
+        pass
+# #endregion
+
+
 # #region debug-point A:midday-review-debug-helper
 def _midday_review_debug_emit(hypothesis_id, msg, **data):
     _env_path = Path(__file__).resolve().parent / '.dbg' / 'midday-review-stale.env'
@@ -5027,6 +5065,14 @@ def _review_issue(category, severity, code, summary, *, action='', blocks_buy=Fa
 
 
 def _collect_reconcile_context():
+    # #region debug-point C:close-node-context-start
+    _main_strategy_chain_emit(
+        'C',
+        'v10_moni_trader.py:_collect_reconcile_context',
+        '[DEBUG] collect reconcile context start',
+        {},
+    )
+    # #endregion
     balance = get_balance()
     positions = get_positions()
     records = load_track_record()
@@ -5038,6 +5084,22 @@ def _collect_reconcile_context():
     if changed:
         save_track_record(records)
     pending_summary = reconcile_summary.get('pending') or summarize_pending_orders(pending_items)
+    # #region debug-point C:close-node-context-done
+    _main_strategy_chain_emit(
+        'C',
+        'v10_moni_trader.py:_collect_reconcile_context',
+        '[DEBUG] collect reconcile context done',
+        {
+            'balance_keys': sorted(list((balance or {}).keys()))[:12],
+            'positions_count': len(positions or []),
+            'records_count': len(records or []),
+            'orders_count': len(orders or []),
+            'changed': bool(changed),
+            'pending_active_buy_count': len((pending_summary or {}).get('active_buy_codes', []) or []),
+            'pending_active_sell_count': len((pending_summary or {}).get('active_sell_codes', []) or []),
+        },
+    )
+    # #endregion
     # #region debug-point B:midday-review-context
     _midday_review_debug_emit(
         'B',
@@ -7423,6 +7485,27 @@ def _resolve_learning_preflight_guard(*, trade_date='', use_previous_close_for_i
     }
 
 
+def _as_report_only_learning_preflight(payload=None):
+    payload = payload if isinstance(payload, dict) else {}
+    normalized = dict(payload)
+    normalized['reported_allow_buy'] = bool(payload.get('allow_buy', False))
+    normalized['reported_allow_add_position'] = bool(payload.get('allow_add_position', False))
+    normalized['reported_allow_aggressive_add'] = bool(payload.get('allow_aggressive_add', False))
+    normalized['allow_buy'] = True
+    normalized['allow_add_position'] = True
+    normalized['allow_aggressive_add'] = True
+    normalized['report_only'] = True
+    notes = list(normalized.get('notes', []) or [])
+    if (
+        (not normalized['reported_allow_buy'])
+        or (not normalized['reported_allow_add_position'])
+        or (not normalized['reported_allow_aggressive_add'])
+    ):
+        notes.append('当前配置: learning gate 仅汇报，不再阻断买入、加仓或激进加仓。')
+    normalized['notes'] = notes
+    return normalized
+
+
 def _load_learning_actions():
     payload = _read_json(LEARNING_ACTIONS_FILE)
     return payload if isinstance(payload, dict) else {}
@@ -8588,28 +8671,29 @@ def do_buy(dry_run=False):
     mode_capital_profile = _build_mode_capital_profile(records)
     learning_actions = _load_learning_actions()
     blocked_t3_modes = _blocked_t3_modes_from_learning_actions(learning_actions)
-    learning_preflight = _resolve_learning_preflight_guard()
+    learning_preflight = _as_report_only_learning_preflight(_resolve_learning_preflight_guard())
     print(
-        f" 收盘学习闸门: {learning_preflight['status']} "
-        f"| buy={'pass' if learning_preflight.get('allow_buy') else 'block'} "
-        f"| aggressive_add={'pass' if learning_preflight.get('allow_aggressive_add') else 'hold'}"
+        f" 收盘学习闸门(汇报): {learning_preflight['status']} "
+        f"| report_buy={'pass' if learning_preflight.get('reported_allow_buy') else 'block'} "
+        f"| report_aggressive_add={'pass' if learning_preflight.get('reported_allow_aggressive_add') else 'hold'} "
+        f"| effective_buy=pass"
     )
     for note in learning_preflight.get('notes', []):
         print(f"  - {note}")
-    if not learning_preflight.get('allow_buy', False):
+    if not learning_preflight.get('reported_allow_buy', False):
         #region debug-point E:buywatch-1450-fail-learning-gate
         _debug_emit_event(
             'B',
             'v10_moni_trader.py:do_buy',
-            '[DEBUG] learning gate blocked buy',
+            '[DEBUG] learning gate downgraded to report-only for buy',
             {
                 'reason': str(learning_preflight.get('reason', 'learning_gate_block')),
+                'reported_allow_buy': bool(learning_preflight.get('reported_allow_buy', False)),
                 'notes': list(learning_preflight.get('notes', []) or []),
             },
         )
         #endregion
-        print(f" 收盘学习闸门未放行，取消新开仓: {learning_preflight.get('reason', 'learning_gate_block')}")
-        return EXIT_NO_ACTION
+        print(f" 收盘学习闸门报告为未放行，但当前配置不阻断新开仓: {learning_preflight.get('reason', 'learning_gate_block')}")
     market_regime = _normalize_market_regime(model_market.get('regime', ''))
     pm_buy_guard = _build_pm_buy_guardrails()
     print(
@@ -9980,17 +10064,17 @@ def do_add_position(dry_run=False):
     mode_capital_profile = _build_mode_capital_profile(records)
     learning_actions = _load_learning_actions()
     blocked_t3_modes = _blocked_t3_modes_from_learning_actions(learning_actions)
-    learning_preflight = _resolve_learning_preflight_guard()
+    learning_preflight = _as_report_only_learning_preflight(_resolve_learning_preflight_guard())
     print(
-        f" 收盘学习闸门: {learning_preflight['status']} "
-        f"| add={'pass' if learning_preflight.get('allow_add_position') else 'block'} "
-        f"| aggressive_add={'pass' if learning_preflight.get('allow_aggressive_add') else 'hold'}"
+        f" 收盘学习闸门(汇报): {learning_preflight['status']} "
+        f"| report_add={'pass' if learning_preflight.get('reported_allow_add_position') else 'block'} "
+        f"| report_aggressive_add={'pass' if learning_preflight.get('reported_allow_aggressive_add') else 'hold'} "
+        f"| effective_add=pass"
     )
     for note in learning_preflight.get('notes', []):
         print(f"  - {note}")
-    if not learning_preflight.get('allow_add_position', False):
-        print(f" 收盘学习闸门未放行，取消加仓: {learning_preflight.get('reason', 'learning_gate_block')}")
-        return EXIT_NO_ACTION
+    if not learning_preflight.get('reported_allow_add_position', False):
+        print(f" 收盘学习闸门报告为未放行，但当前配置不阻断加仓: {learning_preflight.get('reason', 'learning_gate_block')}")
     decision_reference = _build_selected_decision_reference(_read_jsonl(MODEL_DECISIONS_FILE, limit=5000))
     pos_map = _active_position_map(positions)
     pending_summary = summarize_pending_orders(pending_items)
@@ -10619,72 +10703,115 @@ def do_add_position(dry_run=False):
 
 def do_close_node():
     """收盘节点：全天复核复盘 + 学习放行。"""
-    context = _collect_reconcile_context()
-    summary = write_account_artifacts(
-        'report',
-        balance=context['balance'],
-        positions=context['positions'],
-        records=context['records'],
+    stage = 'start'
+    # #region debug-point D:close-node-start
+    _main_strategy_chain_emit(
+        'C',
+        'v10_moni_trader.py:do_close_node',
+        '[DEBUG] close-node started',
+        {'stage': stage},
     )
-    summary['full_reconcile'] = context['reconcile_summary']
-    _write_json_atomic(SUMMARY_FILE, summary)
-    daily_evolution_bundle = _build_daily_evolution_bundle(
-        summary=summary,
-        records=context['records'],
-        trade_date=datetime.now().strftime('%Y-%m-%d'),
-    )
-    daily_evolution_bundle = _attach_intraday_judgment_review(
-        daily_evolution_bundle,
-        summary=summary,
-        records=context['records'],
-        positions=context['positions'],
-    )
-    daily_evolution_bundle = _attach_regime_execution_review(
-        daily_evolution_bundle,
-        summary=summary,
-    )
-    _append_regime_execution_history(
-        daily_evolution_bundle.get('regime_execution_review', {}),
-        source='close_node',
-    )
-    learning_actions = _build_learning_actions(
-        daily_evolution_bundle,
-        trade_date=datetime.now().strftime('%Y-%m-%d'),
-    )
-    daily_evolution_bundle['learning_actions_summary'] = learning_actions.get('summary', {})
-    _write_json_atomic(DAILY_EVOLUTION_BUNDLE_FILE, daily_evolution_bundle)
-    close_payload = _build_close_node_payload(
-        summary=summary,
-        reconcile_summary=context['reconcile_summary'],
-        daily_evolution_bundle=daily_evolution_bundle,
-    )
-    close_payload['learning_actions_summary'] = learning_actions.get('summary', {})
-    close_payload['learning_gate_basis']['regime_positive_sample_count'] = _inum(
-        learning_actions.get('summary', {}).get('regime_positive_sample_count', 0),
-        0,
-    )
-    close_payload['learning_gate_basis']['regime_bias_stage'] = str(
-        learning_actions.get('summary', {}).get('regime_bias_stage', '')
-    ).strip()
-    close_payload['files'] = {
-        'daily_evolution_bundle_file': DAILY_EVOLUTION_BUNDLE_FILE,
-        'engineering_review_file': ENGINEERING_REVIEW_FILE,
-        'trade_episode_history_file': TRADE_EPISODE_HISTORY_FILE,
-        'learning_actions_file': LEARNING_ACTIONS_FILE,
-        'regime_execution_history_file': REGIME_EXECUTION_HISTORY_FILE,
-    }
-    _write_json_atomic(TRADE_EPISODE_HISTORY_FILE, {
-        'generated_at': _now_str(),
-        'trade_date': datetime.now().strftime('%Y-%m-%d'),
-        'summary': daily_evolution_bundle.get('history_summary', {}),
-        'episodes': daily_evolution_bundle.get('trade_episode_history', []),
-    })
-    _write_json_atomic(LEARNING_ACTIONS_FILE, learning_actions)
-    _write_json_atomic(CLOSE_NODE_FILE, close_payload)
-    _write_json_atomic(ENGINEERING_REVIEW_FILE, close_payload.get('engineering_review', {}))
-    _write_json_atomic(LEARNING_GATE_FILE, _build_learning_gate_payload(close_payload))
-    print(json.dumps(close_payload, ensure_ascii=False, indent=2))
-    return EXIT_OK
+    # #endregion
+    try:
+        stage = 'collect_context'
+        context = _collect_reconcile_context()
+        stage = 'write_account_artifacts'
+        summary = write_account_artifacts(
+            'report',
+            balance=context['balance'],
+            positions=context['positions'],
+            records=context['records'],
+        )
+        summary['full_reconcile'] = context['reconcile_summary']
+        _write_json_atomic(SUMMARY_FILE, summary)
+        stage = 'build_daily_evolution_bundle'
+        daily_evolution_bundle = _build_daily_evolution_bundle(
+            summary=summary,
+            records=context['records'],
+            trade_date=datetime.now().strftime('%Y-%m-%d'),
+        )
+        stage = 'attach_intraday_judgment_review'
+        daily_evolution_bundle = _attach_intraday_judgment_review(
+            daily_evolution_bundle,
+            summary=summary,
+            records=context['records'],
+            positions=context['positions'],
+        )
+        stage = 'attach_regime_execution_review'
+        daily_evolution_bundle = _attach_regime_execution_review(
+            daily_evolution_bundle,
+            summary=summary,
+        )
+        _append_regime_execution_history(
+            daily_evolution_bundle.get('regime_execution_review', {}),
+            source='close_node',
+        )
+        stage = 'build_learning_actions'
+        learning_actions = _build_learning_actions(
+            daily_evolution_bundle,
+            trade_date=datetime.now().strftime('%Y-%m-%d'),
+        )
+        daily_evolution_bundle['learning_actions_summary'] = learning_actions.get('summary', {})
+        _write_json_atomic(DAILY_EVOLUTION_BUNDLE_FILE, daily_evolution_bundle)
+        stage = 'build_close_payload'
+        close_payload = _build_close_node_payload(
+            summary=summary,
+            reconcile_summary=context['reconcile_summary'],
+            daily_evolution_bundle=daily_evolution_bundle,
+        )
+        close_payload['learning_actions_summary'] = learning_actions.get('summary', {})
+        close_payload['learning_gate_basis']['regime_positive_sample_count'] = _inum(
+            learning_actions.get('summary', {}).get('regime_positive_sample_count', 0),
+            0,
+        )
+        close_payload['learning_gate_basis']['regime_bias_stage'] = str(
+            learning_actions.get('summary', {}).get('regime_bias_stage', '')
+        ).strip()
+        close_payload['files'] = {
+            'daily_evolution_bundle_file': DAILY_EVOLUTION_BUNDLE_FILE,
+            'engineering_review_file': ENGINEERING_REVIEW_FILE,
+            'trade_episode_history_file': TRADE_EPISODE_HISTORY_FILE,
+            'learning_actions_file': LEARNING_ACTIONS_FILE,
+            'regime_execution_history_file': REGIME_EXECUTION_HISTORY_FILE,
+        }
+        _write_json_atomic(TRADE_EPISODE_HISTORY_FILE, {
+            'generated_at': _now_str(),
+            'trade_date': datetime.now().strftime('%Y-%m-%d'),
+            'summary': daily_evolution_bundle.get('history_summary', {}),
+            'episodes': daily_evolution_bundle.get('trade_episode_history', []),
+        })
+        _write_json_atomic(LEARNING_ACTIONS_FILE, learning_actions)
+        _write_json_atomic(CLOSE_NODE_FILE, close_payload)
+        _write_json_atomic(ENGINEERING_REVIEW_FILE, close_payload.get('engineering_review', {}))
+        _write_json_atomic(LEARNING_GATE_FILE, _build_learning_gate_payload(close_payload))
+        # #region debug-point D:close-node-success
+        _main_strategy_chain_emit(
+            'D',
+            'v10_moni_trader.py:do_close_node',
+            '[DEBUG] close-node finished',
+            {
+                'stage': stage,
+                'holding_count': _inum(((summary.get('performance') or {}).get('holding_count', 0)), 0),
+                'closed_count': _inum(((summary.get('performance') or {}).get('closed_count', 0)), 0),
+            },
+        )
+        # #endregion
+        print(json.dumps(close_payload, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    except Exception as exc:
+        # #region debug-point D:close-node-failed
+        _main_strategy_chain_emit(
+            'D',
+            'v10_moni_trader.py:do_close_node',
+            '[DEBUG] close-node failed',
+            {
+                'stage': stage,
+                'exc_type': type(exc).__name__,
+                'exc_text': repr(exc),
+            },
+        )
+        # #endregion
+        raise
 
 
 def do_midday_node():

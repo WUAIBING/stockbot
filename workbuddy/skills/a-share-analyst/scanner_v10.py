@@ -14,6 +14,8 @@ import sys
 import io
 import time
 import json
+import argparse
+import urllib.request
 import warnings
 from pathlib import Path
 from datetime import datetime
@@ -34,6 +36,44 @@ if sys.platform == "win32":
 CONS_FILE = CSI1000_SKILLS_DIR / "000852cons.xls"
 OUTPUT_DIR = DATA_DIR
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# #region debug-point A:main-strategy-chain-helper
+_DEBUG_ENV_FILE = Path(__file__).resolve().parent / ".dbg" / "main-strategy-chain.env"
+
+
+def _main_strategy_debug_emit(hypothesis_id: str, location: str, msg: str, data: dict) -> None:
+    url = "http://127.0.0.1:7777/event"
+    session_id = "main-strategy-chain"
+    try:
+        content = _DEBUG_ENV_FILE.read_text(encoding="utf-8")
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if line.startswith("DEBUG_SERVER_URL="):
+                url = line.split("=", 1)[1].strip() or url
+            elif line.startswith("DEBUG_SESSION_ID="):
+                session_id = line.split("=", 1)[1].strip() or session_id
+    except Exception:
+        pass
+    payload = {
+        "sessionId": session_id,
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": msg,
+        "data": data,
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.8,
+        ).read()
+    except Exception:
+        pass
+# #endregion
 
 TDX_HOSTS = [
     ("218.75.126.9", 7709),
@@ -85,6 +125,14 @@ def connect_tdx():
             api = TdxHq_API(heartbeat=True)
             try:
                 if api.connect(host, port, time_out=3.0):
+                    # #region debug-point A:scanner-connect-ok
+                    _main_strategy_debug_emit(
+                        "A",
+                        "scanner_v10.py:connect_tdx",
+                        "[DEBUG] scanner connected to tdx",
+                        {"host": host, "port": port},
+                    )
+                    # #endregion
                     return api
             except Exception:
                 pass
@@ -258,157 +306,20 @@ def classify_signal(bz_dir, bz_rt, weekly_align, weekly_slope, ma20_off,
     return (0, "no_signal", 0.0, "")
 
 
-def main():
-    print("=" * 70)
-    print("V10 Scanner: Multi-Tier + Multi-Mode Real-Time Scanner")
-    print("Philosophy: 大肉小肉都是肉 — every day is a trading day")
-    print("=" * 70)
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"Run time: {run_time}\n")
+def _to_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
-    stocks = get_stock_list()
-    api = connect_tdx()
-    print(f"CSI1000: {len(stocks)} stocks, pytdx connected\n")
 
-    # ── Phase 1: Dynamic amount filter ──
-    # 核心原则：牛市多撒网（量比质），熊市只打最确定的（质比量）
-    print("Phase 1: Dynamic amount filter (市场冷热自适应)...")
-    amt_list = []
-    for _, row in stocks.iterrows():
-        bars = api.get_security_bars(9, row["market"], row["code"], 0, 3)
-        if bars:
-            try:
-                df = api.to_df(bars)
-                if df is not None and not df.empty:
-                    amt_list.append({
-                        "code": row["code"], "name": row["name"],
-                        "market": row["market"],
-                        "latest_amt": df.iloc[-1]["amount"],
-                        "last_close": df.iloc[-1]["close"],
-                    })
-            except Exception:
-                pass
+def _to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    # ── 动态判定市场冷热 ──
-    # 方法：看中证1000总成交额（amount单位是元）
-    total_amt_yuan = sum(r['latest_amt'] for r in amt_list)
-    total_amt_yi = total_amt_yuan / 1e8  # 元→亿元
-    if total_amt_yi > SCAN_CONFIG['hot_market_total_yi']:
-        market_regime = '活跃市'
-        amount_threshold = SCAN_CONFIG['hot_market_amount_yuan']
-    elif total_amt_yi < SCAN_CONFIG['cold_market_total_yi']:
-        market_regime = '清淡市'
-        amount_threshold = SCAN_CONFIG['cold_market_amount_yuan']
-    else:
-        market_regime = '正常市'
-        amount_threshold = SCAN_CONFIG['min_amount_yuan']
 
-    print(f"  中证1000总成交额: {total_amt_yi:.0f}亿 | 市场状态: {market_regime}")
-    print(f"  个股成交额阈值: {amount_threshold/1e8:.1f}亿")
-
-    # ── 双重筛选：阈值 + 上限/下限 ──
-    # 先按阈值筛选
-    filtered = [r for r in amt_list if r['latest_amt'] >= amount_threshold]
-    filtered.sort(key=lambda x: x['latest_amt'], reverse=True)
-
-    # 应用上下限
-    if len(filtered) > SCAN_CONFIG['max_stocks']:
-        filtered = filtered[:SCAN_CONFIG['max_stocks']]
-    elif len(filtered) < SCAN_CONFIG['min_stocks']:
-        # 清淡市但达标股不够，放宽到Top min_stocks
-        all_sorted = sorted(amt_list, key=lambda x: x['latest_amt'], reverse=True)
-        filtered = all_sorted[:SCAN_CONFIG['min_stocks']]
-
-    amt_df = pd.DataFrame(filtered)
-    print(f"  -> 扫描{len(amt_df)}只 (阈值>={amount_threshold/1e8:.1f}亿, 范围{SCAN_CONFIG['min_stocks']}-{SCAN_CONFIG['max_stocks']})\n")
-
-    # ── Phase 2: Compute features for each stock ──
-    print("Phase 2: Compute daily + weekly + 5min features...")
-    results = []
-
-    for i, (_, row) in enumerate(amt_df.iterrows()):
-        code = row["code"]
-        name = row["name"]
-        market = row["market"]
-        last_close = row["last_close"]
-
-        # Daily bars
-        daily = fetch_daily_bars(api, market, code, count=250)
-        if daily is None or len(daily) < 60:
-            continue
-
-        # Compute daily features
-        d = daily.copy()
-        for w in [5, 10, 20, 60]:
-            d[f"ma{w}"] = d["close"].rolling(w).mean()
-        d["avg_amt_5d"] = d["amount"].rolling(5).mean()
-        d["amt_ratio"] = d["amount"] / d["avg_amt_5d"]
-        d["close_vs_ma20"] = (d["close"] - d["ma20"]) / d["ma20"] * 100
-
-        # RSI
-        delta = d["close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        d["rsi14"] = 100 - (100 / (1 + rs))
-
-        last = d.iloc[-1]
-        if pd.isna(last.get("ma20")) or pd.isna(last.get("amt_ratio")):
-            continue
-
-        ma20_off = last["close_vs_ma20"] if pd.notna(last["close_vs_ma20"]) else 0.0
-        amt_r = last["amt_ratio"] if pd.notna(last["amt_ratio"]) else 1.0
-        vol_exp = bool(1.3 <= amt_r <= 2.5)
-        rsi = last["rsi14"] if pd.notna(last["rsi14"]) else 50.0
-        is_green = last["close"] > last["open"]
-
-        # Weekly features
-        weekly = fetch_weekly_bars(api, market, code, count=100)
-        wfeats = compute_weekly_features(weekly)
-        weekly_align = wfeats.get("weekly_align", False)
-        weekly_slope = wfeats.get("weekly_slope", 0.0)
-
-        # 5-min features
-        min5 = fetch_5min_bars_today(api, market, code)
-        m5feats = compute_5min_signal(min5)
-        bz_dir = m5feats.get("bz_direction", np.nan)
-        bz_rt = m5feats.get("bz_rt_direction", np.nan)
-        bz_vol_r = m5feats.get("bz_vol_ratio", np.nan)
-
-        # Classify signal
-        tier, mode, position, desc = classify_signal(
-            bz_dir, bz_rt, weekly_align, weekly_slope, ma20_off,
-            vol_exp, rsi, is_green, amt_r
-        )
-
-        results.append({
-            "code": code,
-            "name": name,
-            "close": last_close,
-            "entry_price": last_close,  # explicit entry price
-            "tier": tier,
-            "mode": mode,
-            "position": position,
-            "signal_desc": desc,
-            "bz_direction": bz_dir,
-            "bz_rt_direction": bz_rt,
-            "weekly_align": weekly_align,
-            "weekly_slope": weekly_slope,
-            "close_vs_ma20_pct": ma20_off,
-            "amt_ratio": amt_r,
-            "rsi14": rsi,
-            "is_green": is_green,
-            "vol_expand": vol_exp,
-        })
-
-        if (i + 1) % 50 == 0:
-            print(f"  Processed {i+1}/{len(amt_df)}")
-
-    api.disconnect()
-    print(f"  -> Total: {len(results)} stocks scanned\n")
-
-    # ── Phase 3: Output results ──
-    df = pd.DataFrame(results)
+def _write_outputs(*, df, run_time, total_amt_yi, market_regime, amount_threshold, scanned_count):
     df_sig = df[df["tier"] > 0].copy()
 
     run_slot = datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -418,20 +329,18 @@ def main():
     snapshot_scan_meta = OUTPUT_DIR / f"v10_scan_meta.{run_slot}.json"
     latest_scan_pointer = OUTPUT_DIR / "v10_scan_latest.json"
 
-    # Save full scan: keep both rolling latest file and immutable timestamped snapshot.
     df.to_csv(latest_scan_csv, index=False, encoding="utf-8-sig")
     df.to_csv(snapshot_scan_csv, index=False, encoding="utf-8-sig")
 
-    # Save scan metadata (for downstream tools: watchdog, email, moni_trader)
     scan_meta = {
         'run_time': run_time,
         'run_slot': run_slot,
         'total_csi1000_amt_yi': round(total_amt_yi, 0),
         'market_regime': market_regime,
         'amount_threshold_yi': round(amount_threshold / 1e8, 1),
-        'stocks_scanned': len(amt_df),
+        'stocks_scanned': scanned_count,
         'stocks_with_signal': len(df_sig),
-        'signals_by_tier': {f'T{t}': len(df_sig[df_sig['tier']==t]) for t in [1,2,3]},
+        'signals_by_tier': {f'T{t}': len(df_sig[df_sig['tier'] == t]) for t in [1, 2, 3]},
         'latest_scan_csv': str(latest_scan_csv),
         'snapshot_scan_csv': str(snapshot_scan_csv),
         'latest_scan_meta': str(latest_scan_meta),
@@ -451,12 +360,9 @@ def main():
         },
     )
 
-    # ── Print tiered results ──
     print("=" * 70)
     print("SCAN RESULTS")
     print("=" * 70)
-
-    # Stats
     for tier in [1, 2, 3]:
         t = df_sig[df_sig["tier"] == tier]
         if len(t) == 0:
@@ -471,7 +377,6 @@ def main():
             print(f"  {r['code']:<8s} {r['name']:<10s} {r['entry_price']:>8.2f} {r['position']:>5.0%} "
                   f"{r['mode']:<25s} {bz_s:>8s} {r['weekly_slope']:>6.1f}% {r['close_vs_ma20_pct']:>+6.1f}%")
 
-    # ── Top 5 Picks ──
     print("\n" + "=" * 70)
     print("TOP 5 PICKS (by tier then weekly_slope)")
     print("=" * 70)
@@ -489,7 +394,6 @@ def main():
     else:
         print("  No signals today!")
 
-    # ── Execution Plan ──
     print("\n" + "=" * 70)
     print("EXECUTION PLAN")
     print("=" * 70)
@@ -499,7 +403,6 @@ def main():
     print("  14:55  EXECUTE: market buy or current price +1-2 tick limit")
     print("  Note:   Use entry_price as reference, actual fill may differ by ~0.2%")
 
-    # ── Summary ──
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
@@ -512,7 +415,6 @@ def main():
     print(f"  Tier 3 (小肉 30%pos): {n_t3}")
     print(f"  Total signals: {n_t1 + n_t2 + n_t3}")
 
-    # Mode counts
     if len(df_sig) > 0:
         print(f"\n  By mode:")
         for mode in df_sig["mode"].unique():
@@ -522,6 +424,262 @@ def main():
 
     print(f"\n  Full data saved: {OUTPUT_DIR / 'v10_scan_full.csv'}")
     print("=" * 70)
+
+
+def _run_decision_fast(api, *, run_time):
+    latest_scan_csv = OUTPUT_DIR / "v10_scan_full.csv"
+    if not latest_scan_csv.exists():
+        raise RuntimeError(f"missing prewarm scan file: {latest_scan_csv}")
+    df = pd.read_csv(latest_scan_csv, encoding="utf-8-sig")
+    if "market" not in df.columns:
+        market_df = get_stock_list()[["code", "market"]].copy()
+        market_df["code"] = market_df["code"].map(normalize_code)
+        df["code"] = df["code"].map(normalize_code)
+        df = df.merge(market_df, on="code", how="left")
+    refreshed_rows = []
+    total = len(df)
+    for idx, row in enumerate(df.to_dict(orient="records")):
+        code = normalize_code(row.get("code", ""))
+        market = int(_to_float(row.get("market", 1), 1))
+        min5 = fetch_5min_bars_today(api, market, code)
+        m5feats = compute_5min_signal(min5)
+        bz_dir = m5feats.get("bz_direction", np.nan)
+        bz_rt = m5feats.get("bz_rt_direction", np.nan)
+        bz_vol_r = m5feats.get("bz_vol_ratio", np.nan)
+        tier, mode, position, desc = classify_signal(
+            bz_dir,
+            bz_rt,
+            _to_bool(row.get("weekly_align", False)),
+            _to_float(row.get("weekly_slope", 0.0), 0.0),
+            _to_float(row.get("close_vs_ma20_pct", 0.0), 0.0),
+            _to_bool(row.get("vol_expand", False)),
+            _to_float(row.get("rsi14", 50.0), 50.0),
+            _to_bool(row.get("is_green", False)),
+            _to_float(row.get("amt_ratio", 1.0), 1.0),
+        )
+        row["tier"] = tier
+        row["mode"] = mode
+        row["position"] = position
+        row["signal_desc"] = desc
+        row["bz_direction"] = bz_dir
+        row["bz_rt_direction"] = bz_rt
+        row["bz_vol_ratio"] = bz_vol_r
+        refreshed_rows.append(row)
+        if (idx + 1) % 100 == 0:
+            # #region debug-point C:scanner-decision-refresh-progress
+            _main_strategy_debug_emit(
+                "B",
+                "scanner_v10.py:_run_decision_fast",
+                "[DEBUG] scanner decision refresh progress",
+                {"processed": idx + 1, "total_to_scan": total, "last_code": code},
+            )
+            # #endregion
+    refreshed = pd.DataFrame(refreshed_rows)
+    # #region debug-point B:scanner-decision-refresh-done
+    _main_strategy_debug_emit(
+        "B",
+        "scanner_v10.py:_run_decision_fast",
+        "[DEBUG] scanner decision refresh completed",
+        {
+            "row_count": len(refreshed),
+            "signal_count": int((refreshed["tier"].fillna(0) > 0).sum()) if not refreshed.empty else 0,
+        },
+    )
+    # #endregion
+    _write_outputs(
+        df=refreshed,
+        run_time=run_time,
+        total_amt_yi=_to_float((OUTPUT_DIR / "v10_scan_meta.json").exists() and json.loads((OUTPUT_DIR / "v10_scan_meta.json").read_text(encoding="utf-8")).get("total_csi1000_amt_yi", 0.0), 0.0),
+        market_regime=str(json.loads((OUTPUT_DIR / "v10_scan_meta.json").read_text(encoding="utf-8")).get("market_regime", "cached")) if (OUTPUT_DIR / "v10_scan_meta.json").exists() else "cached",
+        amount_threshold=_to_float(json.loads((OUTPUT_DIR / "v10_scan_meta.json").read_text(encoding="utf-8")).get("amount_threshold_yi", 0.0), 0.0) * 1e8 if (OUTPUT_DIR / "v10_scan_meta.json").exists() else 0.0,
+        scanned_count=len(refreshed),
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="V10 scanner")
+    parser.add_argument("--decision-fast", action="store_true", help="reuse latest scan and refresh 5-min tail only")
+    args = parser.parse_args()
+    # #region debug-point A:scanner-main-start
+    _main_strategy_debug_emit(
+        "A",
+        "scanner_v10.py:main",
+        "[DEBUG] scanner main started",
+        {"started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "decision_fast": bool(args.decision_fast)},
+    )
+    # #endregion
+    print("=" * 70)
+    print("V10 Scanner: Multi-Tier + Multi-Mode Real-Time Scanner")
+    print("Philosophy: 大肉小肉都是肉 — every day is a trading day")
+    print("=" * 70)
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"Run time: {run_time}\n")
+    api = connect_tdx()
+    try:
+        if args.decision_fast:
+            print("Decision fast mode: reuse latest prewarm scan and refresh 5-min tail only...")
+            _run_decision_fast(api, run_time=run_time)
+            return
+
+        stocks = get_stock_list()
+        print(f"CSI1000: {len(stocks)} stocks, pytdx connected\n")
+        print("Phase 1: Dynamic amount filter (市场冷热自适应)...")
+        amt_list = []
+        for _, row in stocks.iterrows():
+            bars = api.get_security_bars(9, row["market"], row["code"], 0, 3)
+            if bars:
+                try:
+                    df = api.to_df(bars)
+                    if df is not None and not df.empty:
+                        amt_list.append({
+                            "code": row["code"], "name": row["name"],
+                            "market": row["market"],
+                            "latest_amt": df.iloc[-1]["amount"],
+                            "last_close": df.iloc[-1]["close"],
+                        })
+                except Exception:
+                    pass
+
+        total_amt_yuan = sum(r['latest_amt'] for r in amt_list)
+        total_amt_yi = total_amt_yuan / 1e8
+        if total_amt_yi > SCAN_CONFIG['hot_market_total_yi']:
+            market_regime = '活跃市'
+            amount_threshold = SCAN_CONFIG['hot_market_amount_yuan']
+        elif total_amt_yi < SCAN_CONFIG['cold_market_total_yi']:
+            market_regime = '清淡市'
+            amount_threshold = SCAN_CONFIG['cold_market_amount_yuan']
+        else:
+            market_regime = '正常市'
+            amount_threshold = SCAN_CONFIG['min_amount_yuan']
+
+        print(f"  中证1000总成交额: {total_amt_yi:.0f}亿 | 市场状态: {market_regime}")
+        print(f"  个股成交额阈值: {amount_threshold/1e8:.1f}亿")
+        filtered = [r for r in amt_list if r['latest_amt'] >= amount_threshold]
+        filtered.sort(key=lambda x: x['latest_amt'], reverse=True)
+        if len(filtered) > SCAN_CONFIG['max_stocks']:
+            filtered = filtered[:SCAN_CONFIG['max_stocks']]
+        elif len(filtered) < SCAN_CONFIG['min_stocks']:
+            all_sorted = sorted(amt_list, key=lambda x: x['latest_amt'], reverse=True)
+            filtered = all_sorted[:SCAN_CONFIG['min_stocks']]
+
+        amt_df = pd.DataFrame(filtered)
+        # #region debug-point B:scanner-phase1-done
+        _main_strategy_debug_emit(
+            "B",
+            "scanner_v10.py:main",
+            "[DEBUG] scanner phase1 completed",
+            {
+                "stock_count": len(stocks),
+                "amt_list_count": len(amt_list),
+                "filtered_count": len(amt_df),
+                "market_regime": market_regime,
+                "amount_threshold_yi": round(amount_threshold / 1e8, 4),
+            },
+        )
+        # #endregion
+        print(f"  -> 扫描{len(amt_df)}只 (阈值>={amount_threshold/1e8:.1f}亿, 范围{SCAN_CONFIG['min_stocks']}-{SCAN_CONFIG['max_stocks']})\n")
+        print("Phase 2: Compute daily + weekly + 5min features...")
+        results = []
+        for i, (_, row) in enumerate(amt_df.iterrows()):
+            code = row["code"]
+            name = row["name"]
+            market = row["market"]
+            last_close = row["last_close"]
+            daily = fetch_daily_bars(api, market, code, count=250)
+            if daily is None or len(daily) < 60:
+                continue
+            d = daily.copy()
+            for w in [5, 10, 20, 60]:
+                d[f"ma{w}"] = d["close"].rolling(w).mean()
+            d["avg_amt_5d"] = d["amount"].rolling(5).mean()
+            d["amt_ratio"] = d["amount"] / d["avg_amt_5d"]
+            d["close_vs_ma20"] = (d["close"] - d["ma20"]) / d["ma20"] * 100
+            delta = d["close"].diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            d["rsi14"] = 100 - (100 / (1 + rs))
+            last = d.iloc[-1]
+            if pd.isna(last.get("ma20")) or pd.isna(last.get("amt_ratio")):
+                continue
+            ma20_off = last["close_vs_ma20"] if pd.notna(last["close_vs_ma20"]) else 0.0
+            amt_r = last["amt_ratio"] if pd.notna(last["amt_ratio"]) else 1.0
+            vol_exp = bool(1.3 <= amt_r <= 2.5)
+            rsi = last["rsi14"] if pd.notna(last["rsi14"]) else 50.0
+            is_green = last["close"] > last["open"]
+            weekly = fetch_weekly_bars(api, market, code, count=100)
+            wfeats = compute_weekly_features(weekly)
+            weekly_align = wfeats.get("weekly_align", False)
+            weekly_slope = wfeats.get("weekly_slope", 0.0)
+            min5 = fetch_5min_bars_today(api, market, code)
+            m5feats = compute_5min_signal(min5)
+            bz_dir = m5feats.get("bz_direction", np.nan)
+            bz_rt = m5feats.get("bz_rt_direction", np.nan)
+            bz_vol_r = m5feats.get("bz_vol_ratio", np.nan)
+            tier, mode, position, desc = classify_signal(
+                bz_dir, bz_rt, weekly_align, weekly_slope, ma20_off,
+                vol_exp, rsi, is_green, amt_r
+            )
+            results.append({
+                "code": code,
+                "name": name,
+                "close": last_close,
+                "entry_price": last_close,
+                "market": market,
+                "tier": tier,
+                "mode": mode,
+                "position": position,
+                "signal_desc": desc,
+                "bz_direction": bz_dir,
+                "bz_rt_direction": bz_rt,
+                "bz_vol_ratio": bz_vol_r,
+                "weekly_align": weekly_align,
+                "weekly_slope": weekly_slope,
+                "close_vs_ma20_pct": ma20_off,
+                "amt_ratio": amt_r,
+                "rsi14": rsi,
+                "is_green": is_green,
+                "vol_expand": vol_exp,
+            })
+            if (i + 1) % 50 == 0:
+                print(f"  Processed {i+1}/{len(amt_df)}")
+            if (i + 1) % 100 == 0:
+                # #region debug-point C:scanner-progress
+                _main_strategy_debug_emit(
+                    "A",
+                    "scanner_v10.py:main",
+                    "[DEBUG] scanner phase2 progress",
+                    {
+                        "processed": i + 1,
+                        "candidate_count": len(results),
+                        "total_to_scan": len(amt_df),
+                        "last_code": code,
+                    },
+                )
+                # #endregion
+
+        # #region debug-point D:scanner-finished
+        _main_strategy_debug_emit(
+            "B",
+            "scanner_v10.py:main",
+            "[DEBUG] scanner finished",
+            {
+                "result_count": len(results),
+                "signal_count": len([row for row in results if int(row.get("tier", 0) or 0) > 0]),
+            },
+        )
+        # #endregion
+        print(f"  -> Total: {len(results)} stocks scanned\n")
+        _write_outputs(
+            df=pd.DataFrame(results),
+            run_time=run_time,
+            total_amt_yi=total_amt_yi,
+            market_regime=market_regime,
+            amount_threshold=amount_threshold,
+            scanned_count=len(amt_df),
+        )
+    finally:
+        api.disconnect()
 
 
 if __name__ == "__main__":

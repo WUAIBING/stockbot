@@ -1463,19 +1463,32 @@ def build_buy_plan(
     persist_plan: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     validate_opening_tradability_artifact(expected_trade_date=_today_str())
-    payload = _ensure_fresh_source_payload()
-    if payload.get("status") != "ok":
-        raise RuntimeError("workbuddy_candidate_pool_latest.json 不可用")
-    selected_records = payload.get("selected_records", [])
-    if not isinstance(selected_records, list) or not selected_records:
-        raise RuntimeError("Workbuddy 候选池为空")
-
     buy_window = _resolve_buy_window(trigger_slot=trigger_slot)
     if not buy_window and not force:
         raise RuntimeError("当前时间/trigger_slot 不在 challenger 买入窗口")
     if not buy_window:
         buy_window = BUY_WINDOW_CONFIGS[-1]
     buy_window_key = str(buy_window.get("key", "")).strip()
+
+    buy_override = _match_buy_override(trade_date=_today_str(), window_key=buy_window_key)
+    if isinstance(buy_override, dict):
+        selected_records = buy_override.get("records", [])
+        payload = {
+            "status": "ok",
+            "trade_date": str(buy_override.get("source_trade_date", _expected_source_trade_date())).strip(),
+            "run_slot": str(buy_override.get("source_run_slot", "")).strip(),
+            "selected_records": selected_records,
+            "generated_at": str(buy_override.get("source_generated_at", _now_str())).strip(),
+            "override_plan_id": str(buy_override.get("plan_id", "")).strip(),
+            "override_source_file": str(buy_override.get("source_file", "")).strip(),
+        }
+    else:
+        payload = _ensure_fresh_source_payload()
+        if payload.get("status") != "ok":
+            raise RuntimeError("workbuddy_candidate_pool_latest.json 不可用")
+        selected_records = payload.get("selected_records", [])
+    if not isinstance(selected_records, list) or not selected_records:
+        raise RuntimeError("Workbuddy 候选池为空")
 
     records = load_track_record()
     execution_state = _prune_execution_state(_load_execution_state(), records)
@@ -1485,21 +1498,9 @@ def build_buy_plan(
     avail = _safe_float(account_snapshot.get("cash_balance", 0.0), 0.0)
     total_assets = _safe_float(account_snapshot.get("total_assets", INITIAL_CAPITAL), INITIAL_CAPITAL)
     cash_budget = round(avail, 2)
-    buy_override = _match_buy_override(trade_date=_today_str(), window_key=buy_window_key)
     override_exit_plan = {}
     if isinstance(buy_override, dict):
         override_exit_plan = buy_override.get("exit_plan", {}) if isinstance(buy_override.get("exit_plan", {}), dict) else {}
-    if buy_override:
-        selected_records = buy_override.get("records", [])
-        payload = {
-            "status": "ok",
-            "trade_date": str(buy_override.get("source_trade_date", payload.get("trade_date", ""))).strip(),
-            "run_slot": str(buy_override.get("source_run_slot", payload.get("run_slot", ""))).strip(),
-            "selected_records": selected_records,
-            "generated_at": str(buy_override.get("source_generated_at", payload.get("generated_at", ""))).strip(),
-            "override_plan_id": str(buy_override.get("plan_id", "")).strip(),
-            "override_source_file": str(buy_override.get("source_file", "")).strip(),
-        }
 
     exclusions = _load_today_tradability_exclusions()
     quote_map = load_quote_map([row.get("code", "") for row in selected_records])

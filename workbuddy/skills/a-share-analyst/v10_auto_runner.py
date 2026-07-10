@@ -991,7 +991,7 @@ def build_steps(phase: str, *, with_email: bool) -> list[list[str] | None]:
     elif phase == 'decision':
         return [
             ['data_freshness_probe.py'],
-            ['scanner_v10.py'],
+            ['scanner_v10.py', '--decision-fast'],
             ['send_email.py', '--type', 'decision'] if with_email else None,
         ]
     elif phase == 'buy':
