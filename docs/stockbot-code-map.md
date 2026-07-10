@@ -81,8 +81,11 @@ At a high level:
 - `workbuddy/skills/a-share-analyst/register_workbuddy_tasks.py`
   - Defines the original local Windows task schedule
   - Useful for understanding the intended intraday timing map
+- `scripts/github-actions/run_trading_day_on_do.sh`
+  - Shared DO launcher for the full trading day
+  - Holds the lock used by both the DO timer and manual GitHub runs
 - `workbuddy/skills/a-share-analyst/github_actions_trade_day.py`
-  - GitHub Actions day controller
+  - Day controller reused by both DO local scheduling and manual GitHub runs
   - Replays the task schedule on the DO self-hosted runner
 
 ### Runtime Path and Validation Layer
@@ -178,9 +181,11 @@ If the task is about mock account querying or operations, read:
 ## GitHub / DO Deployment Layer
 
 - `.github/workflows/trading-day-self-hosted.yml`
-  - Full trading-day GitHub workflow for the DO self-hosted runner
+  - Manual full trading-day workflow for the DO self-hosted runner
 - `.github/workflows/manual-phase-self-hosted.yml`
   - Manual phase runner workflow
+- `scripts/github-actions/install_do_trading_day_timer.sh`
+  - Installs the DO-native `systemd` timer for the 09:25 China-time trigger
 - `scripts/github-actions/setup_self_hosted_runner.sh`
   - Linux runner setup for DO
 - `scripts/github-actions/setup_self_hosted_runner.ps1`
@@ -189,13 +194,16 @@ If the task is about mock account querying or operations, read:
 ### Scheduler Reality
 
 - Active scheduler:
+  - DO local `systemd` timer on the droplet
+- Manual control plane:
   - GitHub Actions on the DO self-hosted runner
 - Legacy scheduler:
   - local Windows `schtasks`
 
 Important interpretation rule:
 
-- use GitHub workflows as the current operational truth
+- use the DO local timer as the guaranteed 09:25 trigger
+- use GitHub workflows for manual runs, sync, and recovery
 - use `register_workbuddy_tasks.py` as the legacy timing map and semantic schedule reference
 
 ### Code Sync Reality
@@ -216,6 +224,7 @@ Practical interpretation rule:
 
 Read:
 
+- `scripts/github-actions/run_trading_day_on_do.sh`
 - `workbuddy/skills/a-share-analyst/register_workbuddy_tasks.py`
 - `workbuddy/skills/a-share-analyst/github_actions_trade_day.py`
 - `.github/workflows/trading-day-self-hosted.yml`

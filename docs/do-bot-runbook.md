@@ -37,13 +37,14 @@ Use this runbook to:
 Bots must understand that there are two scheduler models in this project:
 
 - current active scheduler:
-  - GitHub Actions on the DO self-hosted runner
+  - DO local `systemd` timer on the droplet
 - legacy scheduler:
   - local Windows `schtasks`
 
 Current rule:
 
-- treat GitHub Actions as the active scheduler
+- treat the DO local timer as the guaranteed 09:25 trigger
+- treat GitHub Actions as manual control and recovery only
 - treat Windows `schtasks` as the legacy timing reference
 - do not assume local Windows tasks are still enabled
 
@@ -71,7 +72,6 @@ File:
 Purpose:
 
 - starts one full intraday control job on the DO self-hosted runner
-- runs at `09:25` China time on weekdays
 - can also be triggered manually
 
 Important details:
@@ -80,10 +80,9 @@ Important details:
   - `self-hosted`
   - `linux`
   - `stockbot-do`
-- schedule:
-  - GitHub cron `25 1 * * 1-5`
-  - this corresponds to `09:25` China Standard Time
 - main entrypoint:
+  - `scripts/github-actions/run_trading_day_on_do.sh`
+- day controller:
   - `workbuddy/skills/a-share-analyst/github_actions_trade_day.py`
 - important manual inputs:
   - `trade_date`
@@ -92,8 +91,41 @@ Important details:
 
 Meaning:
 
-- GitHub does not launch every phase as a separate scheduled workflow
-- instead, it starts one day controller job, and that controller replays the intraday task schedule
+- GitHub no longer owns the guaranteed morning trigger
+- it is now the manual entrypoint that calls the same launcher used by the DO timer
+- the shared launcher holds a lock so a manual run and the timer do not start two full-day controllers at once
+
+### DO Local Trading Day Timer
+
+Files:
+
+- `/opt/stockbot/scripts/github-actions/install_do_trading_day_timer.sh`
+- `/opt/stockbot/scripts/github-actions/run_trading_day_on_do.sh`
+
+Purpose:
+
+- guarantee one local `09:25` China-time start on the DO machine
+- remove dependence on GitHub `schedule` event delivery
+- keep the same day-controller logic and runtime paths
+
+Important details:
+
+- installed unit:
+  - `stockbot-trading-day.service`
+- installed timer:
+  - `stockbot-trading-day.timer`
+- schedule:
+  - `01:25 UTC`, Monday-Friday
+  - this is `09:25` China Standard Time
+- env override file:
+  - `/etc/stockbot/trading-day.env`
+- MX secret fallback:
+  - `/opt/stockbot/.mx_apikey`
+
+Meaning:
+
+- if GitHub `schedule` is delayed or dropped, the DO machine still starts the day on time
+- GitHub remains the code source, sync trigger, and manual recovery plane
 
 ### Manual Phase Workflow
 
@@ -244,10 +276,11 @@ If a user asks:
 
 Use this rule:
 
-1. check GitHub workflow logic first
+1. check the DO local timer and launcher first
 2. then check `github_actions_trade_day.py`
 3. then use `register_workbuddy_tasks.py` to interpret intended legacy slot semantics
-4. only talk about Windows `schtasks` as historical or fallback context unless explicitly asked
+4. then check GitHub workflow logic for manual or recovery runs
+5. only talk about Windows `schtasks` as historical or fallback context unless explicitly asked
 
 ## Default Operating Mode
 
@@ -384,6 +417,7 @@ Typical things to check:
 
 Read:
 
+- `/opt/stockbot/scripts/github-actions/run_trading_day_on_do.sh`
 - `/opt/stockbot/workbuddy/skills/a-share-analyst/register_workbuddy_tasks.py`
 - `/opt/stockbot/workbuddy/skills/a-share-analyst/github_actions_trade_day.py`
 - `/opt/stockbot/.github/workflows/trading-day-self-hosted.yml`

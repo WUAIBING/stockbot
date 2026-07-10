@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""GitHub Actions self-hosted 日内总控脚本。
+"""DO / GitHub 共用的日内总控脚本。
 
-在单个 workflow 里按中国市场时间顺序执行本地 Task Scheduler 的全部阶段，
-避免 GitHub schedule 5 分钟粒度无法覆盖 09:31 / 09:47 / 14:49 这类精确时点。
+在单个日级触发里按中国市场时间顺序执行本地 Task Scheduler 的全部阶段，
+避免外部 scheduler 只能表达粗粒度起点、无法覆盖 09:31 / 09:47 / 14:49 这类精确时点。
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def iter_selected_specs(start_from_slot: str) -> list[TaskSpec]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run the full A-share trade-day schedule inside GitHub Actions.")
+    parser = argparse.ArgumentParser(description="Run the full A-share trade-day schedule from the shared day launcher.")
     parser.add_argument("--trade-date", default="", help="Market trade date in YYYY-MM-DD. Defaults to current UTC+8 date.")
     parser.add_argument("--start-from-slot", default="", help="Optional HH:MM slot to skip earlier tasks.")
     parser.add_argument("--max-lag-seconds", type=int, default=DEFAULT_MAX_LAG_SECONDS, help="Run overdue tasks immediately only when lag <= this threshold.")

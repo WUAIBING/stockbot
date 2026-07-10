@@ -1,9 +1,6 @@
 name: Trading Day Self-Hosted
 
 on:
-  schedule:
-    # 09:25 China Standard Time, Monday-Friday.
-    - cron: '25 1 * * 1-5'
   workflow_dispatch:
     inputs:
       trade_date:
@@ -77,7 +74,7 @@ jobs:
       - name: Run full trading-day schedule
         shell: bash
         run: |
-          args=("/opt/stockbot/workbuddy/skills/a-share-analyst/github_actions_trade_day.py")
+          args=()
           trade_date="${{ github.event.inputs.trade_date }}"
           start_from_slot="${{ github.event.inputs.start_from_slot }}"
           if [ -n "$trade_date" ]; then
@@ -89,7 +86,8 @@ jobs:
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
           fi
-          "$TLFZ_PYTHON_EXE" "${args[@]}"
+          export STOCKBOT_TRIGGER_SOURCE="github-actions:${{ github.run_id }}"
+          bash "/opt/stockbot/scripts/github-actions/run_trading_day_on_do.sh" "${args[@]}"
 
       - name: Upload runtime artifacts
         if: always()
