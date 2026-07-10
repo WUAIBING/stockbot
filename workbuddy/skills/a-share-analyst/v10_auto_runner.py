@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
@@ -32,7 +33,7 @@ from workbuddy_runtime import (
 
 
 ROOT = Path(__file__).resolve().parent
-PYTHON = sys.executable
+PYTHON = os.environ.get('TLFZ_PYTHON_EXE') or sys.executable
 STATUS_DIR = DATA_DIR / 'automation_status'
 STATUS_LATEST = STATUS_DIR / 'latest_phase_status.json'
 STATUS_HISTORY = STATUS_DIR / 'phase_history.csv'

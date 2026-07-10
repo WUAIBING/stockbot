@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-PYTHON = Path(sys.executable).resolve()
+PYTHON = Path(os.environ.get('TLFZ_PYTHON_EXE') or sys.executable)
 RUNNER = ROOT / 'v10_auto_runner.py'
 WRAPPER_DIR = ROOT / 'task_wrappers'
 TASK_PREFIX = 'TLFZ-WorkBuddy-'
