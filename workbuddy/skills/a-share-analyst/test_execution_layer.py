@@ -122,6 +122,164 @@ class RunPhaseWatchTests(unittest.TestCase):
         self.assertTrue(failure_calls)
 
 
+class PhaseInspectionSnapshotTests(unittest.TestCase):
+    def test_write_phase_inspection_snapshot_generates_opening_node_file(self) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            opening_file = tmp / "opening_tradability_latest.json"
+            security_file = tmp / "security_master_latest.json"
+            external_file = tmp / "v10_external_market_review_latest.json"
+            output_file = tmp / "v10_opening_node_latest.json"
+            opening_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": f"{today} 09:31:05",
+                        "trade_date": today,
+                        "record_count": 12,
+                        "excluded_today_count": 1,
+                        "review_only_count": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            security_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": f"{today} 09:31:03",
+                        "trade_date": today,
+                        "record_count": 12,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            external_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": f"{today} 09:31:10",
+                        "trade_date": today,
+                        "window_tag": "opening_0931",
+                        "risk_level": "balanced",
+                        "a_share_bias": "neutral",
+                        "impact_summary": "ok",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(auto_runner, "OPENING_TRADABILITY_FILE", opening_file),
+                patch.object(auto_runner, "SECURITY_MASTER_FILE", security_file),
+                patch.object(auto_runner, "EXTERNAL_MARKET_REVIEW_FILE", external_file),
+                patch.object(auto_runner, "OPENING_NODE_FILE", output_file),
+            ):
+                written_path = auto_runner.write_phase_inspection_snapshot(
+                    run_meta={"task_name": "TLFZ-WorkBuddy-OpeningData", "trigger_slot": "09:31", "run_id": "rid-open"},
+                    phase="opening-data",
+                    phase_status="ok",
+                    phase_exit_code=0,
+                )
+
+            self.assertEqual(written_path, output_file)
+            payload = json.loads(output_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload["node"], "opening_node")
+            self.assertEqual(payload["node_status"], "ok")
+            self.assertTrue(payload["checklist"]["opening_tradability_today"])
+            self.assertEqual(payload["summary"]["record_count"], 12)
+
+    def test_write_phase_inspection_snapshot_generates_midday_inspection_file(self) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            midday_review_file = tmp / "v10_midday_review_latest.json"
+            midday_node_file = tmp / "v10_midday_node_latest.json"
+            midday_gate_file = tmp / "v10_midday_gate_latest.json"
+            pm_gate_file = tmp / "v10_pm_gate_status.json"
+            account_summary_file = tmp / "v10_account_summary_latest.json"
+            output_file = tmp / "v10_midday_inspection_latest.json"
+            midday_review_file.write_text(
+                json.dumps({"generated_at": f"{today} 11:35:02", "date": today, "market_temperature": "warm"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            midday_node_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": f"{today} 11:35:05",
+                        "date": today,
+                        "stage": "midday_node",
+                        "review_status": "ok",
+                        "pm_gate_status": "pass",
+                        "blocked_buy_codes": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            midday_gate_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": f"{today} 13:00:05",
+                        "date": today,
+                        "stage": "pm_gate",
+                        "review_status": "ok",
+                        "pm_gate_status": "pass",
+                        "blocked_buy_codes": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            pm_gate_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": f"{today} 13:00:05",
+                        "date": today,
+                        "stage": "pm_gate",
+                        "review_status": "ok",
+                        "pm_gate_status": "pass",
+                        "blocked_buy_codes": [],
+                        "reason_codes": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            account_summary_file.write_text(
+                json.dumps(
+                    {
+                        "generated_at": f"{today} 13:00:08",
+                        "trade_date": today,
+                        "latest_execution_result": {"action": "smart_sell", "status": "ok"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(auto_runner, "MIDDAY_REVIEW_FILE", midday_review_file),
+                patch.object(auto_runner, "MIDDAY_NODE_FILE", midday_node_file),
+                patch.object(auto_runner, "MIDDAY_GATE_FILE", midday_gate_file),
+                patch.object(auto_runner, "PM_GATE_FILE", pm_gate_file),
+                patch.object(auto_runner, "ACCOUNT_SUMMARY_FILE", account_summary_file),
+                patch.object(auto_runner, "MIDDAY_INSPECTION_FILE", output_file),
+            ):
+                written_path = auto_runner.write_phase_inspection_snapshot(
+                    run_meta={"task_name": "TLFZ-WorkBuddy-MiddayGate", "trigger_slot": "13:00", "run_id": "rid-mid"},
+                    phase="midday-gate",
+                    phase_status="ok",
+                    phase_exit_code=0,
+                )
+
+            self.assertEqual(written_path, output_file)
+            payload = json.loads(output_file.read_text(encoding="utf-8"))
+            self.assertEqual(payload["node"], "midday_inspection")
+            self.assertEqual(payload["inspection_status"], "ok")
+            self.assertTrue(payload["checklist"]["pm_gate_today"])
+            self.assertEqual(payload["account_summary"]["latest_execution_action"], "smart_sell")
+
+
 class TaskRegisterValidationTests(unittest.TestCase):
     def test_current_task_specs_pass_validation(self) -> None:
         task_register.validate_task_specs(task_register.TASK_SPECS)

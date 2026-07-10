@@ -38,10 +38,17 @@ STATUS_LATEST = STATUS_DIR / 'latest_phase_status.json'
 STATUS_HISTORY = STATUS_DIR / 'phase_history.csv'
 STATUS_HISTORY_DETAILED = STATUS_DIR / 'phase_history_detailed.csv'
 PREWARM_TIMING_SIGNAL = STATUS_DIR / 'prewarm_timing_signal.json'
+OPENING_NODE_FILE = DATA_DIR / 'v10_opening_node_latest.json'
+MIDDAY_INSPECTION_FILE = DATA_DIR / 'v10_midday_inspection_latest.json'
 CLOSE_NODE_FILE = DATA_DIR / 'v10_close_node_latest.json'
 CLOSE_NODE_MX_REVIEW_FILE = DATA_DIR / 'v10_close_node_mx_review_latest.json'
+SECURITY_MASTER_FILE = DATA_DIR / 'security_master_latest.json'
 OPENING_TRADABILITY_FILE = DATA_DIR / 'opening_tradability_latest.json'
 EXTERNAL_MARKET_REVIEW_FILE = DATA_DIR / 'v10_external_market_review_latest.json'
+MIDDAY_REVIEW_FILE = DATA_DIR / 'v10_midday_review_latest.json'
+MIDDAY_NODE_FILE = DATA_DIR / 'v10_midday_node_latest.json'
+MIDDAY_GATE_FILE = DATA_DIR / 'v10_midday_gate_latest.json'
+PM_GATE_FILE = DATA_DIR / 'v10_pm_gate_status.json'
 WORKBUDDY_LOCAL_REVIEW_FILE = DATA_DIR / 'workbuddy_local_review_latest.json'
 WORKBUDDY_LEARNING_ADVICE_FILE = DATA_DIR / 'workbuddy_learning_advice_latest.json'
 ACCOUNT_SUMMARY_FILE = DATA_DIR / 'v10_account_summary_latest.json'
@@ -193,6 +200,205 @@ def seconds_between(started_at: datetime | None, finished_at: datetime | None) -
 
 def latest_phase_path(phase: str) -> Path:
     return STATUS_DIR / f'latest_{sanitize_token(phase)}_status.json'
+
+
+def payload_date(payload: dict, *keys: str) -> str:
+    if not isinstance(payload, dict):
+        return ''
+    for key in keys:
+        text = str(payload.get(key, '')).strip()
+        if text:
+            return text[:10]
+    return ''
+
+
+def summarize_detail_file(path: Path, *, date_keys: tuple[str, ...], extra_keys: tuple[str, ...] = ()) -> dict[str, object]:
+    payload = read_json(path)
+    date_value = payload_date(payload, *date_keys)
+    summary: dict[str, object] = {
+        'exists': bool(payload),
+        'trade_date': date_value,
+        'generated_at': str(payload.get('generated_at', '')).strip() if isinstance(payload, dict) else '',
+        'is_today': bool(date_value and date_value == datetime.now().strftime('%Y-%m-%d')),
+        'detail_file': str(path),
+    }
+    for key in extra_keys:
+        summary[key] = payload.get(key) if isinstance(payload, dict) else None
+    return summary
+
+
+def build_opening_node_snapshot(
+    *,
+    run_meta: dict[str, str],
+    phase_status: str,
+    phase_exit_code: int,
+) -> dict[str, object]:
+    opening = summarize_detail_file(
+        OPENING_TRADABILITY_FILE,
+        date_keys=('trade_date', 'date'),
+        extra_keys=('record_count', 'excluded_today_count', 'review_only_count'),
+    )
+    security_master = summarize_detail_file(
+        SECURITY_MASTER_FILE,
+        date_keys=('trade_date', 'date'),
+        extra_keys=('record_count',),
+    )
+    external_market = summarize_detail_file(
+        EXTERNAL_MARKET_REVIEW_FILE,
+        date_keys=('trade_date', 'date'),
+        extra_keys=('window_tag', 'risk_level', 'a_share_bias', 'impact_summary'),
+    )
+    checklist = {
+        'opening_data_phase_finished': phase_status in {'ok', 'no_action', 'no_signal', 'skipped'},
+        'opening_tradability_today': bool(opening['is_today']),
+        'security_master_today': bool(security_master['is_today']),
+        'external_market_review_today': bool(external_market['is_today']),
+    }
+    notes: list[str] = []
+    if checklist['opening_tradability_today']:
+        notes.append('09:31 opening-data 已落盘，可直接复核晨间流动性门。')
+    else:
+        notes.append('opening_tradability_latest.json 不是今日版本或缺失。')
+    if not checklist['security_master_today']:
+        notes.append('security_master_latest.json 未确认是今日版本。')
+    if not checklist['external_market_review_today']:
+        notes.append('v10_external_market_review_latest.json 未确认是今日版本。')
+    if phase_status == 'ok' and all(checklist.values()):
+        node_status = 'ok'
+    elif phase_status in {'ok', 'no_action', 'no_signal', 'skipped'}:
+        node_status = 'warning'
+    else:
+        node_status = 'failed'
+    return {
+        'generated_at': format_timestamp(datetime.now()),
+        'trade_date': datetime.now().strftime('%Y-%m-%d'),
+        'node': 'opening_node',
+        'run_id': run_meta['run_id'],
+        'task_name': run_meta['task_name'],
+        'trigger_slot': run_meta['trigger_slot'],
+        'phase_status': phase_status,
+        'phase_exit_code': phase_exit_code,
+        'node_status': node_status,
+        'checklist': checklist,
+        'opening_tradability': opening,
+        'security_master': security_master,
+        'external_market_review': external_market,
+        'summary': {
+            'record_count': int(opening.get('record_count', 0) or 0),
+            'excluded_today_count': int(opening.get('excluded_today_count', 0) or 0),
+            'review_only_count': int(opening.get('review_only_count', 0) or 0),
+            'window_tag': str(external_market.get('window_tag', '') or ''),
+            'risk_level': str(external_market.get('risk_level', '') or ''),
+            'a_share_bias': str(external_market.get('a_share_bias', '') or ''),
+        },
+        'notes': notes,
+    }
+
+
+def build_midday_inspection_snapshot(
+    *,
+    run_meta: dict[str, str],
+    phase: str,
+    phase_status: str,
+    phase_exit_code: int,
+) -> dict[str, object]:
+    midday_review = summarize_detail_file(
+        MIDDAY_REVIEW_FILE,
+        date_keys=('trade_date', 'date'),
+        extra_keys=('market_temperature',),
+    )
+    midday_node = summarize_detail_file(
+        MIDDAY_NODE_FILE,
+        date_keys=('trade_date', 'date'),
+        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes'),
+    )
+    midday_gate = summarize_detail_file(
+        MIDDAY_GATE_FILE,
+        date_keys=('trade_date', 'date'),
+        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes'),
+    )
+    pm_gate = summarize_detail_file(
+        PM_GATE_FILE,
+        date_keys=('trade_date', 'date'),
+        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes', 'reason_codes'),
+    )
+    account_summary_payload = read_json(ACCOUNT_SUMMARY_FILE)
+    latest_execution_result = account_summary_payload.get('latest_execution_result', {}) if isinstance(account_summary_payload, dict) else {}
+    account_summary = summarize_detail_file(
+        ACCOUNT_SUMMARY_FILE,
+        date_keys=('trade_date', 'date'),
+    )
+    account_summary['latest_execution_action'] = str(latest_execution_result.get('action', '')).strip() if isinstance(latest_execution_result, dict) else ''
+    account_summary['latest_execution_status'] = str(latest_execution_result.get('status', '')).strip() if isinstance(latest_execution_result, dict) else ''
+    current_stage_ready = bool(midday_node['is_today']) if phase == 'midday-node' else bool(midday_gate['is_today'] and pm_gate['is_today'])
+    checklist = {
+        'midday_review_today': bool(midday_review['is_today']),
+        'midday_node_today': bool(midday_node['is_today']),
+        'midday_gate_today': bool(midday_gate['is_today']),
+        'pm_gate_today': bool(pm_gate['is_today']),
+        'current_stage_ready': current_stage_ready,
+    }
+    notes: list[str] = []
+    if phase == 'midday-node':
+        notes.append('11:35 午间节点已落盘，当前巡检用于事实复核与下午放行建议。')
+    else:
+        notes.append('13:00 午盘闸门已落盘，当前巡检用于最终下午放行确认。')
+    if not checklist['midday_review_today']:
+        notes.append('v10_midday_review_latest.json 未确认是今日版本。')
+    if phase == 'midday-gate' and not checklist['pm_gate_today']:
+        notes.append('v10_pm_gate_status.json 未确认是今日版本。')
+    if phase_status == 'ok' and current_stage_ready:
+        inspection_status = 'ok'
+    elif phase_status in {'ok', 'no_action', 'no_signal', 'skipped'}:
+        inspection_status = 'warning'
+    else:
+        inspection_status = 'failed'
+    return {
+        'generated_at': format_timestamp(datetime.now()),
+        'trade_date': datetime.now().strftime('%Y-%m-%d'),
+        'node': 'midday_inspection',
+        'stage': phase,
+        'run_id': run_meta['run_id'],
+        'task_name': run_meta['task_name'],
+        'trigger_slot': run_meta['trigger_slot'],
+        'phase_status': phase_status,
+        'phase_exit_code': phase_exit_code,
+        'inspection_status': inspection_status,
+        'checklist': checklist,
+        'midday_review': midday_review,
+        'midday_node': midday_node,
+        'midday_gate': midday_gate,
+        'pm_gate': pm_gate,
+        'account_summary': account_summary,
+        'notes': notes,
+    }
+
+
+def write_phase_inspection_snapshot(
+    *,
+    run_meta: dict[str, str],
+    phase: str,
+    phase_status: str,
+    phase_exit_code: int,
+) -> Path | None:
+    if phase == 'opening-data':
+        payload = build_opening_node_snapshot(
+            run_meta=run_meta,
+            phase_status=phase_status,
+            phase_exit_code=phase_exit_code,
+        )
+        write_json_atomic(OPENING_NODE_FILE, payload)
+        return OPENING_NODE_FILE
+    if phase in {'midday-node', 'midday-gate'}:
+        payload = build_midday_inspection_snapshot(
+            run_meta=run_meta,
+            phase=phase,
+            phase_status=phase_status,
+            phase_exit_code=phase_exit_code,
+        )
+        write_json_atomic(MIDDAY_INSPECTION_FILE, payload)
+        return MIDDAY_INSPECTION_FILE
+    return None
 
 
 def is_soft_fail_step(phase: str, step_name: str) -> bool:
@@ -874,6 +1080,12 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
             learning_note=str(learning.get('learning_note', '')),
             decision_buffer_seconds=learning.get('decision_buffer_seconds') if learning else None,
         )
+        write_phase_inspection_snapshot(
+            run_meta=run_meta,
+            phase=phase,
+            phase_status='skipped',
+            phase_exit_code=0,
+        )
         print(f"[SKIP] {skip_detail}")
         return 0
     deadline_stop, deadline_detail = should_stop_phase_for_deadline(phase)
@@ -888,6 +1100,12 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
             detail=deadline_detail,
             started_at=phase_started_at,
             finished_at=phase_started_at,
+        )
+        write_phase_inspection_snapshot(
+            run_meta=run_meta,
+            phase=phase,
+            phase_status='deadline',
+            phase_exit_code=2,
         )
         print(f"[STOP] {deadline_detail}")
         return 2
@@ -905,6 +1123,12 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
             detail=str(exc),
             started_at=phase_started_at,
             finished_at=preflight_finished_at,
+        )
+        write_phase_inspection_snapshot(
+            run_meta=run_meta,
+            phase=phase,
+            phase_status='failed',
+            phase_exit_code=3,
         )
         print(f"[PREFLIGHT-FAIL] {exc}")
         return 3
@@ -1005,6 +1229,12 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
                     learning_note=str(learning.get('learning_note', '')),
                     decision_buffer_seconds=learning.get('decision_buffer_seconds') if learning else None,
                 )
+                write_phase_inspection_snapshot(
+                    run_meta=run_meta,
+                    phase=phase,
+                    phase_status='failed',
+                    phase_exit_code=code,
+                )
                 if phase == 'close-node':
                     mx_review_payload = write_close_node_mx_review(
                         run_meta=run_meta,
@@ -1041,6 +1271,12 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
             learning_note=str(learning.get('learning_note', '')),
             decision_buffer_seconds=learning.get('decision_buffer_seconds') if learning else None,
         )
+        write_phase_inspection_snapshot(
+            run_meta=run_meta,
+            phase=phase,
+            phase_status=phase_status,
+            phase_exit_code=phase_exit_code,
+        )
         if phase == 'close-node':
             close_node_phase_status = 'warning' if any(item.get('status') != 'ok' for item in close_node_mx_results) else phase_status
             mx_review_payload = write_close_node_mx_review(
@@ -1066,6 +1302,12 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
             detail=f'unhandled runner exception: {type(exc).__name__}: {exc}',
             started_at=phase_started_at,
             finished_at=phase_finished_at,
+        )
+        write_phase_inspection_snapshot(
+            run_meta=run_meta,
+            phase=phase,
+            phase_status='failed',
+            phase_exit_code=3,
         )
         print(f"[RUNNER-FAIL] {type(exc).__name__}: {exc}")
         return 3

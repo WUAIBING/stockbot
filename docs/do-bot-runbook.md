@@ -407,6 +407,8 @@ Typical things to check:
 
 - latest phase status
 - phase history
+- `v10_opening_node_latest.json` for the `09:31 opening-data` morning node summary
+- `v10_midday_inspection_latest.json` for the midday inspection summary
 - close-node outputs
 - candidate pool freshness
 - account summary outputs

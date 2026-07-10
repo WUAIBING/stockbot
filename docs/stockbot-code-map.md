@@ -278,6 +278,10 @@ Important paths on DO:
   - Prompt for mock account usage
 - `/opt/stockbot/workbuddy/a-share-analyst/`
   - Persistent runtime outputs
+- `/opt/stockbot/workbuddy/a-share-analyst/v10_opening_node_latest.json`
+  - `09:31 opening-data` morning-node summary snapshot
+- `/opt/stockbot/workbuddy/a-share-analyst/v10_midday_inspection_latest.json`
+  - Midday inspection summary snapshot built from `midday-node/gate` outputs
 
 ## Bot Operating Notes
 
