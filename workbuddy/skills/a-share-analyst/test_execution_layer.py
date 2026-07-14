@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -12,6 +13,8 @@ from unittest.mock import patch
 
 import evolving_model
 import external_market_review
+import github_actions_trade_day as day_controller
+import mx_api_env
 import register_workbuddy_tasks as task_register
 import v10_auto_runner as auto_runner
 import v10_moni_trader as trader
@@ -58,6 +61,11 @@ class RunPhaseWatchTests(unittest.TestCase):
         steps = auto_runner.build_steps("workbuddy-buy", with_email=False)
         self.assertEqual(steps, [["workbuddy_local_challenger.py", "--buy"]])
 
+    def test_prewarm_phase_uses_fast_scanner_mode(self) -> None:
+        steps = auto_runner.build_steps("prewarm", with_email=False)
+        self.assertEqual(steps[0], ["data_freshness_probe.py"])
+        self.assertEqual(steps[1], ["scanner_v10.py", "--prewarm-fast"])
+
     def test_run_phase_once_fails_fast_when_preflight_breaks(self) -> None:
         with (
             patch.object(auto_runner, "should_skip_phase_for_calendar", return_value=(False, "")),
@@ -73,6 +81,35 @@ class RunPhaseWatchTests(unittest.TestCase):
 
         self.assertEqual(code, 3)
         record_status.assert_called_once()
+
+
+class TraderWindowTimezoneTests(unittest.TestCase):
+    def test_add_position_window_uses_market_timezone(self) -> None:
+        market_now = datetime(2026, 7, 14, 9, 36, 30, tzinfo=trader.MARKET_TZ)
+        with patch.object(trader, "_market_now", return_value=market_now):
+            self.assertTrue(trader.ensure_trade_window("add_position", dry_run=False))
+            self.assertEqual(trader._current_add_position_window_tag(), "09:36")
+
+    def test_buy_window_uses_market_timezone(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with patch.object(trader, "_market_now", return_value=market_now):
+            self.assertTrue(trader.ensure_trade_window("buy", dry_run=False))
+
+    def test_wait_for_today_decision_ready_uses_market_date(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        payload = {
+            "status": "ok",
+            "finished_at": "2026-07-14 14:49:30",
+            "trigger_slot": "14:49",
+        }
+        with (
+            patch.object(trader, "_market_now", return_value=market_now),
+            patch.object(trader, "_read_json", return_value=payload),
+        ):
+            ready, message, latest = trader.wait_for_today_decision_ready(max_wait_seconds=0, poll_seconds=0)
+        self.assertTrue(ready)
+        self.assertEqual(message, "")
+        self.assertEqual(latest, payload)
 
     def test_run_phase_once_records_step_running_before_exec(self) -> None:
         started_at = datetime(2026, 7, 7, 10, 0, 0)
@@ -120,6 +157,47 @@ class RunPhaseWatchTests(unittest.TestCase):
             if call.kwargs.get("step") == "phase" and call.kwargs.get("status") == "failed"
         ]
         self.assertTrue(failure_calls)
+
+
+class TradingDayControllerTests(unittest.TestCase):
+    def test_should_skip_auxiliary_task_when_next_critical_slot_too_close(self) -> None:
+        trade_date = datetime(2026, 7, 14).date()
+        specs = [
+            task_register.TaskSpec("ChallengerBuy1432", "14:32", "workbuddy-buy", trigger_slot="14:30"),
+            task_register.TaskSpec("SmartSell1445", "14:45", "smart-sell"),
+        ]
+        now = datetime(2026, 7, 14, 14, 41, 0, tzinfo=day_controller.MARKET_TZ)
+
+        should_skip, reason = day_controller.should_skip_auxiliary_task(
+            specs[0],
+            now=now,
+            current_index=0,
+            specs=specs,
+            trade_date=trade_date,
+        )
+
+        self.assertTrue(should_skip)
+        self.assertIn("preserve next critical slot 14:45", reason)
+
+    def test_main_returns_zero_when_only_auxiliary_tasks_fail(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 15, 30, 0, tzinfo=day_controller.MARKET_TZ)
+        specs = [
+            task_register.TaskSpec("ChallengerBuy1432", "14:32", "workbuddy-buy", trigger_slot="14:30"),
+            task_register.TaskSpec("Decision", "14:49", "decision"),
+        ]
+        with (
+            patch("sys.argv", ["github_actions_trade_day.py", "--trade-date", "2026-07-14"]),
+            patch.object(day_controller, "is_trading_day", return_value=True),
+            patch.object(day_controller, "ensure_runtime_env", return_value={}),
+            patch.object(day_controller, "iter_selected_specs", return_value=specs),
+            patch.object(day_controller, "target_datetime", return_value=fixed_now),
+            patch.object(day_controller, "market_now", return_value=fixed_now),
+            patch.object(day_controller, "should_skip_auxiliary_task", return_value=(False, "")),
+            patch.object(day_controller, "run_task", side_effect=[1, 0]),
+        ):
+            code = day_controller.main()
+
+        self.assertEqual(code, 0)
 
 
 class PhaseInspectionSnapshotTests(unittest.TestCase):
@@ -501,6 +579,99 @@ class ExternalMarketReviewTests(unittest.TestCase):
         self.assertTrue(set(negative).isdisjoint(set(positive)))
         self.assertTrue(set(negative).isdisjoint(set(neutral)))
         self.assertTrue(set(neutral).isdisjoint(set(positive)))
+
+    def test_mx_api_env_loads_key_from_repo_file_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.dict("os.environ", {"MX_APIKEY": ""}, clear=False),
+            ):
+                resolved = mx_api_env.ensure_mx_runtime_env()
+                resolved_env = os.environ.get("MX_APIKEY")
+
+        self.assertEqual(resolved["MX_APIKEY"], "demo-fallback-key")
+        self.assertEqual(resolved_env, "demo-fallback-key")
+
+    def test_mx_api_env_does_not_use_mx_apikey_as_api_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.dict("os.environ", {"MX_APIKEY": "", "MX_API_URL": ""}, clear=False),
+            ):
+                resolved = mx_api_env.ensure_mx_runtime_env()
+                resolved_url = os.environ.get("MX_API_URL")
+
+        self.assertEqual(resolved["MX_APIKEY"], "demo-fallback-key")
+        self.assertEqual(resolved["MX_API_URL"], "")
+        self.assertEqual(resolved_url, "")
+
+    def test_build_external_market_review_uses_mx_apikey_fallback(self) -> None:
+        sample_item = {
+            "title": "盘前偏中性，先观察结构轮动与防守方向",
+            "content": "多条消息交织，市场整体偏中性。",
+            "informationType": "新闻",
+            "insName": "东方财富研究中心",
+            "date": "2026-06-26 08:20:00",
+        }
+
+        class FakeClient:
+            def search(self, _query):
+                return {"data": {"data": {"llmSearchResponse": {"data": [sample_item]}}}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            output_json = tmpdir_path / "external_review.json"
+            output_csv = tmpdir_path / "external_review.csv"
+            output_history = tmpdir_path / "external_review.jsonl"
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(external_market_review, "OUTPUT_JSON", output_json),
+                patch.object(external_market_review, "OUTPUT_CSV", output_csv),
+                patch.object(external_market_review, "OUTPUT_HISTORY", output_history),
+                patch.object(external_market_review, "MX_SEARCH_SKILL", Path("fake-skill.py")),
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.object(Path, "exists", return_value=True),
+                patch.object(external_market_review, "_read_json", return_value={"records": []}),
+                patch.object(external_market_review, "_load_module", return_value=type("FakeMod", (), {"MXSearch": lambda self=None: FakeClient()})()),
+                patch.dict("os.environ", {"MX_APIKEY": ""}, clear=False),
+            ):
+                payload = external_market_review.build_external_market_review(
+                    run_id="rid",
+                    task_name="TLFZ-WorkBuddy-OpeningData",
+                    trigger_slot="09:31",
+                )
+                resolved_env = os.environ.get("MX_APIKEY")
+
+        self.assertEqual(payload["trade_date"], datetime.now().strftime("%Y-%m-%d"))
+        self.assertEqual(resolved_env, "demo-fallback-key")
+
+    def test_build_external_market_review_degrades_when_skill_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(external_market_review, "OUTPUT_JSON", tmpdir_path / "degraded.json"),
+                patch.object(external_market_review, "OUTPUT_CSV", tmpdir_path / "degraded.csv"),
+                patch.object(external_market_review, "OUTPUT_HISTORY", tmpdir_path / "degraded.jsonl"),
+                patch.object(external_market_review, "MX_SEARCH_SKILL", tmpdir_path / "missing-skill.py"),
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.dict("os.environ", {"MX_APIKEY": ""}, clear=False),
+            ):
+                payload = external_market_review.build_external_market_review(
+                    run_id="rid",
+                    task_name="TLFZ-WorkBuddy-OpeningData",
+                    trigger_slot="09:31",
+                )
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["review_status"], "degraded")
+        self.assertEqual(payload["a_share_bias"], "neutral")
+        self.assertEqual(payload["error_count"], 1)
+        self.assertIn("mx-search skill 缺失", payload["errors"][0]["error"])
 
     def test_close_node_merge_external_market_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

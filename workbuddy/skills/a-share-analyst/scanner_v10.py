@@ -373,9 +373,12 @@ def _write_outputs(*, df, run_time, total_amt_yi, market_regime, amount_threshol
         print(f"  {'Code':<8s} {'Name':<10s} {'Entry':>8s} {'Pos':>5s} {'Mode':<25s} {'bz_dir':>8s} {'Slope':>7s} {'MA20':>7s}")
         print(f"  {'----':<8s} {'----':<10s} {'-----':>8s} {'---':>5s} {'----':<25s} {'------':>8s} {'-----':>7s} {'-----':>7s}")
         for _, r in t.sort_values(["mode", "weekly_slope"], ascending=[True, False]).iterrows():
+            code_text = str(r.get("code", "") or "")
+            name_text = str(r.get("name", "") or "")
+            mode_text = str(r.get("mode", "") or "")
             bz_s = f"{r['bz_direction']:+.2f}%" if not np.isnan(r['bz_direction']) else "N/A"
-            print(f"  {r['code']:<8s} {r['name']:<10s} {r['entry_price']:>8.2f} {r['position']:>5.0%} "
-                  f"{r['mode']:<25s} {bz_s:>8s} {r['weekly_slope']:>6.1f}% {r['close_vs_ma20_pct']:>+6.1f}%")
+            print(f"  {code_text:<8s} {name_text:<10.10s} {r['entry_price']:>8.2f} {r['position']:>5.0%} "
+                  f"{mode_text:<25.25s} {bz_s:>8s} {r['weekly_slope']:>6.1f}% {r['close_vs_ma20_pct']:>+6.1f}%")
 
     print("\n" + "=" * 70)
     print("TOP 5 PICKS (by tier then weekly_slope)")
@@ -384,9 +387,13 @@ def _write_outputs(*, df, run_time, total_amt_yi, market_regime, amount_threshol
         top5 = df_sig.sort_values(["tier", "weekly_slope"], ascending=[True, False]).head(5)
         for rank, (_, r) in enumerate(top5.iterrows(), 1):
             tier_name = {1: "大肉", 2: "中肉", 3: "小肉"}[r['tier']]
-            print(f"  #{rank} [{tier_name}] {r['code']} {r['name']}")
+            code_text = str(r.get("code", "") or "")
+            name_text = str(r.get("name", "") or "")
+            mode_text = str(r.get("mode", "") or "")
+            signal_desc_text = str(r.get("signal_desc", "") or "")
+            print(f"  #{rank} [{tier_name}] {code_text} {name_text}")
             print(f"       Entry: {r['entry_price']:.2f}  Position: {r['position']:.0%}")
-            print(f"       Mode: {r['mode']}  {r['signal_desc']}")
+            print(f"       Mode: {mode_text}  {signal_desc_text}")
             bz_s = f"{r['bz_direction']:+.2f}%" if not np.isnan(r['bz_direction']) else "N/A"
             bz_rt_s = f"{r['bz_rt_direction']:+.2f}%" if not np.isnan(r['bz_rt_direction']) else "N/A"
             print(f"       bz(14:30-15:00)={bz_s}  bz_rt(14:30-14:50)={bz_rt_s}")
@@ -496,16 +503,136 @@ def _run_decision_fast(api, *, run_time):
     )
 
 
+def _run_prewarm_fast(api, *, run_time):
+    stocks = get_stock_list()
+    print(f"CSI1000: {len(stocks)} stocks, pytdx connected\n")
+    print("Phase 1: Dynamic amount filter (市场冷热自适应)...")
+    amt_list = []
+    for _, row in stocks.iterrows():
+        bars = api.get_security_bars(9, row["market"], row["code"], 0, 3)
+        if bars:
+            try:
+                df = api.to_df(bars)
+                if df is not None and not df.empty:
+                    amt_list.append({
+                        "code": row["code"], "name": row["name"],
+                        "market": row["market"],
+                        "latest_amt": df.iloc[-1]["amount"],
+                        "last_close": df.iloc[-1]["close"],
+                    })
+            except Exception:
+                pass
+
+    total_amt_yuan = sum(r["latest_amt"] for r in amt_list)
+    total_amt_yi = total_amt_yuan / 1e8
+    if total_amt_yi > SCAN_CONFIG["hot_market_total_yi"]:
+        market_regime = "活跃市"
+        amount_threshold = SCAN_CONFIG["hot_market_amount_yuan"]
+    elif total_amt_yi < SCAN_CONFIG["cold_market_total_yi"]:
+        market_regime = "清淡市"
+        amount_threshold = SCAN_CONFIG["cold_market_amount_yuan"]
+    else:
+        market_regime = "正常市"
+        amount_threshold = SCAN_CONFIG["min_amount_yuan"]
+
+    print(f"  中证1000总成交额: {total_amt_yi:.0f}亿 | 市场状态: {market_regime}")
+    print(f"  个股成交额阈值: {amount_threshold/1e8:.1f}亿")
+    filtered = [r for r in amt_list if r["latest_amt"] >= amount_threshold]
+    filtered.sort(key=lambda x: x["latest_amt"], reverse=True)
+    if len(filtered) > SCAN_CONFIG["max_stocks"]:
+        filtered = filtered[:SCAN_CONFIG["max_stocks"]]
+    elif len(filtered) < SCAN_CONFIG["min_stocks"]:
+        all_sorted = sorted(amt_list, key=lambda x: x["latest_amt"], reverse=True)
+        filtered = all_sorted[:SCAN_CONFIG["min_stocks"]]
+
+    amt_df = pd.DataFrame(filtered)
+    print(f"  -> 预热扫描{len(amt_df)}只 (阈值>={amount_threshold/1e8:.1f}亿, 范围{SCAN_CONFIG['min_stocks']}-{SCAN_CONFIG['max_stocks']})\n")
+    print("Phase 2: Compute daily + weekly features only...")
+    results = []
+    total = len(amt_df)
+    for i, (_, row) in enumerate(amt_df.iterrows()):
+        code = row["code"]
+        name = row["name"]
+        market = row["market"]
+        last_close = row["last_close"]
+        daily = fetch_daily_bars(api, market, code, count=250)
+        if daily is None or len(daily) < 60:
+            continue
+        d = daily.copy()
+        for w in [5, 10, 20, 60]:
+            d[f"ma{w}"] = d["close"].rolling(w).mean()
+        d["avg_amt_5d"] = d["amount"].rolling(5).mean()
+        d["amt_ratio"] = d["amount"] / d["avg_amt_5d"]
+        d["close_vs_ma20"] = (d["close"] - d["ma20"]) / d["ma20"] * 100
+        delta = d["close"].diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        d["rsi14"] = 100 - (100 / (1 + rs))
+        last = d.iloc[-1]
+        if pd.isna(last.get("ma20")) or pd.isna(last.get("amt_ratio")):
+            continue
+        ma20_off = last["close_vs_ma20"] if pd.notna(last["close_vs_ma20"]) else 0.0
+        amt_r = last["amt_ratio"] if pd.notna(last["amt_ratio"]) else 1.0
+        vol_exp = bool(1.3 <= amt_r <= 2.5)
+        rsi = last["rsi14"] if pd.notna(last["rsi14"]) else 50.0
+        is_green = last["close"] > last["open"]
+        weekly = fetch_weekly_bars(api, market, code, count=100)
+        wfeats = compute_weekly_features(weekly)
+        weekly_align = wfeats.get("weekly_align", False)
+        weekly_slope = wfeats.get("weekly_slope", 0.0)
+
+        # Prewarm only prepares reusable base features; final 5-min classification stays in decision-fast.
+        results.append({
+            "code": code,
+            "name": name,
+            "close": last_close,
+            "entry_price": last_close,
+            "market": market,
+            "tier": 0,
+            "mode": "prewarm_pending_decision",
+            "position": 0.0,
+            "signal_desc": "",
+            "bz_direction": np.nan,
+            "bz_rt_direction": np.nan,
+            "bz_vol_ratio": np.nan,
+            "weekly_align": weekly_align,
+            "weekly_slope": weekly_slope,
+            "close_vs_ma20_pct": ma20_off,
+            "amt_ratio": amt_r,
+            "rsi14": rsi,
+            "is_green": is_green,
+            "vol_expand": vol_exp,
+        })
+        if (i + 1) % 50 == 0:
+            print(f"  Processed {i+1}/{total}")
+
+    print(f"  -> Prewarm cached base features for {len(results)} stocks\n")
+    _write_outputs(
+        df=pd.DataFrame(results),
+        run_time=run_time,
+        total_amt_yi=total_amt_yi,
+        market_regime=market_regime,
+        amount_threshold=amount_threshold,
+        scanned_count=len(amt_df),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="V10 scanner")
     parser.add_argument("--decision-fast", action="store_true", help="reuse latest scan and refresh 5-min tail only")
+    parser.add_argument("--prewarm-fast", action="store_true", help="prewarm only daily/weekly base features and defer 5-min classification to decision")
     args = parser.parse_args()
     # #region debug-point A:scanner-main-start
     _main_strategy_debug_emit(
         "A",
         "scanner_v10.py:main",
         "[DEBUG] scanner main started",
-        {"started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "decision_fast": bool(args.decision_fast)},
+        {
+            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "decision_fast": bool(args.decision_fast),
+            "prewarm_fast": bool(args.prewarm_fast),
+        },
     )
     # #endregion
     print("=" * 70)
@@ -519,6 +646,10 @@ def main():
         if args.decision_fast:
             print("Decision fast mode: reuse latest prewarm scan and refresh 5-min tail only...")
             _run_decision_fast(api, run_time=run_time)
+            return
+        if args.prewarm_fast:
+            print("Prewarm fast mode: cache daily/weekly base features and defer 5-min refresh to decision...")
+            _run_prewarm_fast(api, run_time=run_time)
             return
 
         stocks = get_stock_list()
