@@ -134,6 +134,11 @@ def validate_candidate_pool_artifact(
             "workbuddy 候选池 candidate_count 小于 selected_count: "
             f"{candidate_count} < {selected_count}"
         )
+
+    # Per-entry schema validation (fail-fast on bad data at pool->trader boundary)
+    from .pipeline_schema import validate_candidate_pool as _validate_pool_schema
+    _validate_pool_schema(payload, path_hint=str(target_path))
+
     return ValidationReport(
         name="workbuddy_candidate_pool_latest.json",
         path=target_path,

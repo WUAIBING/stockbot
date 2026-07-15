@@ -26,6 +26,7 @@ from typing import Any
 import v10_moni_trader as base
 from market_resolver import build_today_exclusion_map, exclusion_reason_text, resolve_market_info
 from package_paths import DATA_DIR
+from position_sizer import SizerConfig, compute_position_weights
 from trading_calendar import latest_workbuddy_source_trade_date
 from workbuddy_runtime import (
     ARKCLAW_ROOT,
@@ -1509,6 +1510,8 @@ def build_buy_plan(
 
     selected_records = sorted(selected_records, key=_execution_candidate_priority_key)
 
+    # ----- Phase 1: qualify candidates (same filters as before) -----
+    qualified: list[dict[str, Any]] = []
     for row in selected_records:
         code = _normalize_code(row.get("code", ""))
         name = str(row.get("name", "")).strip()
@@ -1549,10 +1552,76 @@ def build_buy_plan(
             existing_ratio = _safe_float(existing_state.get("built_ratio", 0.0), 0.0)
             existing_cost = _safe_float(holding_record.get("buy_amount", 0.0), 0.0)
 
-        target_weight_pct = _safe_float(row.get("target_weight_pct", 0.0), 0.0)
-        if target_weight_pct <= 0:
-            target_weight_pct = round(100 / max(len(selected_records), 1), 2)
+        if not buy_override:
+            action = _resolve_entry_action(buy_window["key"], readiness, existing_ratio=existing_ratio)
+            if action["action"] == "skip":
+                skipped.append({"code": code, "name": name, "reason": action["reason"]})
+                continue
+
+        qualified.append({
+            "row": row,
+            "code": code,
+            "name": name,
+            "market_info": market_info,
+            "ref_price": ref_price,
+            "readiness": readiness,
+            "existing_ratio": existing_ratio,
+            "existing_cost": existing_cost,
+        })
+
+    # ----- Phase 2: Kelly-based position sizing -----
+    if buy_override:
+        sizer_weights: dict[str, float] = {}
+        sizer_debug: dict[str, Any] = {"mode": "buy_override_disabled"}
+    else:
+        # Enrich with fields the sizer needs from the pool entry
+        sizer_candidates: list[dict[str, Any]] = []
+        for q in qualified:
+            row = q["row"]
+            sizer_candidates.append({
+                "code": q["code"],
+                "name": q["name"],
+                "score": _safe_float(row.get("selection_score", 0.0), 0.0),
+                "avg_candidate_win_rate": _safe_float(row.get("avg_candidate_win_rate", 0.0), 0.0),
+                "avg_candidate_avg_return": _safe_float(row.get("avg_candidate_avg_return", 0.0), 0.0),
+                "avg_profitability_priority": _profitability_priority_value(row),
+                "volatility": _safe_float(row.get("volatility", 0.0), 0.0),
+                "correlation_group": str(row.get("correlation_group", "") or "").strip(),
+                "selection_rank": _safe_int(row.get("selection_rank", 0), 0),
+            })
+
+        realized_pnl = account_snapshot.get("realized_pnl", 0.0)
+        floating_pnl = account_snapshot.get("floating_pnl", 0.0)
+        total_pnl = realized_pnl + floating_pnl
+        drawdown_pct = max(0.0, -total_pnl / max(INITIAL_CAPITAL, 1.0) * 100.0)
+
+        sizer_config = SizerConfig()
+        allocations, sizer_debug = compute_position_weights(
+            sizer_candidates,
+            total_assets,
+            drawdown_pct=drawdown_pct,
+            window_key=buy_window["key"],
+            config=sizer_config,
+        )
+        sizer_weights = {a.code: a.weight_pct for a in allocations}
+        sizer_targets = {a.code: a.target_amount for a in allocations}
+        sizer_debug["sized_count"] = len(allocations)
+
+    # ----- Phase 3: build buy_list from sized candidates -----
+    for q in qualified:
+        row = q["row"]
+        code = q["code"]
+        name = q["name"]
+        market_info = q["market_info"]
+        ref_price = q["ref_price"]
+        readiness = q["readiness"]
+        existing_ratio = q["existing_ratio"]
+        existing_cost = q["existing_cost"]
+
         if buy_override:
+            target_weight_pct = _safe_float(row.get("target_weight_pct", 0.0), 0.0)
+            if target_weight_pct <= 0:
+                target_weight_pct = round(100 / max(len(selected_records), 1), 2)
             target_amount = round(cash_budget * target_weight_pct / 100, 2)
             planned_target_amount = target_amount
             action = {
@@ -1571,17 +1640,17 @@ def build_buy_plan(
                 "runner_day2_final_window": str(override_exit_plan.get("runner_day2_final_window", "")).strip(),
             }
         else:
-            action = _resolve_entry_action(
-                buy_window["key"],
-                readiness,
-                existing_ratio=existing_ratio,
-            )
+            action = _resolve_entry_action(buy_window["key"], readiness, existing_ratio=existing_ratio)
             if action["action"] == "skip":
                 skipped.append({"code": code, "name": name, "reason": action["reason"]})
                 continue
-            target_amount = total_assets * target_weight_pct / 100
+
+            kelly_weight = sizer_weights.get(code, 0.0)
+            target_weight_pct = kelly_weight if kelly_weight > 0 else round(100 / max(len(qualified), 1), 2)
+            target_amount = sizer_targets.get(code, round(total_assets * target_weight_pct / 100, 2))
             planned_target_amount = round(target_amount * _safe_float(action.get("target_build_ratio", 0.0), 0.0), 2)
             exit_plan = _classify_exit_intent(row, readiness, window_key=buy_window["key"])
+
         additional_amount = max(0.0, planned_target_amount - existing_cost)
         allowed_amount = min(additional_amount, avail)
         quantity = base.calc_buy_quantity(ref_price, allowed_amount)
@@ -1674,6 +1743,7 @@ def build_buy_plan(
             if buy_override
             else {"enabled": False}
         ),
+        "position_sizer": sizer_debug,
         "buy_candidate_count": len(buy_list),
         "skipped_count": len(skipped),
         "buy_candidates": buy_list,
