@@ -41,6 +41,7 @@ from pytdx.hq import TdxHq_API
 
 from market_resolver import build_today_exclusion_map, exclusion_reason_text
 from package_paths import DATA_DIR
+from position_sizer import SizerConfig, compute_position_weights
 from trading_calendar import previous_trading_day
 from evolving_model import (
     model_summary as get_evolving_model_summary,
@@ -8061,12 +8062,16 @@ def _build_close_node_payload(*, summary, reconcile_summary, daily_evolution_bun
     return payload
 
 
-def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT):
-    """计算买入数量（整百股），amount=目标买入金额（元）"""
-    if entry_price <= 0 or amount <= 0:
+def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT, override_amount=None):
+    """计算买入数量（整百股），amount=目标买入金额（元）。
+
+    override_amount 非 None 时使用该值替代 amount，支持 Kelly 分配器外部覆写。
+    """
+    effective_amount = override_amount if override_amount is not None else amount
+    if entry_price <= 0 or effective_amount <= 0:
         return 0
-    qty = int(amount / entry_price / 100) * 100
-    return qty if qty >= 100 else 0  # 买不起100股就返回0
+    qty = int(effective_amount / entry_price / 100) * 100
+    return qty if qty >= 100 else 0
 
 
 # ─── TDX 连接（信号衰减检测用） ───
@@ -8991,6 +8996,69 @@ def do_buy(dry_run=False):
     if not buy_list:
         print(" 买入候选已被现有持仓或未完成买单过滤，尾盘不再重复报单")
         return EXIT_NO_ACTION
+
+    # ── Kelly position sizing (feature-flagged, batch allocation) ──
+    kelly_enabled = os.environ.get('MEP_USE_KELLY_SIZER', '0') not in ('0', 'false', '', 'no')
+    kelly_skipped: list[str] = []
+    if kelly_enabled and len(buy_list) >= 1:
+        # Build sizer-compatible candidates from buy_list
+        sizer_input = []
+        for item in buy_list:
+            sizer_input.append({
+                'code': str(item.get('code', '')).strip(),
+                'name': str(item.get('name', '')).strip(),
+                'score': _fnum(item.get('ranking_score', 0.0), 0.0),
+                'avg_candidate_win_rate': 0.0,
+                'avg_candidate_avg_return': 0.0,
+                'avg_profitability_priority': max(
+                    _fnum(item.get('ranking_score', 0.0), 0.0),
+                    _fnum(item.get('model_score', 0.0), 0.0),
+                ),
+                'volatility': 25.0,
+                'correlation_group': str(item.get('model_industry', '') or '').strip(),
+                'selection_rank': _inum(item.get('big_meat_priority_rank', 0), 0) or item['tier'],
+            })
+
+        # Compute drawdown from PnL
+        realized_pnl = _fnum(balance.get('realized_pnl', 0.0), 0.0)
+        floating_pnl = _fnum(balance.get('floating_pnl', 0.0), 0.0)
+        drawdown_pct = max(0.0, - (realized_pnl + floating_pnl) / max(balance.get('initial_capital', total_assets), 1.0) * 100.0)
+
+        allocations, sizer_debug = compute_position_weights(
+            sizer_input,
+            total_assets,
+            drawdown_pct=drawdown_pct,
+            window_key='14:50',
+            config=SizerConfig(max_single_pct=min(12.0, BUY_AMOUNT_DEFAULT / max(total_assets, 1.0) * 100.0)),
+        )
+        sizer_map = {a.code: a for a in allocations}
+
+        # Remap Kelly weights onto buy_list
+        kelly_buy_list = []
+        for item in buy_list:
+            code = str(item.get('code', '')).strip()
+            alloc = sizer_map.get(code)
+            if alloc is None:
+                kelly_skipped.append(f"{code}(kelly_zero)")
+                continue
+            kelly_amount = min(alloc.target_amount, _fnum(item.get('planned_build_amount', 0.0), 0.0))
+            if kelly_amount <= 0:
+                kelly_skipped.append(f"{code}(kelly_zero_amount)")
+                continue
+            item['planned_build_amount'] = kelly_amount
+            item['kelly_weight_pct'] = round(alloc.weight_pct, 4)
+            kelly_buy_list.append(item)
+        buy_list = kelly_buy_list
+        if kelly_skipped:
+            print(f" [Kelly] 分配器跳过: {', '.join(kelly_skipped[:10])}")
+        print(
+            f" [Kelly] 批次分配完成: 输入{len(sizer_input)}只 "
+            f"| 输出{len(sizer_map)}只 "
+            f"| 回撤比例{drawdown_pct:.1f}% "
+            f"| 缩放系数{sizer_debug.get('drawdown_scale', 1.0):.2f}x"
+        )
+    # ── end Kelly block ──
+
     funded_buy_list = []
     skipped_budget = []
     avail = balance['avail_balance']
