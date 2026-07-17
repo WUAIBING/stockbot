@@ -32,14 +32,16 @@ import time
 import re
 import urllib.request
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 from pytdx.hq import TdxHq_API
 
 from market_resolver import build_today_exclusion_map, exclusion_reason_text
+from mx_api_env import ensure_mx_runtime_env
 from package_paths import DATA_DIR
 from position_sizer import SizerConfig, compute_position_weights
 from trading_calendar import previous_trading_day
@@ -181,8 +183,84 @@ def _midday_review_debug_emit(hypothesis_id, msg, **data):
 # #endregion
 
 # 环境变量
-MX_APIKEY = os.environ.get('MX_APIKEY', '')
-MX_API_URL = os.environ.get('MX_API_URL', 'https://mkapi2.dfcfs.com/finskillshub')
+def _midday_api_fail_debug_emit(hypothesis_id: str, msg: str, data: dict, *, location: str) -> None:
+    env_path = Path(__file__).resolve().parent / '.dbg' / 'midday-api-fail.env'
+    url = 'http://127.0.0.1:7788/event'
+    session_id = 'midday-api-fail'
+    try:
+        if env_path.exists():
+            content = env_path.read_text(encoding='utf-8', errors='replace')
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if line.startswith('DEBUG_SERVER_URL='):
+                    url = line.split('=', 1)[1].strip() or url
+                elif line.startswith('DEBUG_SESSION_ID='):
+                    session_id = line.split('=', 1)[1].strip() or session_id
+    except Exception:
+        pass
+    payload = {
+        'sessionId': session_id,
+        'runId': os.environ.get('TRAE_DEBUG_RUN_ID', 'pre'),
+        'hypothesisId': hypothesis_id,
+        'location': location,
+        'msg': msg,
+        'data': data,
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+            ),
+            timeout=0.8,
+        ).read()
+    except Exception:
+        pass
+
+
+# #region debug-point A:mx-api-flap-debug-helper
+def _mx_api_flap_debug_emit(hypothesis_id: str, msg: str, data: dict, *, location: str) -> None:
+    env_path = Path(__file__).resolve().parent / '.dbg' / 'mx-api-flap.env'
+    url = 'http://127.0.0.1:7777/event'
+    session_id = 'mx-api-flap'
+    try:
+        if env_path.exists():
+            content = env_path.read_text(encoding='utf-8', errors='replace')
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if line.startswith('DEBUG_SERVER_URL='):
+                    url = line.split('=', 1)[1].strip() or url
+                elif line.startswith('DEBUG_SESSION_ID='):
+                    session_id = line.split('=', 1)[1].strip() or session_id
+    except Exception:
+        pass
+    payload = {
+        'sessionId': session_id,
+        'runId': os.environ.get('TRAE_DEBUG_RUN_ID', 'pre-fix'),
+        'hypothesisId': hypothesis_id,
+        'location': location,
+        'msg': msg,
+        'data': data,
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+            ),
+            timeout=0.8,
+        ).read()
+    except Exception:
+        pass
+# #endregion
+
+
+_MX_RUNTIME_ENV = ensure_mx_runtime_env()
+MX_APIKEY = _MX_RUNTIME_ENV.get('MX_APIKEY', '') or os.environ.get('MX_APIKEY', '')
+MX_API_URL = _MX_RUNTIME_ENV.get('MX_API_URL', '') or os.environ.get('MX_API_URL', 'https://mkapi2.dfcfs.com/finskillshub')
+
 
 # 数据目录
 SCAN_CSV = str(DATA_DIR / 'v10_scan_full.csv')
@@ -192,12 +270,16 @@ TRACK_FILE = str(DATA_DIR / 'v10_track_record.csv')
 POSITION_STATE_FILE = str(DATA_DIR / 'v10_position_state.json')
 NAV_FILE = str(DATA_DIR / 'v10_nav_history.csv')
 SUMMARY_FILE = str(DATA_DIR / 'v10_account_summary_latest.json')
+BALANCE_CACHE_FILE = str(DATA_DIR / 'v10_balance_cache.json')
+POSITIONS_CACHE_FILE = str(DATA_DIR / 'v10_positions_cache.json')
+ORDERS_CACHE_FILE = str(DATA_DIR / 'v10_orders_cache.json')
 MIDDAY_REVIEW_FILE = str(DATA_DIR / 'v10_midday_review_latest.json')
 MIDDAY_NODE_FILE = str(DATA_DIR / 'v10_midday_node_latest.json')
 MIDDAY_GATE_FILE = str(DATA_DIR / 'v10_midday_gate_latest.json')
 PM_GATE_FILE = str(DATA_DIR / 'v10_pm_gate_status.json')
 CLOSE_NODE_FILE = str(DATA_DIR / 'v10_close_node_latest.json')
 LEARNING_GATE_FILE = str(DATA_DIR / 'v10_learning_gate_status.json')
+READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS = 600
 DAILY_EVOLUTION_BUNDLE_FILE = str(DATA_DIR / 'v10_daily_evolution_bundle_latest.json')
 ENGINEERING_REVIEW_FILE = str(DATA_DIR / 'v10_engineering_review_latest.json')
 ENGINEERING_MANUAL_INCIDENTS_FILE = str(DATA_DIR / 'v10_engineering_manual_incidents_latest.json')
@@ -527,8 +609,19 @@ def _inum(value, default=0):
         return int(default)
 
 
+MARKET_TZ = timezone(timedelta(hours=8), name='UTC+08')
+
+
+def _market_now():
+    return datetime.now(MARKET_TZ)
+
+
+def _market_today():
+    return _market_now().strftime('%Y-%m-%d')
+
+
 def _now_str():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return _market_now().strftime('%Y-%m-%d %H:%M:%S')
 
 
 _LAST_TRADE_API_TS = 0.0
@@ -585,7 +678,7 @@ def _resolve_trade_min_interval(base_interval_seconds, order_context=None):
 
 
 def _is_opening_burst_window(now_dt=None):
-    now_dt = now_dt or datetime.now()
+    now_dt = now_dt or _market_now()
     time_tag = now_dt.strftime('%H:%M')
     return '09:30' <= time_tag < '10:00'
 
@@ -716,6 +809,49 @@ def _write_json_atomic(path, payload):
     tmp_path.replace(json_path)
 
 
+def _write_live_endpoint_cache(path, data):
+    safe_data = json.loads(json.dumps(data, ensure_ascii=False, default=str))
+    _write_json_atomic(path, {
+        'cached_at': _now_str(),
+        'cached_ts': int(time.time()),
+        'data': safe_data,
+    })
+
+
+def _read_live_endpoint_cache(path, *, max_age_seconds=READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS):
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        return None, None
+    data = payload.get('data')
+    cached_ts = _inum(payload.get('cached_ts', 0), 0)
+    if cached_ts <= 0:
+        return None, None
+    age_seconds = max(0, int(time.time()) - cached_ts)
+    if max_age_seconds > 0 and age_seconds > max_age_seconds:
+        return None, age_seconds
+    return data, age_seconds
+
+
+def _rehydrate_cached_orders(items):
+    restored = []
+    for raw in items or []:
+        order = dict(raw if isinstance(raw, dict) else {})
+        ts = _inum(order.get('time', 0), 0)
+        if ts > 0:
+            order['datetime'] = datetime.fromtimestamp(ts)
+        else:
+            dt_raw = str(order.get('datetime', '')).strip()
+            if dt_raw:
+                try:
+                    order['datetime'] = datetime.fromisoformat(dt_raw)
+                except ValueError:
+                    order['datetime'] = None
+            else:
+                order['datetime'] = None
+        restored.append(order)
+    return restored
+
+
 def _append_jsonl(path, payload):
     log_path = Path(path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -799,7 +935,7 @@ def _trade_date_from_run_slot(run_slot):
     text = str(run_slot or '').strip()
     if len(text) >= 10 and text[4] == '-' and text[7] == '-':
         return text[:10]
-    return datetime.now().strftime('%Y-%m-%d')
+    return _market_today()
 
 
 def _build_selected_reason_hash(item):
@@ -1311,7 +1447,7 @@ def _load_scan_snapshot_rows(*, trade_date='', scan_manifest=None):
 
 
 def wait_for_today_decision_ready(*, max_wait_seconds=DECISION_READY_MAX_WAIT_SECONDS, poll_seconds=DECISION_READY_POLL_SECONDS):
-    now = datetime.now()
+    now = _market_now()
     deadline = time.time() + max(0, max_wait_seconds)
     while True:
         payload = _read_json(LATEST_DECISION_STATUS_FILE) or {}
@@ -2271,11 +2407,43 @@ def get_orders(flt_order_drt=0, flt_order_status=0):
         'fltOrderDrt': flt_order_drt,
         'fltOrderStatus': flt_order_status,
     })
+    # #region debug-point D:orders-fetch
+    _mx_api_flap_debug_emit(
+        'D',
+        '[DEBUG] get_orders result',
+        {
+            'ok': bool(result and result.get('code') in ['0', 0, '200', 200]),
+            'flt_order_drt': flt_order_drt,
+            'flt_order_status': flt_order_status,
+            'result_code': None if not isinstance(result, dict) else result.get('code'),
+            'message': '' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+        },
+        location='v10_moni_trader.py:get_orders',
+    )
+    # #endregion
     if not result or result.get('code') not in ['0', 0, '200', 200]:
+        cached_orders, cache_age_seconds = _read_live_endpoint_cache(ORDERS_CACHE_FILE)
+        if isinstance(cached_orders, list):
+            # #region debug-point F:orders-cache-fallback
+            _mx_api_flap_debug_emit(
+                'F',
+                '[DEBUG] get_orders cache fallback',
+                {
+                    'flt_order_drt': flt_order_drt,
+                    'flt_order_status': flt_order_status,
+                    'cache_age_seconds': cache_age_seconds,
+                    'cached_count': len(cached_orders),
+                },
+                location='v10_moni_trader.py:get_orders',
+            )
+            # #endregion
+            return _rehydrate_cached_orders(cached_orders)
         return []
     data = result.get('data', {})
     orders = data.get('orders', []) or []
-    return [_normalize_order(order) for order in orders]
+    normalized_orders = [_normalize_order(order) for order in orders]
+    _write_live_endpoint_cache(ORDERS_CACHE_FILE, normalized_orders)
+    return normalized_orders
 
 
 def _cancel_result_ok(result):
@@ -2539,12 +2707,10 @@ def api_request(
 ):
     """发送 API 请求到妙想服务器"""
     url = f"{MX_API_URL}{endpoint}"
-    cmd = [
-        'curl', '-s', '-X', 'POST', url,
-        '-H', f'apikey: {MX_APIKEY}',
-        '-H', 'Content-Type: application/json; charset=UTF-8',
-        '-d', json.dumps(payload)
-    ]
+    headers = {
+        'apikey': MX_APIKEY,
+        'Content-Type': 'application/json; charset=UTF-8',
+    }
     attempts = _resolve_trade_max_retries(trade_meta) if is_trade else 1
     request_timeout = _fnum(request_timeout_seconds, 30.0)
     if request_timeout <= 0:
@@ -2553,26 +2719,67 @@ def api_request(
         if is_trade:
             _throttle_trade_api(min_interval_seconds=min_interval_seconds)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=request_timeout,
-                                    encoding='utf-8', errors='replace')
-            if result.returncode != 0:
-                # #region debug-point A:curl-process-failed
-                import urllib.request, os; _p='.dbg/midday-api-fail.env'; _u,_s='http://127.0.0.1:7788/event','midday-api-fail'; exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass"); urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId":_s,"runId":"pre","hypothesisId":"A","location":"v10_moni_trader.py:1093","msg":"[DEBUG] curl process failed","data":{"endpoint":endpoint,"returncode":result.returncode,"stderr":(result.stderr or "")[:400],"stdout":(result.stdout or "")[:400],"cwd":os.getcwd(),"has_apikey":bool(MX_APIKEY),"curl_path":__import__('shutil').which('curl')}}, ensure_ascii=False).encode(), headers={"Content-Type":"application/json"}), timeout=2).read()
+            response_obj = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=request_timeout,
+            )
+            response_obj.raise_for_status()
+            try:
+                response = response_obj.json()
+            except ValueError:
+                # #region debug-point D:json-decode-failed
+                _midday_api_fail_debug_emit(
+                    'D',
+                    '[DEBUG] json decode failed',
+                    {
+                        'endpoint': endpoint,
+                        'status_code': response_obj.status_code,
+                        'response_text': (response_obj.text or '')[:400],
+                        'has_apikey': bool(MX_APIKEY),
+                        'transport': 'requests',
+                    },
+                    location='v10_moni_trader.py:1099',
+                )
                 # #endregion
-                print(f"[ERROR] curl failed: {result.stderr}")
+                print("[ERROR] JSON decode failed")
                 response = None
-            else:
-                try:
-                    response = json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    # #region debug-point D:json-decode-failed
-                    import urllib.request, os; _p='.dbg/midday-api-fail.env'; _u,_s='http://127.0.0.1:7788/event','midday-api-fail'; exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass"); urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId":_s,"runId":"pre","hypothesisId":"D","location":"v10_moni_trader.py:1099","msg":"[DEBUG] json decode failed","data":{"endpoint":endpoint,"stdout":(result.stdout or "")[:400],"stderr":(result.stderr or "")[:400],"cwd":os.getcwd(),"has_apikey":bool(MX_APIKEY)}}, ensure_ascii=False).encode(), headers={"Content-Type":"application/json"}), timeout=2).read()
-                    # #endregion
-                    print(f"[ERROR] JSON decode failed")
-                    response = None
+        except requests.RequestException as e:
+            # #region debug-point A:requests-failed
+            response_obj = getattr(e, 'response', None)
+            _midday_api_fail_debug_emit(
+                'A',
+                '[DEBUG] requests transport failed',
+                {
+                    'endpoint': endpoint,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                    'status_code': getattr(response_obj, 'status_code', None),
+                    'response_text': ((response_obj.text if response_obj is not None else '') or '')[:400],
+                    'has_apikey': bool(MX_APIKEY),
+                    'transport': 'requests',
+                },
+                location='v10_moni_trader.py:1093',
+            )
+            # #endregion
+            print(f"[ERROR] request failed: {e}")
+            response = None
         except Exception as e:
             # #region debug-point E:python-exception
-            import urllib.request, os; _p='.dbg/midday-api-fail.env'; _u,_s='http://127.0.0.1:7788/event','midday-api-fail'; exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass"); urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId":_s,"runId":"pre","hypothesisId":"E","location":"v10_moni_trader.py:1104","msg":"[DEBUG] api_request exception","data":{"endpoint":endpoint,"error_type":type(e).__name__,"error":str(e),"cwd":os.getcwd(),"has_apikey":bool(MX_APIKEY),"curl_path":__import__('shutil').which('curl')}}, ensure_ascii=False).encode(), headers={"Content-Type":"application/json"}), timeout=2).read()
+            _midday_api_fail_debug_emit(
+                'E',
+                '[DEBUG] api_request exception',
+                {
+                    'endpoint': endpoint,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                    'cwd': os.getcwd(),
+                    'has_apikey': bool(MX_APIKEY),
+                    'transport': 'requests',
+                },
+                location='v10_moni_trader.py:1104',
+            )
             # #endregion
             print(f"[ERROR] API request failed: {e}")
             response = None
@@ -2616,20 +2823,76 @@ def api_request(
 def get_balance():
     """查询账户资金（API moneyUnit=1 时返回单位为元，无需额外换算）"""
     result = api_request('/api/claw/mockTrading/balance', {'moneyUnit': 1})
+    # #region debug-point B:balance-fetch
+    _mx_api_flap_debug_emit(
+        'B',
+        '[DEBUG] get_balance result',
+        {
+            'ok': bool(result and result.get('code') in ['0', 0, '200', 200]),
+            'result_code': None if not isinstance(result, dict) else result.get('code'),
+            'message': '' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+        },
+        location='v10_moni_trader.py:get_balance',
+    )
+    # #endregion
     if not result or result.get('code') not in ['0', 0, '200', 200]:
+        cached_balance, cache_age_seconds = _read_live_endpoint_cache(BALANCE_CACHE_FILE)
+        if isinstance(cached_balance, dict) and cached_balance:
+            # #region debug-point F:balance-cache-fallback
+            _mx_api_flap_debug_emit(
+                'F',
+                '[DEBUG] get_balance cache fallback',
+                {
+                    'cache_age_seconds': cache_age_seconds,
+                    'has_total_assets': bool(_fnum(cached_balance.get('total_assets', 0.0), 0.0) > 0),
+                },
+                location='v10_moni_trader.py:get_balance',
+            )
+            # #endregion
+            return cached_balance
         return None
     data = result['data']
-    return {
+    balance = {
         'total_assets': data.get('totalAssets', 0),
         'avail_balance': data.get('availBalance', 0),
         'total_pos_value': data.get('totalPosValue', 0),
     }
+    _write_live_endpoint_cache(BALANCE_CACHE_FILE, balance)
+    return balance
 
 
 def get_positions():
     """查询持仓（API返回单位：count=股, value/profit=元, price需按priceDec除）"""
     result = api_request('/api/claw/mockTrading/positions', {'moneyUnit': 1})
+    # #region debug-point C:positions-fetch
+    _mx_api_flap_debug_emit(
+        'C',
+        '[DEBUG] get_positions result',
+        {
+            'ok': bool(result and result.get('code') in ['0', 0, '200', 200]),
+            'result_code': None if not isinstance(result, dict) else result.get('code'),
+            'message': '' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+            'raw_pos_count': _inum((((result or {}).get('data') or {}).get('posList') or []).__len__(), 0) if isinstance(result, dict) else 0,
+        },
+        location='v10_moni_trader.py:get_positions',
+    )
+    # #endregion
     if not result or result.get('code') not in ['0', 0, '200', 200]:
+        cached_positions, cache_age_seconds = _read_live_endpoint_cache(POSITIONS_CACHE_FILE)
+        if isinstance(cached_positions, list):
+            # #region debug-point F:positions-cache-fallback
+            _mx_api_flap_debug_emit(
+                'F',
+                '[DEBUG] get_positions cache fallback',
+                {
+                    'cache_age_seconds': cache_age_seconds,
+                    'cached_count': len(cached_positions),
+                    'cached_codes': [str((item or {}).get('code', '')).zfill(6) for item in cached_positions[:10]],
+                },
+                location='v10_moni_trader.py:get_positions',
+            )
+            # #endregion
+            return cached_positions
         return []
     data = result['data']
     pos_list = data.get('posList', [])
@@ -2654,6 +2917,7 @@ def get_positions():
         if not _has_active_position(item):
             continue
         positions.append(item)
+    _write_live_endpoint_cache(POSITIONS_CACHE_FILE, positions)
     return positions
 
 
@@ -4747,6 +5011,22 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
     previous_summary = _read_json(SUMMARY_FILE) if os.path.exists(SUMMARY_FILE) else {}
     fallback_account = previous_summary.get('account', {}) if isinstance(previous_summary, dict) else {}
     account_live = bool(balance) or bool(positions)
+    # #region debug-point E:summary-fallback
+    _mx_api_flap_debug_emit(
+        'E',
+        '[DEBUG] write_account_artifacts pre-summary',
+        {
+            'tag': tag,
+            'account_live': account_live,
+            'has_balance': bool(balance),
+            'positions_count': len(positions or []),
+            'fallback_position_count': _inum(fallback_account.get('position_count', 0), 0),
+            'pending_active_buy_count': len((pending_summary or {}).get('active_buy_codes', []) or []),
+            'pending_active_sell_count': len((pending_summary or {}).get('active_sell_codes', []) or []),
+        },
+        location='v10_moni_trader.py:write_account_artifacts',
+    )
+    # #endregion
     if not account_live and fallback_account:
         balance = {
             'total_assets': _fnum(fallback_account.get('total_assets', 0.0), 0.0),
@@ -4869,7 +5149,7 @@ def build_midday_review(*, balance=None, positions=None, orders=None, records=No
     pending_items = refresh_pending_orders(orders=orders, positions=positions)
     pending_summary = summarize_pending_orders(pending_items)
     active_pos_map = _active_position_map(positions)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     review_items = []
     market_temperature = 'neutral'
     total_profit_pct = 0.0
@@ -5410,7 +5690,7 @@ def _build_intraday_judgment(*, context, review_payload, review_status, pm_gate_
 
     return {
         'available': True,
-        'trade_date': datetime.now().strftime('%Y-%m-%d'),
+        'trade_date': _market_today(),
         'generated_at': _now_str(),
         'market_temperature': market_temperature,
         'review_status': review_status,
@@ -6365,7 +6645,7 @@ def _load_latest_midday_payload():
 
 
 def _build_pm_buy_guardrails():
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     payload = _load_latest_midday_payload()
     if not payload and os.path.exists(PM_GATE_FILE):
         payload = _read_json(PM_GATE_FILE)
@@ -8152,7 +8432,7 @@ def _in_checkpoint_grace(now_value, checkpoints, *, grace_minutes=3):
 
 
 def _resolve_add_position_window(now_value=None):
-    now_value = now_value or datetime.now()
+    now_value = now_value or _market_now()
     for hour, minute in ADD_POSITION_CHECKPOINTS:
         current = now_value.hour * 60 + now_value.minute + now_value.second / 60.0
         checkpoint = hour * 60 + minute
@@ -8171,7 +8451,7 @@ def _current_add_position_window_tag(now_value=None):
 
 
 def ensure_trade_window(action, *, dry_run=False):
-    now = datetime.now()
+    now = _market_now()
     if dry_run:
         return True
     current = now.strftime('%H:%M')
@@ -8961,7 +9241,7 @@ def do_buy(dry_run=False):
     pending_items = refresh_pending_orders(orders=orders, positions=positions)
     pending_summary = summarize_pending_orders(pending_items)
     active_pos_map = _active_position_map(positions)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     holding_codes = {
         str(r.get('code', '')).zfill(6)
         for r in records
@@ -9260,7 +9540,7 @@ def _do_sell_core(smart=False, dry_run=False):
     if not ensure_trade_window(action, dry_run=dry_run):
         return EXIT_WINDOW_SKIPPED
     records = load_track_record()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     track_holding = [r for r in records if r.get('status') == 'holding']
     #region debug-point smart-sell-initial-refresh-start
     initial_refresh_started_at = time.perf_counter()
@@ -10555,7 +10835,7 @@ def do_add_position(dry_run=False):
     if skipped_yield_new:
         print(f" 新机会让位过滤: {', '.join(skipped_yield_new[:10])}")
 
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     success_count = 0
     first_pass_success_count = 0
     tail_retry_success_count = 0
@@ -10772,6 +11052,18 @@ def do_add_position(dry_run=False):
 def do_close_node():
     """收盘节点：全天复核复盘 + 学习放行。"""
     stage = 'start'
+    started_at = time.perf_counter()
+    def _emit_stage(checkpoint: str, **data):
+        _main_strategy_chain_emit(
+            'C',
+            'v10_moni_trader.py:do_close_node',
+            f'[DEBUG] close-node stage {checkpoint}',
+            {
+                'stage': stage,
+                'elapsed_ms': round((time.perf_counter() - started_at) * 1000, 1),
+                **data,
+            },
+        )
     # #region debug-point D:close-node-start
     _main_strategy_chain_emit(
         'C',
@@ -10782,8 +11074,16 @@ def do_close_node():
     # #endregion
     try:
         stage = 'collect_context'
+        _emit_stage('collect_context:start')
         context = _collect_reconcile_context()
+        _emit_stage(
+            'collect_context:done',
+            positions_count=len(context.get('positions') or []),
+            records_count=len(context.get('records') or []),
+            orders_count=len(context.get('orders') or []),
+        )
         stage = 'write_account_artifacts'
+        _emit_stage('write_account_artifacts:start')
         summary = write_account_artifacts(
             'report',
             balance=context['balance'],
@@ -10792,20 +11092,30 @@ def do_close_node():
         )
         summary['full_reconcile'] = context['reconcile_summary']
         _write_json_atomic(SUMMARY_FILE, summary)
+        _emit_stage(
+            'write_account_artifacts:done',
+            account_live=bool((summary.get('account_status') or {}).get('live')),
+            position_count=_inum(((summary.get('account') or {}).get('position_count', 0)), 0),
+        )
         stage = 'build_daily_evolution_bundle'
+        _emit_stage('build_daily_evolution_bundle:start')
         daily_evolution_bundle = _build_daily_evolution_bundle(
             summary=summary,
             records=context['records'],
-            trade_date=datetime.now().strftime('%Y-%m-%d'),
+            trade_date=_market_today(),
         )
+        _emit_stage('build_daily_evolution_bundle:done')
         stage = 'attach_intraday_judgment_review'
+        _emit_stage('attach_intraday_judgment_review:start')
         daily_evolution_bundle = _attach_intraday_judgment_review(
             daily_evolution_bundle,
             summary=summary,
             records=context['records'],
             positions=context['positions'],
         )
+        _emit_stage('attach_intraday_judgment_review:done')
         stage = 'attach_regime_execution_review'
+        _emit_stage('attach_regime_execution_review:start')
         daily_evolution_bundle = _attach_regime_execution_review(
             daily_evolution_bundle,
             summary=summary,
@@ -10814,14 +11124,21 @@ def do_close_node():
             daily_evolution_bundle.get('regime_execution_review', {}),
             source='close_node',
         )
+        _emit_stage('attach_regime_execution_review:done')
         stage = 'build_learning_actions'
+        _emit_stage('build_learning_actions:start')
         learning_actions = _build_learning_actions(
             daily_evolution_bundle,
-            trade_date=datetime.now().strftime('%Y-%m-%d'),
+            trade_date=_market_today(),
         )
         daily_evolution_bundle['learning_actions_summary'] = learning_actions.get('summary', {})
         _write_json_atomic(DAILY_EVOLUTION_BUNDLE_FILE, daily_evolution_bundle)
+        _emit_stage(
+            'build_learning_actions:done',
+            learning_action_count=len((learning_actions.get('actions') or [])),
+        )
         stage = 'build_close_payload'
+        _emit_stage('build_close_payload:start')
         close_payload = _build_close_node_payload(
             summary=summary,
             reconcile_summary=context['reconcile_summary'],
@@ -10852,6 +11169,11 @@ def do_close_node():
         _write_json_atomic(CLOSE_NODE_FILE, close_payload)
         _write_json_atomic(ENGINEERING_REVIEW_FILE, close_payload.get('engineering_review', {}))
         _write_json_atomic(LEARNING_GATE_FILE, _build_learning_gate_payload(close_payload))
+        _emit_stage(
+            'build_close_payload:done',
+            learning_gate_status=str(close_payload.get('learning_gate_status', '')).strip(),
+            review_status=str(close_payload.get('review_status', '')).strip(),
+        )
         # #region debug-point D:close-node-success
         _main_strategy_chain_emit(
             'D',

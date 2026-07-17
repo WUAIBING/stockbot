@@ -72,10 +72,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+
+      - name: Verify checkout provenance
+        shell: bash
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/github-actions/verify_checkout_provenance.sh" \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_SHA" \
+            "${{ github.ref_name }}"
 
       - name: Sync checkout to DO repo
         shell: bash
+        env:
+          SYNC_SOURCE_SHA: ${{ github.sha }}
+          SYNC_SOURCE_BRANCH: ${{ github.ref_name }}
+          SYNC_SOURCE_REMOTE_URL: https://github.com/${{ github.repository }}
         run: |
           bash "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
 
@@ -87,10 +99,7 @@ jobs:
           skill_root="$workbuddy_root/skills/a-share-analyst"
           data_dir="$repo_root/workbuddy/a-share-analyst"
           pool_dir="$repo_root/workbuddy_pool"
-          python_exe="${{ vars.TLFZ_PYTHON_EXE }}"
-          if [ -z "$python_exe" ]; then
-            python_exe="$repo_root/.venv/bin/python"
-          fi
+          python_exe="$(bash "$GITHUB_WORKSPACE/scripts/github-actions/resolve_runtime_python.sh" "$repo_root" "${{ vars.TLFZ_PYTHON_EXE }}")"
           mkdir -p "$data_dir" "$pool_dir"
           {
             echo "TLFZ_ARKCLAW_ROOT=$repo_root"

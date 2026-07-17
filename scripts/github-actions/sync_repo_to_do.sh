@@ -4,6 +4,9 @@ set -euo pipefail
 SOURCE_ROOT="${1:-${GITHUB_WORKSPACE:-}}"
 TARGET_ROOT="${2:-/opt/stockbot}"
 DRY_RUN="${SYNC_DRY_RUN:-0}"
+SYNC_SOURCE_SHA="${SYNC_SOURCE_SHA:-}"
+SYNC_SOURCE_BRANCH="${SYNC_SOURCE_BRANCH:-}"
+SYNC_SOURCE_REMOTE_URL="${SYNC_SOURCE_REMOTE_URL:-}"
 
 if [[ -z "$SOURCE_ROOT" ]]; then
   echo "SOURCE_ROOT is required"
@@ -46,5 +49,17 @@ echo "Source: $SOURCE_ROOT"
 echo "Target: $TARGET_ROOT"
 
 rsync "${RSYNC_ARGS[@]}" "$SOURCE_ROOT"/ "$TARGET_ROOT"/
+
+if [[ "$DRY_RUN" != "1" ]]; then
+  if [[ -n "$SYNC_SOURCE_SHA" ]]; then
+    printf '%s\n' "$SYNC_SOURCE_SHA" > "$TARGET_ROOT/.stockbot-sync-source-sha"
+  fi
+  if [[ -n "$SYNC_SOURCE_BRANCH" ]]; then
+    printf '%s\n' "$SYNC_SOURCE_BRANCH" > "$TARGET_ROOT/.stockbot-sync-source-branch"
+  fi
+  if [[ -n "$SYNC_SOURCE_REMOTE_URL" ]]; then
+    printf '%s\n' "$SYNC_SOURCE_REMOTE_URL" > "$TARGET_ROOT/.stockbot-sync-source-remote"
+  fi
+fi
 
 echo "Sync complete"

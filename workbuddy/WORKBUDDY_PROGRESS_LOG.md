@@ -4082,3 +4082,108 @@
    - 主策略是否真正按新逻辑释放；
    - challenger 计划顺序与实际表现是否一致；
    - 若仍有残余代理逻辑，再继续收口。
+
+## 2026-07-14
+
+### 收盘复检与主策略执行层修复
+
+#### 1. 收盘节点状态确认
+
+- 已直接复核 DO 上今天的收盘节点落盘：
+  - `15:06 close-node` 最终 `status=ok`
+  - `duration_seconds=485`
+  - `v10_close_node_latest.json` 与 `v10_account_summary_latest.json` 均已刷新
+- 收盘产物中的关键后验结论包括：
+  - `intraday_judgment_review.verdict = validated`
+  - `regime_execution_label = defensive-low-exposure-watch`
+  - `missed_opportunity_count = 0`
+- 这说明今天的 day-end 产物本身是完整可读的，收盘链没有再像前一轮那样炸在 close-node。
+
+#### 2. 盘中“没买/没加/没卖”根因复盘
+
+- 今天不是简单的“策略太保守”，而是先定位到了主策略执行层时区 bug：
+  - DO 主机系统时区是 `UTC`
+  - 交易日调度器按中国市场时钟运行
+  - 但 `v10_moni_trader.py` 的主交易窗口判断直接用了本地 `datetime.now()`
+- 结合 DO 真实 phase history，证据很强：
+  - `09:36 / 10:28 / 13:28 add-position` 全部 `window skipped`
+  - `14:50 buy-watch` 从首轮到最后一轮重试都 `window skipped`
+  - 这些时间在北京时间本来就在合法窗口内，但在 DO 本地 `UTC` 语义下会被错误判成窗口外
+- 结论：
+  - 今天主策略“无动作”的执行轨迹被时区 bug 污染
+  - 今天不能再把“没加仓”直接解释成策略主动且正确地放弃了所有机会
+
+#### 3. 已完成的代码修复
+
+- 在 `v10_moni_trader.py` 中新增了统一市场时区 helper：
+  - `MARKET_TZ`
+  - `_market_now()`
+  - `_market_today()`
+- 已将主策略核心时间敏感路径切到市场时区：
+  - `ensure_trade_window()`
+  - `_resolve_add_position_window()`
+  - `do_buy()`
+  - `_do_sell_core()`
+  - `do_add_position()`
+  - `wait_for_today_decision_ready()`
+  - `build_midday_review()`
+  - `_build_pm_buy_guardrails()`
+- 这样做的目的不是改策略，而是让 DO 上的主策略执行层真正按 `CST/UTC+08` 判定交易窗口和当日日期。
+
+#### 4. DO 同步与验证
+
+- 已将下列文件同步到 DO：
+  - `v10_moni_trader.py`
+  - `test_execution_layer.py`
+- 已先在 DO 侧做备份：
+  - `/opt/stockbot/workbuddy/skills/a-share-analyst/.bak_20260714_tzfix/`
+- 验证口径使用 DO 正式解释器，而不是裸 `python3`：
+  - `/opt/stockbot/.venv/bin/python`
+- 已完成的 DO 验证包括：
+  - `py_compile` 通过
+  - `python -m unittest test_execution_layer.TraderWindowTimezoneTests -v` 通过
+  - 关键窗口直测通过：
+    - `09:36 add-position => allowed=True`
+    - `14:52 buy => allowed=True`
+    - `14:15 smart-sell => allowed=True`
+    - `wait_for_today_decision_ready()` 已按市场日期识别同日 decision
+
+#### 5. 当前判断
+
+- 对“明天主策略执行层会不会再被这个时区 bug 影响”的判断：
+  - 主策略核心执行链已高置信修住
+  - 明天不应再因为 DO 是 `UTC` 而把合法中国市场窗口误判成 `window skipped`
+- 但需要明确：
+  - 这不等于“明天一定会买”
+  - 它只意味着明天的主策略行为终于可以被干净解释，不会再被这类基础执行 bug 污染
+
+#### 6. 仍待继续处理的问题
+
+- `14:30 prewarm` 的根因已进一步收敛：
+  - 昨天本地已经写了 `prewarm-fast`
+  - 但第一次 DO 同步漏掉了 `v10_auto_runner.py`
+  - 导致 DO 仍按旧路径执行 `['scanner_v10.py']`，看起来“修过”，实际没有生效
+- 现已重新同步 `scanner_v10.py / v10_auto_runner.py / test_execution_layer.py`
+- DO 正式 `.venv` 验证通过：
+  - `test_prewarm_phase_uses_fast_scanner_mode` 通过
+  - `prewarm` 单 phase replay `status=ok`
+  - `duration_seconds=761`，不再复现 `907s timeout`
+  - `decision` 单 phase replay `status=ok`
+  - `duration_seconds=169`
+  - DO 日志明确显示执行命令为 `scanner_v10.py --decision-fast`
+- 当前遗留不再是“prewarm 跑不通”，而是“14:30 对 14:49 仍然偏紧”：
+  - `prewarm_timing_signal.json` 已刷新为 `status=ok`
+  - 但建议改为 `14:25`
+- `native holding` 识别口径仍值得继续核对，因为即便时区修好，`add-position` 也只对主策略原生持仓生效
+- 这些问题不会掩盖今天已经完成的最关键修复：
+  - 主策略交易窗口和当日 decision 判定已对齐到 `CST`
+
+#### 7. 明日优先观察位
+
+1. `09:36 add-position`
+2. `10:28 add-position`
+3. `14:49 decision`
+4. `14:50 buy-watch`
+5. `scan_status.is_fresh`
+6. `latest_buy_status.json` 是否还出现伪 `window skipped`
+7. 是否正式把 `prewarm` 调度从 `14:30` 提前到 `14:25`
