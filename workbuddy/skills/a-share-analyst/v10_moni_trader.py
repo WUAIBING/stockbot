@@ -2877,9 +2877,12 @@ def api_request(
         'Content-Type': 'application/json; charset=UTF-8',
     }
     attempts = _resolve_trade_max_retries(trade_meta) if is_trade else QUERY_REQUEST_MAX_ATTEMPTS
-    request_timeout = _fnum(request_timeout_seconds, 30.0)
+    # 08-08 实测：DO→MX 跨境链路 MX 响应间歇性 30s+（本地同接口 2s 稳定，
+    # 服务端不慢）。read timeout 30s 会让黑洞等待占满单票预算，改为 15s，
+    # 让重试更早触发（QUERY 3 次 / TRADE 4 次，均在墙钟预算内）。
+    request_timeout = _fnum(request_timeout_seconds, 15.0)
     if request_timeout <= 0:
-        request_timeout = 30.0
+        request_timeout = 15.0
     if wall_clock_deadline_seconds is None:
         wall_clock_deadline_seconds = (
             TRADE_API_WALLCLOCK_SECONDS if is_trade else QUERY_API_WALLCLOCK_SECONDS
