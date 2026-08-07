@@ -278,6 +278,25 @@ _MX_RUNTIME_ENV = ensure_mx_runtime_env()
 MX_APIKEY = _MX_RUNTIME_ENV.get('MX_APIKEY', '') or os.environ.get('MX_APIKEY', '')
 MX_API_URL = _MX_RUNTIME_ENV.get('MX_API_URL', '') or os.environ.get('MX_API_URL', 'https://mkapi2.dfcfs.com/finskillshub')
 
+# ---- MX API 连接池复用 ----
+# 08-08 DO 侧实测：每次 requests.post 新建 TCP+TLS 连接（握手约 1.3s，
+# 跨境链路下握手本身也可能 ConnectTimeout）。改用共享 Session 连接池，
+# 复用 keep-alive 连接，降低握手开销与失败率。墙钟守护线程每次从池中
+# 取连接，urllib3 PoolManager 线程安全；max_retries=0 保持业务层重试
+# 语义不变（重试由 api_request 的 wall_clock 循环控制）。
+try:
+    _MX_HTTP_ADAPTER = requests.adapters.HTTPAdapter(
+        pool_connections=8,
+        pool_maxsize=8,
+        max_retries=0,
+    )
+    _MX_HTTP_SESSION = requests.Session()
+    _MX_HTTP_SESSION.mount('https://', _MX_HTTP_ADAPTER)
+    _MX_HTTP_SESSION.mount('http://', _MX_HTTP_ADAPTER)
+except Exception:
+    _MX_HTTP_SESSION = requests
+
+
 
 # 数据目录
 SCAN_CSV = str(DATA_DIR / 'v10_scan_full.csv')
@@ -2834,7 +2853,7 @@ def _api_post_with_wall_clock(url, headers, payload, timeout_tuple, deadline_ts)
 
     def _run():
         try:
-            result_holder['response'] = requests.post(
+            result_holder['response'] = _MX_HTTP_SESSION.post(
                 url,
                 headers=headers,
                 json=payload,
