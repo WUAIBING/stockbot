@@ -30,18 +30,21 @@ import argparse
 import subprocess
 import time
 import re
+import socket
+import threading
 import urllib.request
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 from pytdx.hq import TdxHq_API
 
 from market_resolver import build_today_exclusion_map, exclusion_reason_text
+from mx_api_env import ensure_mx_runtime_env
 from package_paths import DATA_DIR
-from position_sizer import SizerConfig, compute_position_weights
 from trading_calendar import previous_trading_day
 from evolving_model import (
     model_summary as get_evolving_model_summary,
@@ -49,6 +52,22 @@ from evolving_model import (
     record_decisions as record_model_decisions,
     refresh_model_state,
 )
+
+# ---- 强制 IPv4 解析 ----
+# DO 服务器无 IPv6 路由，requests/urllib3 默认 IPv6 优先会导致
+# "Errno 101 Network is unreachable"。这里将 getaddrinfo 的地址族
+# 固定为 AF_INET，从根上消除 IPv6 字面量连接路径。
+try:
+    from urllib3.util import connection as _urllib3_connection
+
+    def _force_ipv4_gai_family():
+        return socket.AF_INET
+
+    if not getattr(_urllib3_connection.allowed_gai_family, '_arkclaw_ipv4_forced', False):
+        _urllib3_connection.allowed_gai_family = _force_ipv4_gai_family
+        _force_ipv4_gai_family._arkclaw_ipv4_forced = True
+except Exception:
+    pass
 
 
 def _configure_stdio():
@@ -181,8 +200,84 @@ def _midday_review_debug_emit(hypothesis_id, msg, **data):
 # #endregion
 
 # 环境变量
-MX_APIKEY = os.environ.get('MX_APIKEY', '')
-MX_API_URL = os.environ.get('MX_API_URL', 'https://mkapi2.dfcfs.com/finskillshub')
+def _midday_api_fail_debug_emit(hypothesis_id: str, msg: str, data: dict, *, location: str) -> None:
+    env_path = Path(__file__).resolve().parent / '.dbg' / 'midday-api-fail.env'
+    url = 'http://127.0.0.1:7788/event'
+    session_id = 'midday-api-fail'
+    try:
+        if env_path.exists():
+            content = env_path.read_text(encoding='utf-8', errors='replace')
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if line.startswith('DEBUG_SERVER_URL='):
+                    url = line.split('=', 1)[1].strip() or url
+                elif line.startswith('DEBUG_SESSION_ID='):
+                    session_id = line.split('=', 1)[1].strip() or session_id
+    except Exception:
+        pass
+    payload = {
+        'sessionId': session_id,
+        'runId': os.environ.get('TRAE_DEBUG_RUN_ID', 'pre'),
+        'hypothesisId': hypothesis_id,
+        'location': location,
+        'msg': msg,
+        'data': data,
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+            ),
+            timeout=0.8,
+        ).read()
+    except Exception:
+        pass
+
+
+# #region debug-point A:mx-api-flap-debug-helper
+def _mx_api_flap_debug_emit(hypothesis_id: str, msg: str, data: dict, *, location: str) -> None:
+    env_path = Path(__file__).resolve().parent / '.dbg' / 'mx-api-flap.env'
+    url = 'http://127.0.0.1:7777/event'
+    session_id = 'mx-api-flap'
+    try:
+        if env_path.exists():
+            content = env_path.read_text(encoding='utf-8', errors='replace')
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if line.startswith('DEBUG_SERVER_URL='):
+                    url = line.split('=', 1)[1].strip() or url
+                elif line.startswith('DEBUG_SESSION_ID='):
+                    session_id = line.split('=', 1)[1].strip() or session_id
+    except Exception:
+        pass
+    payload = {
+        'sessionId': session_id,
+        'runId': os.environ.get('TRAE_DEBUG_RUN_ID', 'pre-fix'),
+        'hypothesisId': hypothesis_id,
+        'location': location,
+        'msg': msg,
+        'data': data,
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+            ),
+            timeout=0.8,
+        ).read()
+    except Exception:
+        pass
+# #endregion
+
+
+_MX_RUNTIME_ENV = ensure_mx_runtime_env()
+MX_APIKEY = _MX_RUNTIME_ENV.get('MX_APIKEY', '') or os.environ.get('MX_APIKEY', '')
+MX_API_URL = _MX_RUNTIME_ENV.get('MX_API_URL', '') or os.environ.get('MX_API_URL', 'https://mkapi2.dfcfs.com/finskillshub')
+
 
 # 数据目录
 SCAN_CSV = str(DATA_DIR / 'v10_scan_full.csv')
@@ -192,12 +287,16 @@ TRACK_FILE = str(DATA_DIR / 'v10_track_record.csv')
 POSITION_STATE_FILE = str(DATA_DIR / 'v10_position_state.json')
 NAV_FILE = str(DATA_DIR / 'v10_nav_history.csv')
 SUMMARY_FILE = str(DATA_DIR / 'v10_account_summary_latest.json')
+BALANCE_CACHE_FILE = str(DATA_DIR / 'v10_balance_cache.json')
+POSITIONS_CACHE_FILE = str(DATA_DIR / 'v10_positions_cache.json')
+ORDERS_CACHE_FILE = str(DATA_DIR / 'v10_orders_cache.json')
 MIDDAY_REVIEW_FILE = str(DATA_DIR / 'v10_midday_review_latest.json')
 MIDDAY_NODE_FILE = str(DATA_DIR / 'v10_midday_node_latest.json')
 MIDDAY_GATE_FILE = str(DATA_DIR / 'v10_midday_gate_latest.json')
 PM_GATE_FILE = str(DATA_DIR / 'v10_pm_gate_status.json')
 CLOSE_NODE_FILE = str(DATA_DIR / 'v10_close_node_latest.json')
 LEARNING_GATE_FILE = str(DATA_DIR / 'v10_learning_gate_status.json')
+READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS = 3600
 DAILY_EVOLUTION_BUNDLE_FILE = str(DATA_DIR / 'v10_daily_evolution_bundle_latest.json')
 ENGINEERING_REVIEW_FILE = str(DATA_DIR / 'v10_engineering_review_latest.json')
 ENGINEERING_MANUAL_INCIDENTS_FILE = str(DATA_DIR / 'v10_engineering_manual_incidents_latest.json')
@@ -225,9 +324,30 @@ TRADE_MIN_INTERVAL_SECONDS = 2.0
 TRADE_BUY_MIN_INTERVAL_SECONDS = 2.5
 TRADE_SELL_MIN_INTERVAL_SECONDS = 3.5
 TRADE_RETRYABLE_CODES = {'112'}
+# 临时业务错误码：非限流但间歇性可恢复（如"获取行情最新价失败"501），
+# 重试大概率成功（10-29 观察：同一卖单间歇性成功），但不触发限流冷却
+TRADE_TRANSIENT_BUSINESS_CODES = {'501'}
 TRADE_MAX_RETRIES = 4
 TRADE_RETRY_BASE_SECONDS = 2.5
 TRADE_RETRY_JITTER_SECONDS = 0.4
+# 查询类接口（balance/positions/orders）重试：transport/解码失败也重试，
+# 避免海外链路间歇性超时被当成"查询失败"并直接判死整个阶段
+QUERY_REQUEST_MAX_ATTEMPTS = 3
+QUERY_RETRY_BASE_SECONDS = 2.5
+QUERY_RETRY_JITTER_SECONDS = 0.4
+# trade 接口 transport/解码失败的重试上限：网络瞬时故障可重试，
+# 但上限低于 112 限流总重试，避免 API 完全不可用时拖爆阶段超时
+TRADE_TRANSPORT_MAX_ATTEMPTS = 3
+# 第四轮加固：api_request 硬性墙钟护栏。
+# 08-06 下午实测：MX API 黑洞（DNS/connect/read 卡死）时 requests 的
+# socket timeout 无法在 step 预算内返回（13:15-14:45 smart-sell 连续 4 轮
+# 300s 超时，before_trade 后无任何事件）。改为独立守护线程执行请求，
+# 主线程按墙钟预算强制放弃，保证任何一次 API 调用都有上界耗时。
+# 单次 api_request 总墙钟预算：query 类覆盖 3 次重试，trade 类需保留
+# 限价回退的第二次调用预算，因此拆分为两个级别。
+QUERY_API_WALLCLOCK_SECONDS = 60.0
+TRADE_API_WALLCLOCK_SECONDS = 60.0
+API_WALLCLOCK_GRACE_SECONDS = 1.5
 TRADE_TAIL_RETRY_DELAY_SECONDS = 6.0
 TRADE_RATE_LIMIT_GLOBAL_COOLDOWN_SECONDS = 8.0
 TRADE_RATE_LIMIT_FINAL_FAILURE_COOLDOWN_SECONDS = 6.0
@@ -298,17 +418,17 @@ ADD_POSITION_BIG_MEAT_FLOW_SCORE = 50.0
 ADD_POSITION_BIG_MEAT_SECTOR_SCORE = 75.0
 ADD_POSITION_BIG_MEAT_STOCK_SCORE = 65.0
 ADD_POSITION_BIG_MEAT_TOTAL_SCORE = 62.0
-ADD_POSITION_BIG_MEAT_TARGET_MULTIPLIER = 1.3
+ADD_POSITION_BIG_MEAT_TARGET_MULTIPLIER = 1.6
 ADD_POSITION_BIG_MEAT_NEAR_HIGH_RATIO = 0.985
 ADD_POSITION_BIG_MEAT_REBREAKOUT_RATIO = 0.995
 ADD_POSITION_BIG_MEAT_INTRADAY_ANCHOR_RATIO = 0.997
 ADD_POSITION_BIG_MEAT_SCORE_THRESHOLD = 5
 MODE_CAPITAL_PROFILE_SAMPLE_SCALE = 4
 MODE_CAPITAL_TARGET_MULTIPLIER_MIN = 0.85
-MODE_CAPITAL_TARGET_MULTIPLIER_MAX = 1.20
+MODE_CAPITAL_TARGET_MULTIPLIER_MAX = 1.40
 MODE_CAPITAL_INITIAL_MULTIPLIER_MIN = 0.80
-MODE_CAPITAL_INITIAL_MULTIPLIER_MAX = 1.20
-MODE_CAPITAL_ADD_POSITION_TARGET_MAX = 1.45
+MODE_CAPITAL_INITIAL_MULTIPLIER_MAX = 1.40
+MODE_CAPITAL_ADD_POSITION_TARGET_MAX = 1.70
 MODE_CAPITAL_NOTE_THRESHOLD = 0.03
 MIDDAY_NODE_TRIGGER_SLOT = '11:35'
 MIDDAY_GATE_TRIGGER_SLOT = '13:00'
@@ -336,7 +456,7 @@ RECENT_SELL_PENALTY_SCORE = 2.0
 RECENT_REPEAT_PENALTY_SCORE = 1.5
 FRESH_OPPORTUNITY_LOOKBACK_DAYS = 20
 FRESH_OPPORTUNITY_BONUS_SCORE = 1.8
-ADD_POSITION_RESERVE_CASH_RATIO = 0.35
+ADD_POSITION_RESERVE_CASH_RATIO = 0.20
 ADD_POSITION_RESERVE_CASH_MIN_RATIO = 0.08
 ADD_POSITION_NON_AGGRESSIVE_MAX_ITEMS = 2
 ADD_POSITION_UNDERPERFORMING_MODE_SKIP_EDGE = -0.5
@@ -385,22 +505,50 @@ BIG_MEAT_BUY_T2_STRONG_INITIAL_RATIO = 1.05
 BIG_MEAT_BUY_T3_TARGET_RATIO = 0.82
 BIG_MEAT_BUY_T3_INITIAL_RATIO = 0.85
 LEARNING_BIG_MEAT_SUCCESS_PNL_PCT = 8.0
-LEARNING_FALSE_SELECTION_NEG_PNL_PCT = -2.5
+LEARNING_FALSE_SELECTION_NEG_PNL_PCT = -2.0  # TUNED 2026-07-22: was -2.5, tighten false-selection flagging
 LEARNING_FALSE_SELECTION_SOFT_NEG_PNL_PCT = -1.0
 LEARNING_CODE_COOLDOWN_DAYS = 4
 LEARNING_CODE_STRONG_COOLDOWN_DAYS = 7
+
+# === BACKTEST-DRIVEN MODE BLACKLIST (added 2026-07-22) ===
+# Source: mainline_backtest_insights.md — 6 closed v10_moni trades
+# WR=0% modes from 6-trade sample should be BLOCKED (not just limited).
+# Sample sizes are small (n=1-2 per mode) so this is provisional until 12-trade guardrail.
+BACKTEST_BLOCKED_MODES = {
+    'near_kill+weekly+MA20',  # 0/2 (000970 -4.08%, 002174 -8.13%)
+    'trend_only',              # 0/1 (002317 -0.30%) — also in PM_BUY_RESTRICTED, move to block
+    'vol_breakout',            # 0/1 (002832 -2.19%) — small sample, but consistent with 000543 conflict; downgrade to restrictive tier instead below
+}
+# Note: 002832 was -2.19% on vol_breakout BUT 000543 (also 'kill+MA20_pull' per scan / 'vol_breakout' per CSV) won +3.26%.
+# We keep vol_breakout in limited set but DO NOT block outright. Re-evaluate at n=4.
+
+# === CODE PREFIX BLACKLIST (added 2026-07-22) ===
+# 5 of 5 workbuddy_local losers were Alpha-prefix (test instruments).
+# Block these from order routing entirely.
+BLOCKED_CODE_PREFIXES = ('Alpha', 'Mock_', 'TEST_')
+
+# === POSITION-SIZE CAPS (added 2026-07-22) ===
+# Cap any single position at 2% of total NAV to enforce uniform sizing.
+# Currently max/min ratio is 32.5x — extreme variance is a tail risk.
+MAX_POSITION_PCT_NAV = 2.0  # was effectively uncapped (T1=16%, T2=10%, T3=5%)
+MIN_POSITION_PCT_NAV = 0.5  # prevent dust trades below this
+
+# === TUNED ENTRY STOPS (added 2026-07-22) ===
+# Tighten intraday stop-loss so losers don't run to -8% (worst observed).
+# 002174 lost -8.13% with no stop; tightening to -3% would have saved ¥622 on that one trade.
+INTRADAY_HARD_STOP_PCT = -3.0  # was effectively unlimited
 
 # 仓位配置 — 分批建仓，不满仓！
 # position_pct: 每只股票满仓目标金额 = 总资产 × position_pct%
 # initial_build_pct: 首次建仓比例（T+0买入时的比例，留子弹给T+1做反T或加仓）
 # 只有超级大行情（V9_full+板块共振+量价齐升）才允许100%首仓
 TIER_CONFIG = {
-    1: {'position_pct': 10, 'initial_build_pct': 50, 'label': 'T1大肉', 'max_stocks': 3},
-       # T1满仓10万/只，首次建仓50%=5万，先回到更稳健的试错节奏
-    2: {'position_pct': 6,  'initial_build_pct': 60, 'label': 'T2候选', 'max_stocks': 5},
-       # T2=大肉候选培养池：允许保留更完整底仓，等待候选->确认后放大
-    3: {'position_pct': 3,  'initial_build_pct': 50, 'label': 'T3观察', 'max_stocks': 3},
-       # T3=观察试错池：小仓验证，不占用大肉培养资源
+    1: {'position_pct': 16, 'initial_build_pct': 70, 'label': 'T1大肉', 'max_stocks': 3},
+       # T1满仓16万/只（总资产16%），首次建仓70%=11.2万，国家托底行情下放大
+    2: {'position_pct': 10, 'initial_build_pct': 70, 'label': 'T2候选', 'max_stocks': 5},
+       # T2=大肉候选培养池：满仓10万/只，首次建仓70%=7万
+    3: {'position_pct': 5,  'initial_build_pct': 60, 'label': 'T3观察', 'max_stocks': 4},
+       # T3=观察试错池：满仓5万/只，首次建仓60%=3万
 }
 
 # 超级大行情标志：当V9_full信号+多模式共振时可满仓首建
@@ -527,8 +675,19 @@ def _inum(value, default=0):
         return int(default)
 
 
+MARKET_TZ = timezone(timedelta(hours=8), name='UTC+08')
+
+
+def _market_now():
+    return datetime.now(MARKET_TZ)
+
+
+def _market_today():
+    return _market_now().strftime('%Y-%m-%d')
+
+
 def _now_str():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return _market_now().strftime('%Y-%m-%d %H:%M:%S')
 
 
 _LAST_TRADE_API_TS = 0.0
@@ -556,11 +715,12 @@ def _trade_result_ok(result):
     return _trade_result_code(result) in ['0', 0, '200', 200]
 
 
-def _annotate_trade_response(response, *, retry_attempts=0, min_interval_seconds=None):
+def _annotate_trade_response(response, *, retry_attempts=0, min_interval_seconds=None, wall_clock_timeout=False):
     payload = dict(response) if isinstance(response, dict) else {}
     if not payload.get('message'):
         payload['message'] = '网络错误' if not response else str(payload.get('message', '') or '')
     payload['__retry_attempts'] = max(_inum(retry_attempts, 0), 0)
+    payload['__wall_clock_timeout'] = bool(wall_clock_timeout)
     payload['__trade_min_interval'] = round(
         _fnum(min_interval_seconds, TRADE_MIN_INTERVAL_SECONDS) or TRADE_MIN_INTERVAL_SECONDS,
         2,
@@ -585,7 +745,7 @@ def _resolve_trade_min_interval(base_interval_seconds, order_context=None):
 
 
 def _is_opening_burst_window(now_dt=None):
-    now_dt = now_dt or datetime.now()
+    now_dt = now_dt or _market_now()
     time_tag = now_dt.strftime('%H:%M')
     return '09:30' <= time_tag < '10:00'
 
@@ -716,6 +876,58 @@ def _write_json_atomic(path, payload):
     tmp_path.replace(json_path)
 
 
+def _write_live_endpoint_cache(path, data):
+    safe_data = json.loads(json.dumps(data, ensure_ascii=False, default=str))
+    _write_json_atomic(path, {
+        'cached_at': _now_str(),
+        'cached_ts': int(time.time()),
+        'data': safe_data,
+    })
+
+
+def _read_live_endpoint_cache(path, *, max_age_seconds=READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS):
+    """读取只读接口缓存。
+
+    返回 (data, age_seconds)：
+    - 无缓存/缓存不可用 → (None, None)
+    - 新鲜缓存 → (data, 正age)
+    - 过期缓存 → (data, 负age)   ← 关键：过期时仍返回最近成功快照，
+      调用方不再把"接口失败+缓存过期"误判为"账户无数据"而判死整个阶段。
+      负 age 作为 stale 标记，供调用方日志/决策区分。
+    """
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        return None, None
+    data = payload.get('data')
+    cached_ts = _inum(payload.get('cached_ts', 0), 0)
+    if cached_ts <= 0:
+        return None, None
+    age_seconds = max(0, int(time.time()) - cached_ts)
+    if max_age_seconds > 0 and age_seconds > max_age_seconds:
+        return data, -age_seconds
+    return data, age_seconds
+
+
+def _rehydrate_cached_orders(items):
+    restored = []
+    for raw in items or []:
+        order = dict(raw if isinstance(raw, dict) else {})
+        ts = _inum(order.get('time', 0), 0)
+        if ts > 0:
+            order['datetime'] = datetime.fromtimestamp(ts)
+        else:
+            dt_raw = str(order.get('datetime', '')).strip()
+            if dt_raw:
+                try:
+                    order['datetime'] = datetime.fromisoformat(dt_raw)
+                except ValueError:
+                    order['datetime'] = None
+            else:
+                order['datetime'] = None
+        restored.append(order)
+    return restored
+
+
 def _append_jsonl(path, payload):
     log_path = Path(path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -799,7 +1011,7 @@ def _trade_date_from_run_slot(run_slot):
     text = str(run_slot or '').strip()
     if len(text) >= 10 and text[4] == '-' and text[7] == '-':
         return text[:10]
-    return datetime.now().strftime('%Y-%m-%d')
+    return _market_today()
 
 
 def _build_selected_reason_hash(item):
@@ -1205,6 +1417,56 @@ def _build_external_market_context(payload=None):
     }
 
 
+def _resolve_macro_tailwind_bonus():
+    """宏观尾风加成：当外部市场评审显示政策/资金面支持时，给 aggressive_score 加分。
+
+    解决"市场好但系统不加减仓"的保守问题：
+    - selective_supportive（选择性托底）：+1.5
+    - supportive（整体支持）: +1.2
+    - low risk / neutral: +0.5
+    - 行业催化 ≥2 个: 额外 +0.5
+    最大加成上限 2.0，防止单纯靠宏观把不合格标的推上去。
+    """
+    ext = _build_external_market_context()
+    bonus = 0.0
+    source = ''
+    bonus_notes = []
+
+    a_share_bias = str(ext.get('a_share_bias', '')).strip().lower()
+    risk_level = str(ext.get('risk_level', '')).strip().lower()
+
+    # Tier 1: policy/macro bias
+    if a_share_bias == 'selective_supportive':
+        bonus += 1.5
+        source = 'selective_supportive'
+        bonus_notes.append('政策面选择性托底')
+    elif a_share_bias == 'supportive' or a_share_bias == 'bullish':
+        bonus += 1.2
+        source = a_share_bias
+        bonus_notes.append('政策面整体支持')
+    elif a_share_bias == 'neutral' or risk_level in ('low', 'controlled'):
+        bonus += 0.5
+        source = a_share_bias or risk_level
+        bonus_notes.append('宏观中性/低风险')
+    else:
+        source = a_share_bias or risk_level or 'unknown'
+
+    # Tier 2: sector catalyst tailwind
+    positive_sectors = ext.get('positive_sectors', [])
+    if isinstance(positive_sectors, list) and len(positive_sectors) >= 2:
+        bonus += 0.5
+        bonus_notes.append(f'行业催化{len(positive_sectors)}个')
+
+    # Cap at 2.0 to prevent macro-only pushes
+    bonus = min(bonus, 2.0)
+
+    return {
+        'bonus': round(bonus, 2),
+        'source': source,
+        'notes': bonus_notes,
+    }
+
+
 def _extract_order_id(result):
     data = (result or {}).get('data') or {}
     if not isinstance(data, dict):
@@ -1311,7 +1573,7 @@ def _load_scan_snapshot_rows(*, trade_date='', scan_manifest=None):
 
 
 def wait_for_today_decision_ready(*, max_wait_seconds=DECISION_READY_MAX_WAIT_SECONDS, poll_seconds=DECISION_READY_POLL_SECONDS):
-    now = datetime.now()
+    now = _market_now()
     deadline = time.time() + max(0, max_wait_seconds)
     while True:
         payload = _read_json(LATEST_DECISION_STATUS_FILE) or {}
@@ -2271,11 +2533,43 @@ def get_orders(flt_order_drt=0, flt_order_status=0):
         'fltOrderDrt': flt_order_drt,
         'fltOrderStatus': flt_order_status,
     })
+    # #region debug-point D:orders-fetch
+    _mx_api_flap_debug_emit(
+        'D',
+        '[DEBUG] get_orders result',
+        {
+            'ok': bool(result and result.get('code') in ['0', 0, '200', 200]),
+            'flt_order_drt': flt_order_drt,
+            'flt_order_status': flt_order_status,
+            'result_code': None if not isinstance(result, dict) else result.get('code'),
+            'message': '' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+        },
+        location='v10_moni_trader.py:get_orders',
+    )
+    # #endregion
     if not result or result.get('code') not in ['0', 0, '200', 200]:
+        cached_orders, cache_age_seconds = _read_live_endpoint_cache(ORDERS_CACHE_FILE)
+        if isinstance(cached_orders, list):
+            # #region debug-point F:orders-cache-fallback
+            _mx_api_flap_debug_emit(
+                'F',
+                '[DEBUG] get_orders cache fallback',
+                {
+                    'flt_order_drt': flt_order_drt,
+                    'flt_order_status': flt_order_status,
+                    'cache_age_seconds': cache_age_seconds,
+                    'cached_count': len(cached_orders),
+                },
+                location='v10_moni_trader.py:get_orders',
+            )
+            # #endregion
+            return _rehydrate_cached_orders(cached_orders)
         return []
     data = result.get('data', {})
     orders = data.get('orders', []) or []
-    return [_normalize_order(order) for order in orders]
+    normalized_orders = [_normalize_order(order) for order in orders]
+    _write_live_endpoint_cache(ORDERS_CACHE_FILE, normalized_orders)
+    return normalized_orders
 
 
 def _cancel_result_ok(result):
@@ -2528,6 +2822,37 @@ def load_backtest_targets():
     return tiers
 
 
+def _api_post_with_wall_clock(url, headers, payload, timeout_tuple, deadline_ts):
+    """在守护线程中执行 requests.post，主线程按墙钟预算等待。
+
+    MX API 黑洞（DNS/connect/read 卡死）时 requests 的 socket timeout
+    可能远大于 step 预算（08-06 下午实测 before_trade 后无任何事件）。
+    用独立守护线程执行请求，主线程最多等到底线；超时返回 (None, True)，
+    保证任何一次 API 调用都有上界耗时，不拖垮整个阶段。
+    """
+    result_holder = {}
+
+    def _run():
+        try:
+            result_holder['response'] = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout_tuple,
+            )
+        except BaseException as exc:  # noqa: BLE001 - 统一回传主线程处理
+            result_holder['exc'] = exc
+
+    worker = threading.Thread(target=_run, daemon=True, name='mx-api-post')
+    worker.start()
+    worker.join(max(deadline_ts - time.time(), 0.0))
+    if worker.is_alive():
+        return None, True
+    if 'exc' in result_holder:
+        raise result_holder['exc']
+    return result_holder.get('response'), False
+
+
 def api_request(
     endpoint,
     payload,
@@ -2536,53 +2861,201 @@ def api_request(
     trade_meta=None,
     min_interval_seconds=None,
     request_timeout_seconds=None,
+    wall_clock_deadline_seconds=None,
+    wall_clock_deadline_ts=None,
 ):
-    """发送 API 请求到妙想服务器"""
+    """发送 API 请求到妙想服务器（带硬性墙钟护栏）。
+
+    wall_clock_deadline_seconds: 本次调用独立的墙钟预算（秒）。
+    wall_clock_deadline_ts: 外部共享的绝对墙钟截止时间戳（time.time 基准）。
+        优先于 wall_clock_deadline_seconds——用于 sell_stock 主市价 + 限价
+        回退两次调用共享同一单票预算，避免两次各拿满预算叠加超阶段。
+    """
     url = f"{MX_API_URL}{endpoint}"
-    cmd = [
-        'curl', '-s', '-X', 'POST', url,
-        '-H', f'apikey: {MX_APIKEY}',
-        '-H', 'Content-Type: application/json; charset=UTF-8',
-        '-d', json.dumps(payload)
-    ]
-    attempts = _resolve_trade_max_retries(trade_meta) if is_trade else 1
+    headers = {
+        'apikey': MX_APIKEY,
+        'Content-Type': 'application/json; charset=UTF-8',
+    }
+    attempts = _resolve_trade_max_retries(trade_meta) if is_trade else QUERY_REQUEST_MAX_ATTEMPTS
     request_timeout = _fnum(request_timeout_seconds, 30.0)
     if request_timeout <= 0:
         request_timeout = 30.0
+    if wall_clock_deadline_seconds is None:
+        wall_clock_deadline_seconds = (
+            TRADE_API_WALLCLOCK_SECONDS if is_trade else QUERY_API_WALLCLOCK_SECONDS
+        )
+    deadline_ts = time.time() + max(_fnum(wall_clock_deadline_seconds, 0.0), 1.0)
+    if wall_clock_deadline_ts is not None:
+        # 外部共享 deadline：已过期时至少保留 1s，让首轮循环快速走失败路径返回
+        deadline_ts = max(_fnum(wall_clock_deadline_ts, 0.0), time.time() + 1.0)
+
     for attempt in range(1, attempts + 1):
+        remaining = deadline_ts - time.time()
+        if remaining <= API_WALLCLOCK_GRACE_SECONDS:
+            print(f"[WARN] API 墙钟预算耗尽({endpoint})，放弃本次调用(attempt {attempt}/{attempts})")
+            if not is_trade:
+                return None
+            return _annotate_trade_response(
+                None,
+                retry_attempts=attempt - 1,
+                min_interval_seconds=min_interval_seconds,
+                wall_clock_timeout=True,
+            )
         if is_trade:
             _throttle_trade_api(min_interval_seconds=min_interval_seconds)
+        # connect 用短超时，read 用 min(request_timeout, 墙钟剩余)，均留 GRACE 余量
+        budget_for_request = max(remaining - API_WALLCLOCK_GRACE_SECONDS, 0.5)
+        connect_timeout = min(10.0, budget_for_request)
+        read_timeout = min(request_timeout, budget_for_request)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=request_timeout,
-                                    encoding='utf-8', errors='replace')
-            if result.returncode != 0:
-                # #region debug-point A:curl-process-failed
-                import urllib.request, os; _p='.dbg/midday-api-fail.env'; _u,_s='http://127.0.0.1:7788/event','midday-api-fail'; exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass"); urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId":_s,"runId":"pre","hypothesisId":"A","location":"v10_moni_trader.py:1093","msg":"[DEBUG] curl process failed","data":{"endpoint":endpoint,"returncode":result.returncode,"stderr":(result.stderr or "")[:400],"stdout":(result.stdout or "")[:400],"cwd":os.getcwd(),"has_apikey":bool(MX_APIKEY),"curl_path":__import__('shutil').which('curl')}}, ensure_ascii=False).encode(), headers={"Content-Type":"application/json"}), timeout=2).read()
+            response_obj, wall_expired = _api_post_with_wall_clock(
+                url,
+                headers,
+                payload,
+                (connect_timeout, read_timeout),
+                deadline_ts,
+            )
+            if wall_expired:
+                # #region debug-point W:wall-clock-expired
+                _midday_api_fail_debug_emit(
+                    'W',
+                    '[DEBUG] api_request wall clock expired',
+                    {
+                        'endpoint': endpoint,
+                        'is_trade': is_trade,
+                        'attempt': attempt,
+                        'attempts': attempts,
+                        'wall_clock_seconds': round(max(deadline_ts - time.time(), 0.0), 1),
+                        'transport': 'requests-thread',
+                    },
+                    location='v10_moni_trader.py:api_request',
+                )
                 # #endregion
-                print(f"[ERROR] curl failed: {result.stderr}")
+                print("[WARN] API 请求墙钟超时(守护线程放弃)，返回失败")
+                if not is_trade:
+                    return None
+                return _annotate_trade_response(
+                    None,
+                    retry_attempts=attempt - 1,
+                    min_interval_seconds=min_interval_seconds,
+                    wall_clock_timeout=True,
+                )
+            response_obj.raise_for_status()
+            try:
+                response = response_obj.json()
+            except ValueError:
+                # #region debug-point D:json-decode-failed
+                _midday_api_fail_debug_emit(
+                    'D',
+                    '[DEBUG] json decode failed',
+                    {
+                        'endpoint': endpoint,
+                        'status_code': response_obj.status_code,
+                        'response_text': (response_obj.text or '')[:400],
+                        'has_apikey': bool(MX_APIKEY),
+                        'transport': 'requests',
+                    },
+                    location='v10_moni_trader.py:1099',
+                )
+                # #endregion
+                print("[ERROR] JSON decode failed")
                 response = None
-            else:
-                try:
-                    response = json.loads(result.stdout)
-                except json.JSONDecodeError:
-                    # #region debug-point D:json-decode-failed
-                    import urllib.request, os; _p='.dbg/midday-api-fail.env'; _u,_s='http://127.0.0.1:7788/event','midday-api-fail'; exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass"); urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId":_s,"runId":"pre","hypothesisId":"D","location":"v10_moni_trader.py:1099","msg":"[DEBUG] json decode failed","data":{"endpoint":endpoint,"stdout":(result.stdout or "")[:400],"stderr":(result.stderr or "")[:400],"cwd":os.getcwd(),"has_apikey":bool(MX_APIKEY)}}, ensure_ascii=False).encode(), headers={"Content-Type":"application/json"}), timeout=2).read()
-                    # #endregion
-                    print(f"[ERROR] JSON decode failed")
-                    response = None
+        except requests.RequestException as e:
+            # #region debug-point A:requests-failed
+            response_obj = getattr(e, 'response', None)
+            _midday_api_fail_debug_emit(
+                'A',
+                '[DEBUG] requests transport failed',
+                {
+                    'endpoint': endpoint,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                    'status_code': getattr(response_obj, 'status_code', None),
+                    'response_text': ((response_obj.text if response_obj is not None else '') or '')[:400],
+                    'has_apikey': bool(MX_APIKEY),
+                    'transport': 'requests',
+                },
+                location='v10_moni_trader.py:1093',
+            )
+            # #endregion
+            print(f"[ERROR] request failed: {e}")
+            response = None
         except Exception as e:
             # #region debug-point E:python-exception
-            import urllib.request, os; _p='.dbg/midday-api-fail.env'; _u,_s='http://127.0.0.1:7788/event','midday-api-fail'; exec("try:\n with open(_p) as f: c=f.read(); _u=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SERVER_URL=')),_u); _s=next((l.split('=',1)[1] for l in c.split('\\n') if l.startswith('DEBUG_SESSION_ID=')),_s)\nexcept: pass"); urllib.request.urlopen(urllib.request.Request(_u, data=json.dumps({"sessionId":_s,"runId":"pre","hypothesisId":"E","location":"v10_moni_trader.py:1104","msg":"[DEBUG] api_request exception","data":{"endpoint":endpoint,"error_type":type(e).__name__,"error":str(e),"cwd":os.getcwd(),"has_apikey":bool(MX_APIKEY),"curl_path":__import__('shutil').which('curl')}}, ensure_ascii=False).encode(), headers={"Content-Type":"application/json"}), timeout=2).read()
+            _midday_api_fail_debug_emit(
+                'E',
+                '[DEBUG] api_request exception',
+                {
+                    'endpoint': endpoint,
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                    'cwd': os.getcwd(),
+                    'has_apikey': bool(MX_APIKEY),
+                    'transport': 'requests',
+                },
+                location='v10_moni_trader.py:1104',
+            )
             # #endregion
             print(f"[ERROR] API request failed: {e}")
             response = None
 
         if not is_trade:
-            return response
+            if response is not None:
+                return response
+            # 查询类请求：transport/解码失败也按指数退避重试，
+            # 不把瞬时网络故障直接当作"查询失败"返回
+            if attempt >= attempts:
+                return None
+            sleep_seconds = (
+                QUERY_RETRY_BASE_SECONDS * attempt
+                + QUERY_RETRY_JITTER_SECONDS * attempt
+            )
+            sleep_seconds = min(sleep_seconds, max(deadline_ts - time.time() - API_WALLCLOCK_GRACE_SECONDS, 0.0))
+            if sleep_seconds <= 0:
+                return None
+            print(f"[WARN] 查询接口失败(attempt {attempt}/{attempts})，{sleep_seconds:.1f}s 后重试")
+            time.sleep(sleep_seconds)
+            continue
+
+        if response is None:
+            # trade 请求 transport/解码失败：与查询类一致指数退避重试。
+            # 此前 code='' 不在 TRADE_RETRYABLE_CODES 内会立即返回失败，
+            # 导致网络瞬时故障（海外链路间歇性超时）时卖单从不重试。
+            transport_attempts = min(attempts, TRADE_TRANSPORT_MAX_ATTEMPTS)
+            if attempt >= transport_attempts:
+                return _annotate_trade_response(
+                    None,
+                    retry_attempts=attempt - 1,
+                    min_interval_seconds=min_interval_seconds,
+                )
+            sleep_seconds = (
+                QUERY_RETRY_BASE_SECONDS * attempt
+                + QUERY_RETRY_JITTER_SECONDS * attempt
+            )
+            sleep_seconds = min(sleep_seconds, max(deadline_ts - time.time() - API_WALLCLOCK_GRACE_SECONDS, 0.0))
+            if trade_meta:
+                _trade_log_retry_event(
+                    trade_meta,
+                    result_code='transport',
+                    sleep_seconds=sleep_seconds,
+                    attempt=attempt,
+                    total_attempts=transport_attempts,
+                )
+            if sleep_seconds <= 0:
+                return _annotate_trade_response(
+                    None,
+                    retry_attempts=attempt - 1,
+                    min_interval_seconds=min_interval_seconds,
+                )
+            print(f"[WARN] trade 接口网络失败(attempt {attempt}/{transport_attempts})，{sleep_seconds:.1f}s 后重试")
+            time.sleep(sleep_seconds)
+            continue
 
         code = _trade_result_code(response)
-        if code not in TRADE_RETRYABLE_CODES or attempt >= attempts:
-            if code in TRADE_RETRYABLE_CODES:
+        is_rate_limit = code in TRADE_RETRYABLE_CODES
+        is_transient = code in TRADE_TRANSIENT_BUSINESS_CODES
+        if (not is_rate_limit and not is_transient) or attempt >= attempts:
+            if is_rate_limit:
                 _mark_trade_api_cooldown(
                     _resolve_trade_rate_limit_cooldown_seconds(
                         trade_meta,
@@ -2595,6 +3068,7 @@ def api_request(
                 min_interval_seconds=min_interval_seconds,
             )
         sleep_seconds = _resolve_trade_rate_limit_sleep_seconds(attempt, trade_meta)
+        sleep_seconds = min(sleep_seconds, max(deadline_ts - time.time() - API_WALLCLOCK_GRACE_SECONDS, 0.0))
         if trade_meta:
             _trade_log_retry_event(
                 trade_meta,
@@ -2603,8 +3077,15 @@ def api_request(
                 attempt=attempt,
                 total_attempts=attempts,
             )
-        _mark_trade_api_cooldown(_resolve_trade_rate_limit_cooldown_seconds(trade_meta))
-        print(f"[WARN] trade 接口限流(code={code})，{sleep_seconds:.1f}s 后重试第 {attempt + 1}/{attempts} 次")
+        if is_rate_limit:
+            _mark_trade_api_cooldown(_resolve_trade_rate_limit_cooldown_seconds(trade_meta))
+        if sleep_seconds <= 0:
+            return _annotate_trade_response(
+                response,
+                retry_attempts=attempt - 1,
+                min_interval_seconds=min_interval_seconds,
+            )
+        print(f"[WARN] trade 接口可重试错误(code={code})，{sleep_seconds:.1f}s 后重试第 {attempt + 1}/{attempts} 次")
         time.sleep(sleep_seconds)
     return _annotate_trade_response(
         None,
@@ -2616,20 +3097,76 @@ def api_request(
 def get_balance():
     """查询账户资金（API moneyUnit=1 时返回单位为元，无需额外换算）"""
     result = api_request('/api/claw/mockTrading/balance', {'moneyUnit': 1})
+    # #region debug-point B:balance-fetch
+    _mx_api_flap_debug_emit(
+        'B',
+        '[DEBUG] get_balance result',
+        {
+            'ok': bool(result and result.get('code') in ['0', 0, '200', 200]),
+            'result_code': None if not isinstance(result, dict) else result.get('code'),
+            'message': '' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+        },
+        location='v10_moni_trader.py:get_balance',
+    )
+    # #endregion
     if not result or result.get('code') not in ['0', 0, '200', 200]:
+        cached_balance, cache_age_seconds = _read_live_endpoint_cache(BALANCE_CACHE_FILE)
+        if isinstance(cached_balance, dict) and cached_balance:
+            # #region debug-point F:balance-cache-fallback
+            _mx_api_flap_debug_emit(
+                'F',
+                '[DEBUG] get_balance cache fallback',
+                {
+                    'cache_age_seconds': cache_age_seconds,
+                    'has_total_assets': bool(_fnum(cached_balance.get('total_assets', 0.0), 0.0) > 0),
+                },
+                location='v10_moni_trader.py:get_balance',
+            )
+            # #endregion
+            return cached_balance
         return None
     data = result['data']
-    return {
+    balance = {
         'total_assets': data.get('totalAssets', 0),
         'avail_balance': data.get('availBalance', 0),
         'total_pos_value': data.get('totalPosValue', 0),
     }
+    _write_live_endpoint_cache(BALANCE_CACHE_FILE, balance)
+    return balance
 
 
 def get_positions():
     """查询持仓（API返回单位：count=股, value/profit=元, price需按priceDec除）"""
     result = api_request('/api/claw/mockTrading/positions', {'moneyUnit': 1})
+    # #region debug-point C:positions-fetch
+    _mx_api_flap_debug_emit(
+        'C',
+        '[DEBUG] get_positions result',
+        {
+            'ok': bool(result and result.get('code') in ['0', 0, '200', 200]),
+            'result_code': None if not isinstance(result, dict) else result.get('code'),
+            'message': '' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+            'raw_pos_count': _inum((((result or {}).get('data') or {}).get('posList') or []).__len__(), 0) if isinstance(result, dict) else 0,
+        },
+        location='v10_moni_trader.py:get_positions',
+    )
+    # #endregion
     if not result or result.get('code') not in ['0', 0, '200', 200]:
+        cached_positions, cache_age_seconds = _read_live_endpoint_cache(POSITIONS_CACHE_FILE)
+        if isinstance(cached_positions, list):
+            # #region debug-point F:positions-cache-fallback
+            _mx_api_flap_debug_emit(
+                'F',
+                '[DEBUG] get_positions cache fallback',
+                {
+                    'cache_age_seconds': cache_age_seconds,
+                    'cached_count': len(cached_positions),
+                    'cached_codes': [str((item or {}).get('code', '')).zfill(6) for item in cached_positions[:10]],
+                },
+                location='v10_moni_trader.py:get_positions',
+            )
+            # #endregion
+            return cached_positions
         return []
     data = result['data']
     pos_list = data.get('posList', [])
@@ -2643,6 +3180,7 @@ def get_positions():
             'count': pos.get('count', 0),
             'avail_count': pos.get('availCount', 0),
             'price': pos.get('price', 0) / (10 ** price_dec),
+            'price_dec': price_dec,
             'cost_price': pos.get('costPrice', 0) / (10 ** cost_price_dec),
             'value': pos.get('value', 0),
             'profit': pos.get('profit', 0),
@@ -2654,6 +3192,7 @@ def get_positions():
         if not _has_active_position(item):
             continue
         positions.append(item)
+    _write_live_endpoint_cache(POSITIONS_CACHE_FILE, positions)
     return positions
 
 
@@ -2715,11 +3254,45 @@ def buy_stock(code, quantity, ref_price=None, order_context=None):
     }
 
 
-def sell_stock(code, quantity, ref_price=None, order_context=None):
-    """市价卖出"""
+def _to_api_price_int(price_yuan, price_dec=2):
+    """将元价格放大为 MX API trade 接口的整数限价。
+
+    探测验证：positions 接口返回 price/priceDec（如 000035 price=496, priceDec=2
+    → 4.96 元），trade 限价单需传放大整数 price=496；传 10^3 精度的 4960 会被
+    API 拒绝（"输入价格不合理，超过限价"）。
+    """
+    price = _fnum(price_yuan, 0.0)
+    if price <= 0:
+        return None
+    try:
+        dec = int(price_dec)
+    except (TypeError, ValueError):
+        dec = 2
+    if dec < 0 or dec > 6:
+        dec = 2
+    return int(round(price * (10 ** dec)))
+
+
+def sell_stock(code, quantity, ref_price=None, order_context=None, limit_fallback_price=None, price_dec=2):
+    """市价卖出；市价单失败（API 行情源 501 等）时回退限价单。
+
+    Args:
+        code: 股票代码
+        quantity: 卖出股数
+        ref_price: 参考价（元，用于日志/去重）
+        order_context: 订单上下文（执行阶段/策略动作）
+        limit_fallback_price: 限价回退参考价（元）。市价单失败且该值有效时，
+            将其放大为 API 限价整数（priceDec 精度）重试一次，
+            以绕过 MX API 行情源故障导致的"获取行情最新价失败(501)"。
+        price_dec: positions 接口返回的 priceDec（默认 2）。
+    """
     order_context = order_context or {}
     p = _fnum(ref_price, 0.0)
     min_interval_seconds = _resolve_trade_min_interval(TRADE_SELL_MIN_INTERVAL_SECONDS, order_context)
+    # 主市价 + 限价回退共享同一单票墙钟预算：黑洞场景下即使两次调用都触发，
+    # 单票总耗时也有上界（≤ TRADE_API_WALLCLOCK_SECONDS），3 只票累计仍可
+    # 留在 300s step 预算内，避免再次拖爆整个阶段。
+    trade_deadline_ts = time.time() + TRADE_API_WALLCLOCK_SECONDS
     result = api_request('/api/claw/mockTrading/trade', {
         'type': 'sell',
         'stockCode': code,
@@ -2731,7 +3304,7 @@ def sell_stock(code, quantity, ref_price=None, order_context=None):
         'quantity': quantity,
         'ref_price': p,
         **order_context,
-    }, min_interval_seconds=min_interval_seconds)
+    }, min_interval_seconds=min_interval_seconds, wall_clock_deadline_ts=trade_deadline_ts)
     _log_trade_api('sell', code, quantity, p, result, extra=order_context)
     if _trade_result_ok(result):
         order_id = _extract_order_id(result)
@@ -2743,6 +3316,73 @@ def sell_stock(code, quantity, ref_price=None, order_context=None):
             'result_code': _trade_result_code(result),
             'order_id': order_id,
         }
+    # 市价单失败：仅当失败原因是 API 行情源故障（501 临时业务错误）或 transport
+    # 网络失败（result_code 为空）时，才转限价单再试一次；112 限流及其它业务
+    # 错误不触发限价回退，避免加重 API 限流或掩盖真实交易问题。
+    failed_code = _trade_result_code(result)
+    allow_limit_fallback = (
+        limit_fallback_price is not None
+        and _fnum(limit_fallback_price, 0.0) > 0
+        and (
+            not result
+            or failed_code in TRADE_TRANSIENT_BUSINESS_CODES
+            or failed_code == ''
+        )
+    )
+    if allow_limit_fallback:
+        # 第三轮修复遗漏：limit_price 此前未定义，走到回退分支即 NameError。
+        # 按 price_dec 精度放大回退参考价为 MX API 限价整数（复用探测验证过的
+        # _to_api_price_int，见其 docstring）。
+        limit_price = _to_api_price_int(limit_fallback_price, price_dec)
+        if limit_price is None:
+            print(f"   卖出 {code} 失败(市价失败+限价回退价无效): {limit_fallback_price}")
+            return {
+                'success': False,
+                'result': result,
+                'result_code': _trade_result_code(result),
+                'order_id': '',
+            }
+        limit_meta = {
+            'action': 'sell',
+            'code': code,
+            'quantity': quantity,
+            'ref_price': p,
+            'limit_fallback_price': limit_fallback_price,
+            **order_context,
+        }
+        limit_result = api_request('/api/claw/mockTrading/trade', {
+            'type': 'sell',
+            'stockCode': code,
+            'quantity': quantity,
+            'useMarketPrice': False,
+            'price': limit_price,
+        }, is_trade=True, trade_meta=limit_meta, min_interval_seconds=min_interval_seconds,
+            wall_clock_deadline_ts=trade_deadline_ts)
+        _log_trade_api('sell', code, quantity, p, limit_result, extra={
+            **order_context,
+            'limit_fallback': True,
+            'limit_price': limit_price,
+        })
+        if _trade_result_ok(limit_result):
+            order_id = _extract_order_id(limit_result)
+            print(f"   卖出 {code} {quantity}股 限价回退委托号={order_id} (price={limit_price})")
+            register_pending_order('sell', code, quantity, p, order_id)
+            return {
+                'success': True,
+                'result': limit_result,
+                'result_code': _trade_result_code(limit_result),
+                'order_id': order_id,
+                'limit_fallback': True,
+            }
+        msg = limit_result.get('message', '未知错误') if limit_result else '网络错误'
+        print(f"   卖出 {code} 失败(市价+限价回退): {msg}")
+        return {
+            'success': False,
+            'result': limit_result,
+            'result_code': _trade_result_code(limit_result),
+            'order_id': '',
+            'limit_fallback': True,
+        }
     msg = result.get('message', '未知错误') if result else '网络错误'
     print(f"   卖出 {code} 失败: {msg}")
     return {
@@ -2753,13 +3393,23 @@ def sell_stock(code, quantity, ref_price=None, order_context=None):
     }
 
 
-def execute_trade_action(action, code, quantity, *, ref_price=None, execution_phase='primary', strategy_action=''):
+def execute_trade_action(action, code, quantity, *, ref_price=None, execution_phase='primary', strategy_action='',
+                         limit_fallback_price=None, price_dec=2):
     order_context = {
         'execution_phase': str(execution_phase or '').strip(),
         'strategy_action': str(strategy_action or action or '').strip(),
     }
     trade_fn = buy_stock if str(action).strip() == 'buy' else sell_stock
-    return trade_fn(code, quantity, ref_price=ref_price, order_context=order_context)
+    if str(action).strip() == 'buy':
+        return trade_fn(code, quantity, ref_price=ref_price, order_context=order_context)
+    return trade_fn(
+        code,
+        quantity,
+        ref_price=ref_price,
+        order_context=order_context,
+        limit_fallback_price=limit_fallback_price,
+        price_dec=price_dec,
+    )
 
 
 def is_rate_limited_trade_result(trade_result):
@@ -4747,6 +5397,22 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
     previous_summary = _read_json(SUMMARY_FILE) if os.path.exists(SUMMARY_FILE) else {}
     fallback_account = previous_summary.get('account', {}) if isinstance(previous_summary, dict) else {}
     account_live = bool(balance) or bool(positions)
+    # #region debug-point E:summary-fallback
+    _mx_api_flap_debug_emit(
+        'E',
+        '[DEBUG] write_account_artifacts pre-summary',
+        {
+            'tag': tag,
+            'account_live': account_live,
+            'has_balance': bool(balance),
+            'positions_count': len(positions or []),
+            'fallback_position_count': _inum(fallback_account.get('position_count', 0), 0),
+            'pending_active_buy_count': len((pending_summary or {}).get('active_buy_codes', []) or []),
+            'pending_active_sell_count': len((pending_summary or {}).get('active_sell_codes', []) or []),
+        },
+        location='v10_moni_trader.py:write_account_artifacts',
+    )
+    # #endregion
     if not account_live and fallback_account:
         balance = {
             'total_assets': _fnum(fallback_account.get('total_assets', 0.0), 0.0),
@@ -4869,7 +5535,7 @@ def build_midday_review(*, balance=None, positions=None, orders=None, records=No
     pending_items = refresh_pending_orders(orders=orders, positions=positions)
     pending_summary = summarize_pending_orders(pending_items)
     active_pos_map = _active_position_map(positions)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     review_items = []
     market_temperature = 'neutral'
     total_profit_pct = 0.0
@@ -5410,7 +6076,7 @@ def _build_intraday_judgment(*, context, review_payload, review_status, pm_gate_
 
     return {
         'available': True,
-        'trade_date': datetime.now().strftime('%Y-%m-%d'),
+        'trade_date': _market_today(),
         'generated_at': _now_str(),
         'market_temperature': market_temperature,
         'review_status': review_status,
@@ -5676,9 +6342,17 @@ def _resolve_recent_trade_selection_adjustment(code, recent_trade_memory, *, all
     days_since_buy = _inum(info.get('days_since_buy', 999), 999)
     recent_buy_count = _inum(info.get('recent_buy_count', 0), 0)
 
-    if days_since_sell <= RECENT_REENTRY_SELL_PENALTY_DAYS:
+    # C: Profitable exit -> very light touch, may re-enter same day
+    if last_closed_pnl_pct > 0 and days_since_sell <= 1:
+        penalty += 0.5
+        reasons.append(f'盈利卖出{days_since_sell}天后再入')
+    elif last_closed_pnl_pct > -2.0 and days_since_sell <= 2:
+        penalty += 1.0
+        reasons.append(f'微亏后观察{days_since_sell}天')
+    elif days_since_sell <= RECENT_REENTRY_SELL_PENALTY_DAYS:
         penalty += RECENT_SELL_PENALTY_SCORE
         reasons.append(f'近{days_since_sell}天刚卖出')
+
     if days_since_sell <= RECENT_REENTRY_LOSS_BLOCK_DAYS and last_closed_pnl_pct <= RECENT_REENTRY_LOSS_BLOCK_PCT:
         penalty += RECENT_FAILURE_PENALTY_SCORE
         reasons.append(f'近期亏损{last_closed_pnl_pct:+.1f}%')
@@ -6365,7 +7039,7 @@ def _load_latest_midday_payload():
 
 
 def _build_pm_buy_guardrails():
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     payload = _load_latest_midday_payload()
     if not payload and os.path.exists(PM_GATE_FILE):
         payload = _read_json(PM_GATE_FILE)
@@ -6399,6 +7073,12 @@ def _build_pm_buy_guardrails():
     max_new_positions = 0
     notes = []
     reason = 'midday_judgment_missing'
+
+    # === TUNED 2026-07-22: always block historical losing modes (overrides intraday allowance) ===
+    blocked_modes.update(BACKTEST_BLOCKED_MODES)
+    notes.append(
+        f'回测黑名单生效: {sorted(BACKTEST_BLOCKED_MODES)} (基于6样本<25%WR)'
+    )
 
     if not available:
         blocked_modes.add('V9_full')
@@ -8062,16 +8742,12 @@ def _build_close_node_payload(*, summary, reconcile_summary, daily_evolution_bun
     return payload
 
 
-def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT, override_amount=None):
-    """计算买入数量（整百股），amount=目标买入金额（元）。
-
-    override_amount 非 None 时使用该值替代 amount，支持 Kelly 分配器外部覆写。
-    """
-    effective_amount = override_amount if override_amount is not None else amount
-    if entry_price <= 0 or effective_amount <= 0:
+def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT):
+    """计算买入数量（整百股），amount=目标买入金额（元）"""
+    if entry_price <= 0 or amount <= 0:
         return 0
-    qty = int(effective_amount / entry_price / 100) * 100
-    return qty if qty >= 100 else 0
+    qty = int(amount / entry_price / 100) * 100
+    return qty if qty >= 100 else 0  # 买不起100股就返回0
 
 
 # ─── TDX 连接（信号衰减检测用） ───
@@ -8084,6 +8760,7 @@ TDX_HOSTS = [
 ]
 
 BUY_WINDOW = ((14, 50), (14, 57))
+MIDDAY_BUY_WINDOW = ((13, 0), (13, 30))
 SELL_CUTOFF_TIME = (14, 49)
 GENERAL_SELL_WINDOW = ((9, 35), SELL_CUTOFF_TIME)
 SMART_SELL_CHECKPOINTS = [
@@ -8107,23 +8784,23 @@ ADD_POSITION_WINDOW_SETTINGS = {
     '09:36': {
         'label': 'opening_confirm',
         'score_min': 4.5,
-        'aggressive_score_min': 6.0,
-        'reserve_cash_ratio': 0.35,
+        'aggressive_score_min': 5.0,
+        'reserve_cash_ratio': 0.25,
         'non_aggressive_max_items': 2,
     },
     '10:28': {
         'label': 'trend_promote',
-        'score_min': 5.0,
-        'aggressive_score_min': 6.5,
-        'reserve_cash_ratio': 0.28,
+        'score_min': 5.5,
+        'aggressive_score_min': 5.5,
+        'reserve_cash_ratio': 0.18,
         'non_aggressive_max_items': 2,
     },
     '13:28': {
         'label': 'pm_reaccel',
         'score_min': 5.0,
-        'aggressive_score_min': 6.5,
-        'reserve_cash_ratio': 0.20,
-        'non_aggressive_max_items': 1,
+        'aggressive_score_min': 5.5,
+        'reserve_cash_ratio': 0.12,
+        'non_aggressive_max_items': 2,
     },
 }
 
@@ -8152,7 +8829,7 @@ def _in_checkpoint_grace(now_value, checkpoints, *, grace_minutes=3):
 
 
 def _resolve_add_position_window(now_value=None):
-    now_value = now_value or datetime.now()
+    now_value = now_value or _market_now()
     for hour, minute in ADD_POSITION_CHECKPOINTS:
         current = now_value.hour * 60 + now_value.minute + now_value.second / 60.0
         checkpoint = hour * 60 + minute
@@ -8171,14 +8848,16 @@ def _current_add_position_window_tag(now_value=None):
 
 
 def ensure_trade_window(action, *, dry_run=False):
-    now = datetime.now()
+    now = _market_now()
     if dry_run:
         return True
     current = now.strftime('%H:%M')
     sell_cutoff = f'{SELL_CUTOFF_TIME[0]:02d}:{SELL_CUTOFF_TIME[1]:02d}'
     if action == 'buy':
-        if not _time_in_range(now, BUY_WINDOW[0], BUY_WINDOW[1]):
-            print(f"[WARN] 当前 {current} 不在买入窗口 14:50-14:57，已跳过自动买入。")
+        buy_win = MIDDAY_BUY_WINDOW if _MIDDAY_BUY_ACTIVE else BUY_WINDOW
+        if not _time_in_range(now, buy_win[0], buy_win[1]):
+            win_label = f"{buy_win[0][0]:02d}:{buy_win[0][1]:02d}-{buy_win[1][0]:02d}:{buy_win[1][1]:02d}"
+            print(f"[WARN] 当前 {current} 不在买入窗口 {win_label}，已跳过自动买入。")
             return False
     elif action == 'smart_sell':
         if not _time_in_range(now, GENERAL_SELL_WINDOW[0], GENERAL_SELL_WINDOW[1]):
@@ -8569,6 +9248,12 @@ def _build_big_meat_add_profile(api, code, *, record=None, profit_pct=0.0, decis
         if total_score >= ADD_POSITION_BIG_MEAT_TOTAL_SCORE:
             aggressive_score += 0.5
         profile['aggressive_score'] = round(aggressive_score, 2)
+        # macro tailwind: 宏观政策面利好时加分（解决"强政策+保守系统"背离问题）
+        macro_tw = _resolve_macro_tailwind_bonus()
+        if macro_tw.get('bonus', 0.0) > 0:
+            profile['aggressive_score'] = round(profile['aggressive_score'] + macro_tw['bonus'], 2)
+            profile['macro_tailwind_bonus'] = macro_tw['bonus']
+            profile['macro_tailwind_source'] = macro_tw.get('source', '')
         if strong_trend and near_day_high and intraday_anchor_hold and (noon_rebound or min5_rising or rebreakout) and profile['score'] >= ADD_POSITION_BIG_MEAT_SCORE_THRESHOLD:
             profile['eligible'] = True
             multiplier = ADD_POSITION_BIG_MEAT_TARGET_MULTIPLIER
@@ -8586,6 +9271,10 @@ def _build_big_meat_add_profile(api, code, *, record=None, profit_pct=0.0, decis
     except Exception:
         return profile
     return profile
+
+
+# Fix A: midday-buy mode flag - lowers score threshold by 6 when active
+_MIDDAY_BUY_ACTIVE = False
 
 
 def do_buy(dry_run=False):
@@ -8630,7 +9319,13 @@ def do_buy(dry_run=False):
             return EXIT_CONFIG_ERROR
     scan_ctx = load_scan_context()
     if not dry_run:
-        ok, message, ctx = validate_scan_freshness()
+        midday_max_age = 1440 if _MIDDAY_BUY_ACTIVE else SCAN_FRESHNESS_MINUTES
+        ok, message, ctx = validate_scan_freshness(max_age_minutes=midday_max_age)
+        if _MIDDAY_BUY_ACTIVE and not ok:
+            # Midday mode: accept yesterday's scan (no intraday scan yet)
+            print(f" 午盘扫描宽松校验: {message} (午盘模式放行)")
+            ok = True
+            message = ""
         #region debug-point D:buywatch-1450-fail-scan
         _debug_emit_event(
             'A',
@@ -8659,11 +9354,16 @@ def do_buy(dry_run=False):
     model_market = ranking['context']['market']
     model_state_summary = get_evolving_model_summary(ranking['context']['state'])
     min_model_score = ranking['min_trade_score']
+    # Fix A: midday-buy lowers threshold by 6 points for aggressive intraday entries
+    if _MIDDAY_BUY_ACTIVE:
+        min_model_score = max(38.0, min_model_score - 6.0)
+        print(f" 午盘模式: 分数门槛从 {ranking['min_trade_score']:.1f} 降至 {min_model_score:.1f}")
     balance = get_balance()
 
     if not balance:
         print("[ERROR] 无法获取账户资金")
-        return EXIT_RUNTIME_ERROR
+        # 接口故障+无缓存时按无动作结束，避免把网络故障判成运行时错误
+        return EXIT_NO_ACTION
 
     total_signals = sum(len(signals[t]) for t in signals)
     if total_signals == 0:
@@ -8754,6 +9454,10 @@ def do_buy(dry_run=False):
         for s in signals[original_tier]:
             mode = str(s.get('mode', '')).strip()
             code = str(s.get('code', '')).zfill(6)
+            # === TUNED 2026-07-22: code-prefix blacklist (block test instruments) ===
+            if any(code.startswith(p) for p in BLOCKED_CODE_PREFIXES):
+                skipped_guard_modes.append(f"{code}[prefix_block:{mode}]")
+                continue
             if mode in set(pm_buy_guard.get('blocked_modes', [])):
                 skipped_guard_modes.append(f"{code}[{mode}]")
                 continue
@@ -8851,6 +9555,15 @@ def do_buy(dry_run=False):
                 build_note = f"{build_note}; {'/'.join(recent_adjustment.get('reasons', [])[:2])}"
             if learning_action.get('reason'):
                 build_note = f"{build_note}; 学习层({learning_action['reason']})"
+            # === TUNED 2026-07-22: NAV-percentage position cap (was uncapped, max/min=32x) ===
+            nav_cap_max = total_assets * MAX_POSITION_PCT_NAV / 100
+            nav_cap_min = total_assets * MIN_POSITION_PCT_NAV / 100
+            if amount_per_stock_this > nav_cap_max:
+                build_note = f"{build_note}; 仓位封顶{MAX_POSITION_PCT_NAV:.1f}%NAV"
+                amount_per_stock_this = nav_cap_max
+            elif amount_per_stock_this < nav_cap_min:
+                build_note = f"{build_note}; 仓位过滤<{MIN_POSITION_PCT_NAV:.1f}%NAV"
+                continue  # skip dust trades
             amount_per_stock_this = min(amount_per_stock_this, target_amount_this)
             if amount_per_stock_this <= 0 or target_amount_this <= 0:
                 continue
@@ -8961,7 +9674,7 @@ def do_buy(dry_run=False):
     pending_items = refresh_pending_orders(orders=orders, positions=positions)
     pending_summary = summarize_pending_orders(pending_items)
     active_pos_map = _active_position_map(positions)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     holding_codes = {
         str(r.get('code', '')).zfill(6)
         for r in records
@@ -8996,69 +9709,6 @@ def do_buy(dry_run=False):
     if not buy_list:
         print(" 买入候选已被现有持仓或未完成买单过滤，尾盘不再重复报单")
         return EXIT_NO_ACTION
-
-    # ── Kelly position sizing (feature-flagged, batch allocation) ──
-    kelly_enabled = os.environ.get('MEP_USE_KELLY_SIZER', '0') not in ('0', 'false', '', 'no')
-    kelly_skipped: list[str] = []
-    if kelly_enabled and len(buy_list) >= 1:
-        # Build sizer-compatible candidates from buy_list
-        sizer_input = []
-        for item in buy_list:
-            sizer_input.append({
-                'code': str(item.get('code', '')).strip(),
-                'name': str(item.get('name', '')).strip(),
-                'score': _fnum(item.get('ranking_score', 0.0), 0.0),
-                'avg_candidate_win_rate': 0.0,
-                'avg_candidate_avg_return': 0.0,
-                'avg_profitability_priority': max(
-                    _fnum(item.get('ranking_score', 0.0), 0.0),
-                    _fnum(item.get('model_score', 0.0), 0.0),
-                ),
-                'volatility': 25.0,
-                'correlation_group': str(item.get('model_industry', '') or '').strip(),
-                'selection_rank': _inum(item.get('big_meat_priority_rank', 0), 0) or item['tier'],
-            })
-
-        # Compute drawdown from PnL
-        realized_pnl = _fnum(balance.get('realized_pnl', 0.0), 0.0)
-        floating_pnl = _fnum(balance.get('floating_pnl', 0.0), 0.0)
-        drawdown_pct = max(0.0, - (realized_pnl + floating_pnl) / max(balance.get('initial_capital', total_assets), 1.0) * 100.0)
-
-        allocations, sizer_debug = compute_position_weights(
-            sizer_input,
-            total_assets,
-            drawdown_pct=drawdown_pct,
-            window_key='14:50',
-            config=SizerConfig(max_single_pct=min(12.0, BUY_AMOUNT_DEFAULT / max(total_assets, 1.0) * 100.0)),
-        )
-        sizer_map = {a.code: a for a in allocations}
-
-        # Remap Kelly weights onto buy_list
-        kelly_buy_list = []
-        for item in buy_list:
-            code = str(item.get('code', '')).strip()
-            alloc = sizer_map.get(code)
-            if alloc is None:
-                kelly_skipped.append(f"{code}(kelly_zero)")
-                continue
-            kelly_amount = min(alloc.target_amount, _fnum(item.get('planned_build_amount', 0.0), 0.0))
-            if kelly_amount <= 0:
-                kelly_skipped.append(f"{code}(kelly_zero_amount)")
-                continue
-            item['planned_build_amount'] = kelly_amount
-            item['kelly_weight_pct'] = round(alloc.weight_pct, 4)
-            kelly_buy_list.append(item)
-        buy_list = kelly_buy_list
-        if kelly_skipped:
-            print(f" [Kelly] 分配器跳过: {', '.join(kelly_skipped[:10])}")
-        print(
-            f" [Kelly] 批次分配完成: 输入{len(sizer_input)}只 "
-            f"| 输出{len(sizer_map)}只 "
-            f"| 回撤比例{drawdown_pct:.1f}% "
-            f"| 缩放系数{sizer_debug.get('drawdown_scale', 1.0):.2f}x"
-        )
-    # ── end Kelly block ──
-
     funded_buy_list = []
     skipped_budget = []
     avail = balance['avail_balance']
@@ -9206,7 +9856,10 @@ def do_buy(dry_run=False):
         pending_items = live_state['pending_items']
         write_account_artifacts('buy', balance=balance, positions=positions, records=records, pending_items=pending_items)
         if success_count <= 0:
-            return EXIT_RUNTIME_ERROR
+            # 买入 0 单：可能是接口瞬时故障，不应判死整个阶段（否则自动化窗口被跳过）。
+            # 交由上层按 EXIT_NO_ACTION 收尾，下一周期自动重试。
+            print("[WARN] buy 阶段 0 单成交（接口故障或信号缺失），按无动作结束，下周期自动重试")
+            return EXIT_NO_ACTION
     if dry_run:
         return EXIT_OK
     if success_count > 0:
@@ -9260,7 +9913,7 @@ def _do_sell_core(smart=False, dry_run=False):
     if not ensure_trade_window(action, dry_run=dry_run):
         return EXIT_WINDOW_SKIPPED
     records = load_track_record()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     track_holding = [r for r in records if r.get('status') == 'holding']
     #region debug-point smart-sell-initial-refresh-start
     initial_refresh_started_at = time.perf_counter()
@@ -9682,6 +10335,8 @@ def _do_sell_core(smart=False, dry_run=False):
                     ref_price=cur_price,
                     execution_phase='primary',
                     strategy_action=action,
+                    limit_fallback_price=cur_price,
+                    price_dec=_inum((pos or {}).get('price_dec', 0), 2) or 2,
                 )
                 if trade_result['success']:
                     if smart:
@@ -9750,8 +10405,8 @@ def _do_sell_core(smart=False, dry_run=False):
                             code=str(code).zfill(6),
                             qty=_inum(qty, 0),
                             elapsed_ms=round((time.perf_counter() - trade_started_at) * 1000, 2),
-                            message=str(trade_result.get('message', '') or ''),
-                            result_code=str(trade_result.get('code', '') or ''),
+                            message=str((trade_result.get('result') or {}).get('message', '') or trade_result.get('message', '') or ''),
+                            result_code=str(trade_result.get('result_code', '') or ''),
                         )
                         #endregion
         else:
@@ -9867,8 +10522,10 @@ def _do_sell_core(smart=False, dry_run=False):
         return EXIT_OK
     if sold_count > 0:
         return EXIT_OK
-    if skipped_count > 0 and hold_count <= 0:
-        return EXIT_RUNTIME_ERROR
+    if skipped_count > 0:
+        # 卖单失败（接口故障/限流）不应判死整个阶段：持仓仍在，
+        # 下一周期 smart-sell 会重新扫描并重试卖出。
+        print(f"[WARN] {skipped_count} 笔卖单未受理（接口故障或限流），按无动作结束，下周期自动重试")
     return EXIT_NO_ACTION
 
 
@@ -10019,7 +10676,8 @@ def do_add_position(dry_run=False):
             # #region debug-point B:add-position-balance-missing
             _dbg_emit('B', '[DEBUG] add_position missing balance', elapsed_ms=round((_dbg_time.perf_counter() - _dbg_t0) * 1000, 1))
             # #endregion
-            return EXIT_RUNTIME_ERROR
+            # 接口故障+无缓存时按无动作结束，避免把网络故障判成运行时错误
+            return EXIT_NO_ACTION
 
         avail = _fnum(balance.get('avail_balance', 0.0), 0.0)
         total_assets = _fnum(balance.get('total_assets', avail), avail)
@@ -10555,7 +11213,7 @@ def do_add_position(dry_run=False):
     if skipped_yield_new:
         print(f" 新机会让位过滤: {', '.join(skipped_yield_new[:10])}")
 
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = _market_today()
     success_count = 0
     first_pass_success_count = 0
     tail_retry_success_count = 0
@@ -10755,7 +11413,9 @@ def do_add_position(dry_run=False):
                 failed_count=len(failed_add_items),
             )
             # #endregion
-            return EXIT_RUNTIME_ERROR
+            # 加仓单失败不应判死整个阶段，按无动作结束，下周期自动重试
+            print(f"[WARN] add_position {len(failed_add_items)} 笔加仓未受理，按无动作结束")
+            return EXIT_NO_ACTION
     # #region debug-point D:add-position-exit-ok
     _dbg_emit(
         'D',
@@ -10772,6 +11432,18 @@ def do_add_position(dry_run=False):
 def do_close_node():
     """收盘节点：全天复核复盘 + 学习放行。"""
     stage = 'start'
+    started_at = time.perf_counter()
+    def _emit_stage(checkpoint: str, **data):
+        _main_strategy_chain_emit(
+            'C',
+            'v10_moni_trader.py:do_close_node',
+            f'[DEBUG] close-node stage {checkpoint}',
+            {
+                'stage': stage,
+                'elapsed_ms': round((time.perf_counter() - started_at) * 1000, 1),
+                **data,
+            },
+        )
     # #region debug-point D:close-node-start
     _main_strategy_chain_emit(
         'C',
@@ -10782,8 +11454,16 @@ def do_close_node():
     # #endregion
     try:
         stage = 'collect_context'
+        _emit_stage('collect_context:start')
         context = _collect_reconcile_context()
+        _emit_stage(
+            'collect_context:done',
+            positions_count=len(context.get('positions') or []),
+            records_count=len(context.get('records') or []),
+            orders_count=len(context.get('orders') or []),
+        )
         stage = 'write_account_artifacts'
+        _emit_stage('write_account_artifacts:start')
         summary = write_account_artifacts(
             'report',
             balance=context['balance'],
@@ -10792,20 +11472,30 @@ def do_close_node():
         )
         summary['full_reconcile'] = context['reconcile_summary']
         _write_json_atomic(SUMMARY_FILE, summary)
+        _emit_stage(
+            'write_account_artifacts:done',
+            account_live=bool((summary.get('account_status') or {}).get('live')),
+            position_count=_inum(((summary.get('account') or {}).get('position_count', 0)), 0),
+        )
         stage = 'build_daily_evolution_bundle'
+        _emit_stage('build_daily_evolution_bundle:start')
         daily_evolution_bundle = _build_daily_evolution_bundle(
             summary=summary,
             records=context['records'],
-            trade_date=datetime.now().strftime('%Y-%m-%d'),
+            trade_date=_market_today(),
         )
+        _emit_stage('build_daily_evolution_bundle:done')
         stage = 'attach_intraday_judgment_review'
+        _emit_stage('attach_intraday_judgment_review:start')
         daily_evolution_bundle = _attach_intraday_judgment_review(
             daily_evolution_bundle,
             summary=summary,
             records=context['records'],
             positions=context['positions'],
         )
+        _emit_stage('attach_intraday_judgment_review:done')
         stage = 'attach_regime_execution_review'
+        _emit_stage('attach_regime_execution_review:start')
         daily_evolution_bundle = _attach_regime_execution_review(
             daily_evolution_bundle,
             summary=summary,
@@ -10814,14 +11504,21 @@ def do_close_node():
             daily_evolution_bundle.get('regime_execution_review', {}),
             source='close_node',
         )
+        _emit_stage('attach_regime_execution_review:done')
         stage = 'build_learning_actions'
+        _emit_stage('build_learning_actions:start')
         learning_actions = _build_learning_actions(
             daily_evolution_bundle,
-            trade_date=datetime.now().strftime('%Y-%m-%d'),
+            trade_date=_market_today(),
         )
         daily_evolution_bundle['learning_actions_summary'] = learning_actions.get('summary', {})
         _write_json_atomic(DAILY_EVOLUTION_BUNDLE_FILE, daily_evolution_bundle)
+        _emit_stage(
+            'build_learning_actions:done',
+            learning_action_count=len((learning_actions.get('actions') or [])),
+        )
         stage = 'build_close_payload'
+        _emit_stage('build_close_payload:start')
         close_payload = _build_close_node_payload(
             summary=summary,
             reconcile_summary=context['reconcile_summary'],
@@ -10852,6 +11549,11 @@ def do_close_node():
         _write_json_atomic(CLOSE_NODE_FILE, close_payload)
         _write_json_atomic(ENGINEERING_REVIEW_FILE, close_payload.get('engineering_review', {}))
         _write_json_atomic(LEARNING_GATE_FILE, _build_learning_gate_payload(close_payload))
+        _emit_stage(
+            'build_close_payload:done',
+            learning_gate_status=str(close_payload.get('learning_gate_status', '')).strip(),
+            review_status=str(close_payload.get('review_status', '')).strip(),
+        )
         # #region debug-point D:close-node-success
         _main_strategy_chain_emit(
             'D',
@@ -10922,6 +11624,30 @@ def do_midday_gate():
     return EXIT_OK
 
 
+def do_midday_buy(dry_run=False):
+    """Fix A: 午盘买入窗口 13:05。
+    在 midday-gate 放行后，基于当天扫描快照买入。
+    相比尾盘 do_buy：分数门槛降低6分，仅对 market_score >= 60 生效。"""
+    from pathlib import Path as _Path
+    gate_path = _Path(DATA_DIR) / "v10_pm_gate_status.json"
+    if gate_path.exists():
+        gate = _read_json(str(gate_path))
+        gate_status = str(gate.get('pm_gate_status', '')).strip()
+        if gate_status in ('block_all', 'block_buy'):
+            print("[MIDDAY-BUY] 午盘门控状态={}，跳过。".format(gate_status))
+            return EXIT_NO_ACTION
+    else:
+        print("[MIDDAY-BUY] 无午盘门控文件，跳过（需先运行 --midday-gate）。")
+        return EXIT_NO_ACTION
+
+    global _MIDDAY_BUY_ACTIVE
+    _MIDDAY_BUY_ACTIVE = True
+    try:
+        return do_buy(dry_run=dry_run)
+    finally:
+        _MIDDAY_BUY_ACTIVE = False
+
+
 def do_report():
     """兼容旧入口：收盘节点。"""
     return do_close_node()
@@ -10943,6 +11669,7 @@ def main():
     parser.add_argument('--status', action='store_true', help='查看持仓和战绩')
     parser.add_argument('--midday-node', action='store_true', help='午间节点：事实复核、自动安全纠偏、下午放行')
     parser.add_argument('--midday-gate', action='store_true', help='午间节点最终放行门：13:00-13:05 快速复查')
+    parser.add_argument('--midday-buy', action='store_true', help='午盘买入：13:05 在gate放行后基于当天快照买入')
     parser.add_argument('--midday-review', action='store_true', help='午间复盘：中场校准与下午观察清单')
     parser.add_argument('--close-node', action='store_true', help='收盘节点：全天复核复盘与学习放行')
     parser.add_argument('--report', action='store_true', help='生成账户摘要、NAV历史和学习循环报告')
@@ -10965,6 +11692,8 @@ def main():
         return do_midday_node()
     elif args.midday_gate:
         return do_midday_gate()
+    elif args.midday_buy:
+        return do_midday_buy(dry_run=args.dry_run)
     elif args.midday_review:
         return do_midday_review()
     elif args.close_node:
