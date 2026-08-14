@@ -73,6 +73,7 @@ jobs:
           pool_dir="$repo_root/workbuddy_pool"
           python_exe="$(bash "$GITHUB_WORKSPACE/scripts/github-actions/resolve_runtime_python.sh" "$repo_root" "${{ vars.TLFZ_PYTHON_EXE }}")"
           mkdir -p "$data_dir" "$pool_dir"
+          mx_api_url="${{ vars.MX_API_URL }}"
           {
             echo "TLFZ_ARKCLAW_ROOT=$repo_root"
             echo "TLFZ_WORKBUDDY_ROOT=$workbuddy_root"
@@ -81,7 +82,9 @@ jobs:
             echo "TLFZ_WORKBUDDY_POOL_DIR=$pool_dir"
             echo "TLFZ_PYTHON_EXE=$python_exe"
             echo "MX_APIKEY=${{ secrets.MX_APIKEY }}"
-            echo "MX_API_URL=${{ vars.MX_API_URL }}"
+            if [ -n "$mx_api_url" ]; then
+              echo "MX_API_URL=$mx_api_url"
+            fi
           } >> "$GITHUB_ENV"
           "$python_exe" --version
           echo "Repo root: $repo_root"

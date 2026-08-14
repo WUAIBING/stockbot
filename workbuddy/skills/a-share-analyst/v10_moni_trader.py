@@ -261,8 +261,21 @@ def _mx_api_flap_debug_emit(hypothesis_id: str, msg: str, data: dict, *, locatio
 
 
 _MX_RUNTIME_ENV = ensure_mx_runtime_env()
+DEFAULT_MX_API_URL = 'https://mkapi2.dfcfs.com/finskillshub'
+
+
+def resolve_mx_api_url(runtime_env=None, environ=None):
+    runtime_env = runtime_env if isinstance(runtime_env, dict) else {}
+    environ = environ if isinstance(environ, dict) else os.environ
+    return (
+        str(runtime_env.get('MX_API_URL', '') or '').strip()
+        or str(environ.get('MX_API_URL', '') or '').strip()
+        or DEFAULT_MX_API_URL
+    )
+
+
 MX_APIKEY = _MX_RUNTIME_ENV.get('MX_APIKEY', '') or os.environ.get('MX_APIKEY', '')
-MX_API_URL = _MX_RUNTIME_ENV.get('MX_API_URL', '') or os.environ.get('MX_API_URL', 'https://mkapi2.dfcfs.com/finskillshub')
+MX_API_URL = resolve_mx_api_url(_MX_RUNTIME_ENV)
 
 
 # 数据目录

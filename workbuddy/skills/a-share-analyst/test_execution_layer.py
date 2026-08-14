@@ -146,6 +146,12 @@ class TraderWindowTimezoneTests(unittest.TestCase):
         self.assertEqual(persisted["details"]["signal_count"], 3)
         self.assertEqual(persisted["details"]["skipped_low_model"], ["000001:42.0"])
 
+    def test_resolve_mx_api_url_falls_back_when_runtime_and_env_values_are_blank(self) -> None:
+        self.assertEqual(
+            trader.resolve_mx_api_url({"MX_API_URL": ""}, {"MX_API_URL": ""}),
+            trader.DEFAULT_MX_API_URL,
+        )
+
     def test_add_position_window_uses_market_timezone(self) -> None:
         market_now = datetime(2026, 7, 14, 9, 36, 30, tzinfo=trader.MARKET_TZ)
         with patch.object(trader, "_market_now", return_value=market_now):
