@@ -22,6 +22,7 @@ on:
           - add-position
           - smart-sell
           - sell
+          - repair-mx-002487
           - status
           - close-node
           - report

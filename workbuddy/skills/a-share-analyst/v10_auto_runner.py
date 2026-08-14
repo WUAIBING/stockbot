@@ -94,6 +94,7 @@ STEP_TIMEOUTS = {
     ('add-position', 'v10_moni_trader.py'): 240,
     ('smart-sell', 'v10_moni_trader.py'): 300,
     ('sell', 'v10_moni_trader.py'): 240,
+    ('repair-mx-002487', 'v10_moni_trader.py'): 180,
     ('status', 'v10_moni_trader.py'): 180,
     ('close-node', 'v10_moni_trader.py'): 420,
     ('close-node', 'external_market_review.py'): 360,
@@ -923,6 +924,14 @@ def build_steps(phase: str, *, with_email: bool) -> list[list[str] | None]:
         return [['v10_moni_trader.py', '--sell']]
     elif phase == 'status':
         return [['v10_moni_trader.py', '--status']]
+    elif phase == 'repair-mx-002487':
+        return [[
+            'v10_moni_trader.py',
+            '--repair-closed-episode', '002487',
+            '--repair-buy-order-id', '262214600000064468',
+            '--repair-buy-order-id', '262214500000070240',
+            '--repair-sell-order-id', '262244500000038738',
+        ]]
     elif phase == 'close-node':
         return [
             ['v10_moni_trader.py', '--close-node'],
