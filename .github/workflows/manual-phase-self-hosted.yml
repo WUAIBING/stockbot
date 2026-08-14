@@ -150,3 +150,5 @@ jobs:
           path: |
             /opt/stockbot/workbuddy/a-share-analyst/automation_status/**
             /opt/stockbot/workbuddy/a-share-analyst/*latest*.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_orders_cache.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_positions_cache.json
