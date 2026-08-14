@@ -308,6 +308,8 @@ EXTERNAL_MARKET_REVIEW_HISTORY_FILE = str(AUTOMATION_STATUS_DIR / 'external_mark
 LATEST_DECISION_STATUS_FILE = str(AUTOMATION_STATUS_DIR / 'latest_decision_status.json')
 BACKTEST_SUMMARY_FILE = str(DATA_DIR / 'v10_summary.json')
 TRADE_API_LOG_FILE = str(DATA_DIR / 'v10_trade_api_log.jsonl')
+MX_VERIFIED_FILLS_FILE = str(DATA_DIR / 'v10_mx_verified_fills.json')
+MX_FILL_REPAIR_FILE = str(DATA_DIR / 'v10_mx_fill_repair_latest.json')
 PENDING_ORDERS_FILE = str(DATA_DIR / 'v10_pending_orders.json')
 PENDING_ORDERS_ARCHIVE_FILE = str(DATA_DIR / 'v10_pending_orders_archive.json')
 SMART_SELL_RETRY_STATE_FILE = str(DATA_DIR / 'v10_smart_sell_retry_state.json')
@@ -2589,6 +2591,48 @@ def get_orders(flt_order_drt=0, flt_order_status=0):
     normalized_orders = [_normalize_order(order) for order in orders]
     _write_live_endpoint_cache(ORDERS_CACHE_FILE, normalized_orders)
     return normalized_orders
+
+
+def _get_filled_orders_from_mx(direction):
+    """读取 MX 已成委托；校正历史账本时不允许使用本地缓存。"""
+    result = api_request('/api/claw/mockTrading/orders', {
+        'fltOrderDrt': _inum(direction, 0),
+        'fltOrderStatus': 4,
+    })
+    if not result or result.get('code') not in ['0', 0, '200', 200]:
+        message = '' if not isinstance(result, dict) else str(result.get('message', '')).strip()
+        return [], message or 'MX 已成订单查询失败'
+    data = result.get('data', {}) if isinstance(result.get('data', {}), dict) else {}
+    orders = data.get('orders', []) or []
+    return [_normalize_order(order) for order in orders if isinstance(order, dict)], ''
+
+
+def _load_mx_verified_fills():
+    payload = _read_json(MX_VERIFIED_FILLS_FILE)
+    fills = payload.get('fills', {}) if isinstance(payload, dict) else {}
+    return {
+        str(order_id).strip(): dict(item)
+        for order_id, item in (fills or {}).items()
+        if str(order_id).strip() and isinstance(item, dict)
+    }
+
+
+def _verified_fill_from_order(order, *, action):
+    order = order if isinstance(order, dict) else {}
+    dt = order.get('datetime')
+    trade_price = _fnum(order.get('actual_trade_price', 0.0), 0.0)
+    trade_count = _inum(order.get('trade_count', 0), 0)
+    return {
+        'order_id': str(order.get('id', '')).strip(),
+        'code': str(order.get('code', '')).zfill(6),
+        'action': str(action).strip(),
+        'trade_price': round(trade_price, 4),
+        'trade_count': trade_count,
+        'trade_date': dt.strftime('%Y-%m-%d') if isinstance(dt, datetime) else '',
+        'trade_time': dt.strftime('%H:%M:%S') if isinstance(dt, datetime) else '',
+        'verified_at': _now_str(),
+        'source': 'mx_mockTrading_orders_status_4',
+    }
 
 
 def _cancel_result_ok(result):
@@ -5825,6 +5869,7 @@ def _extract_trade_api_order_id(row):
 def _build_trade_fill_index():
     index = {}
     seen = set()
+    verified_fills = _load_mx_verified_fills()
     for row in _read_jsonl(TRADE_API_LOG_FILE, limit=0):
         event_type = str(row.get('event_type', 'trade_result') or 'trade_result').strip()
         if event_type and event_type != 'trade_result':
@@ -5849,16 +5894,28 @@ def _build_trade_fill_index():
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
+        verified = verified_fills.get(order_id, {})
+        verified_matches = (
+            str(verified.get('code', '')).zfill(6) == code
+            and str(verified.get('action', '')).strip() == action
+            and _fnum(verified.get('trade_price', 0.0), 0.0) > 0
+            and _inum(verified.get('trade_count', 0), 0) > 0
+        )
+        verified_at = ' '.join(part for part in (
+            str(verified.get('trade_date', '')).strip(),
+            str(verified.get('trade_time', '')).strip(),
+        ) if part).strip()
         index.setdefault((code, action), []).append({
             'code': code,
             'action': action,
-            'logged_at': logged_at,
-            'trade_date': _date_key(logged_at),
+            'logged_at': verified_at or logged_at,
+            'trade_date': _date_key(verified_at or logged_at),
             'order_id': order_id,
-            'quantity': _inum(row.get('quantity', 0), 0),
-            'price': round(_fnum(row.get('ref_price', 0.0), 0.0), 4),
+            'quantity': _inum(verified.get('trade_count', 0), 0) if verified_matches else _inum(row.get('quantity', 0), 0),
+            'price': round(_fnum(verified.get('trade_price', 0.0), 0.0), 4) if verified_matches else round(_fnum(row.get('ref_price', 0.0), 0.0), 4),
             'strategy_action': str(row.get('strategy_action', '')).strip(),
             'retry_attempts': _inum(row.get('retry_attempts', 0), 0),
+            'verified_by_mx': verified_matches,
         })
     for key in index:
         index[key].sort(key=lambda item: str(item.get('logged_at', '')))
@@ -10871,6 +10928,139 @@ def do_midday_review():
     return EXIT_NO_ACTION
 
 
+def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
+    """用 MX 已成委托校正一笔已平仓 episode，不触发任何交易接口。"""
+    code = str(code or '').zfill(6)
+    buy_ids = [str(order_id).strip() for order_id in (buy_order_ids or []) if str(order_id).strip()]
+    sell_id = str(sell_order_id or '').strip()
+    report = {
+        'generated_at': _now_str(),
+        'code': code,
+        'buy_order_ids': buy_ids,
+        'sell_order_id': sell_id,
+        'ok': False,
+    }
+
+    def fail(message):
+        report['error'] = str(message)
+        _write_json_atomic(MX_FILL_REPAIR_FILE, report)
+        return report
+
+    if not code or len(buy_ids) != len(set(buy_ids)) or not buy_ids or not sell_id:
+        return fail('必须提供唯一的买入订单 ID 与一个卖出订单 ID')
+
+    source_records = load_track_record(positions=[])
+    source_matches = [
+        record for record in source_records
+        if str(record.get('status', '')).strip() == 'closed'
+        and str(record.get('code', '')).zfill(6) == code
+        and set(_split_order_ids(record.get('buy_order_ids', ''))) == set(buy_ids)
+        and str(record.get('sell_order_id', '')).strip() == sell_id
+    ]
+    if len(source_matches) != 1:
+        return fail(f'未找到唯一的本地已平仓记录（匹配数={len(source_matches)}）')
+
+    buy_orders, buy_error = _get_filled_orders_from_mx(1)
+    if buy_error:
+        return fail(buy_error)
+    sell_orders, sell_error = _get_filled_orders_from_mx(2)
+    if sell_error:
+        return fail(sell_error)
+    buy_by_id = {str(order.get('id', '')).strip(): order for order in buy_orders}
+    sell_by_id = {str(order.get('id', '')).strip(): order for order in sell_orders}
+    matched_buys = [buy_by_id.get(order_id) for order_id in buy_ids]
+    matched_sell = sell_by_id.get(sell_id)
+    if any(order is None for order in matched_buys) or matched_sell is None:
+        return fail('MX 已成订单历史未返回全部指定订单；未写入任何校正')
+
+    for expected_direction, orders_to_validate in ((1, matched_buys), (2, [matched_sell])):
+        for order in orders_to_validate:
+            if (
+                str(order.get('code', '')).zfill(6) != code
+                or _inum(order.get('direction', 0), 0) != expected_direction
+                or _inum(order.get('status', 0), 0) != 4
+                or _inum(order.get('trade_count', 0), 0) <= 0
+                or _fnum(order.get('actual_trade_price', 0.0), 0.0) <= 0
+            ):
+                return fail(f'MX 订单 {order.get("id", "")} 未通过成交字段校验；未写入任何校正')
+
+    buy_count = sum(_inum(order.get('trade_count', 0), 0) for order in matched_buys)
+    sell_count = _inum(matched_sell.get('trade_count', 0), 0)
+    if buy_count != sell_count:
+        return fail(f'买卖成交数量不一致：买入 {buy_count}，卖出 {sell_count}；未写入任何校正')
+
+    existing_payload = _read_json(MX_VERIFIED_FILLS_FILE)
+    fills = existing_payload.get('fills', {}) if isinstance(existing_payload, dict) else {}
+    fills = dict(fills) if isinstance(fills, dict) else {}
+    verified_buys = [_verified_fill_from_order(order, action='buy') for order in matched_buys]
+    verified_sell = _verified_fill_from_order(matched_sell, action='sell')
+    for fill in [*verified_buys, verified_sell]:
+        fills[fill['order_id']] = fill
+    _write_json_atomic(MX_VERIFIED_FILLS_FILE, {
+        'version': 1,
+        'updated_at': _now_str(),
+        'fills': fills,
+    })
+
+    records = load_track_record(positions=[])
+    repaired_matches = [
+        record for record in records
+        if str(record.get('status', '')).strip() == 'closed'
+        and str(record.get('code', '')).zfill(6) == code
+        and set(_split_order_ids(record.get('buy_order_ids', ''))) == set(buy_ids)
+        and str(record.get('sell_order_id', '')).strip() == sell_id
+    ]
+    if len(repaired_matches) != 1:
+        _write_json_atomic(MX_VERIFIED_FILLS_FILE, existing_payload)
+        return fail(f'校正后无法重建唯一记录（匹配数={len(repaired_matches)}）')
+    repaired = repaired_matches[0]
+    expected_entry = sum(
+        _fnum(fill.get('trade_price', 0.0), 0.0) * _inum(fill.get('trade_count', 0), 0)
+        for fill in verified_buys
+    ) / buy_count
+    expected_sell = _fnum(verified_sell.get('trade_price', 0.0), 0.0)
+    if (
+        abs(_fnum(repaired.get('entry_price', 0.0), 0.0) - expected_entry) > 0.0001
+        or abs(_fnum(repaired.get('sell_price', 0.0), 0.0) - expected_sell) > 0.0001
+    ):
+        _write_json_atomic(MX_VERIFIED_FILLS_FILE, existing_payload)
+        return fail('校正后的运行时记录未采用 MX 成交价；请保留现场并排查')
+
+    episodes = _build_trade_episode_history(records)
+    _write_json_atomic(TRADE_EPISODE_HISTORY_FILE, {
+        'generated_at': _now_str(),
+        'trade_date': _market_today(),
+        'summary': _summarize_trade_episode_history(episodes),
+        'episodes': episodes,
+    })
+    balance = get_balance()
+    positions = get_positions()
+    pending_items = refresh_pending_orders(orders=get_orders(), positions=positions)
+    summary = write_account_artifacts(
+        tag='mx_fill_repair',
+        balance=balance,
+        positions=positions,
+        records=records,
+        pending_items=pending_items,
+    )
+    report.update({
+        'ok': True,
+        'source': 'mx_mockTrading_orders_status_4',
+        'verified_buy_fills': verified_buys,
+        'verified_sell_fill': verified_sell,
+        'corrected_record': {
+            'entry_price': _fnum(repaired.get('entry_price', 0.0), 0.0),
+            'sell_price': _fnum(repaired.get('sell_price', 0.0), 0.0),
+            'quantity': _inum(repaired.get('quantity', 0), 0),
+            'pnl': _fnum(repaired.get('pnl', 0.0), 0.0),
+            'pnl_pct': _fnum(repaired.get('pnl_pct', 0.0), 0.0),
+        },
+        'summary_generated_at': summary.get('generated_at', ''),
+    })
+    _write_json_atomic(MX_FILL_REPAIR_FILE, report)
+    return report
+
+
 def main():
     assert_runtime_write_identity(AUTOMATION_STATUS_DIR)
     parser = argparse.ArgumentParser(description='V10 + mx-moni 模拟交易')
@@ -10883,6 +11073,9 @@ def main():
     parser.add_argument('--status', action='store_true', help='查看持仓和战绩')
     parser.add_argument('--close-node', action='store_true', help='收盘节点：全天复核复盘与学习放行')
     parser.add_argument('--report', action='store_true', help='生成账户摘要、NAV历史和学习循环报告')
+    parser.add_argument('--repair-closed-episode', metavar='CODE', help='仅用 MX 已成订单校正指定已平仓记录')
+    parser.add_argument('--repair-buy-order-id', action='append', default=[], help='校正记录的 MX 买入订单 ID（可重复传入）')
+    parser.add_argument('--repair-sell-order-id', default='', help='校正记录的 MX 卖出订单 ID')
     parser.add_argument('--dry-run', action='store_true', help='模拟运行，不实际下单')
     args = parser.parse_args()
 
@@ -10890,6 +11083,14 @@ def main():
         print("[ERROR] MX_APIKEY 未配置")
         return EXIT_CONFIG_ERROR
 
+    if args.repair_closed_episode:
+        repair = repair_closed_episode_from_mx_orders(
+            args.repair_closed_episode,
+            buy_order_ids=args.repair_buy_order_id,
+            sell_order_id=args.repair_sell_order_id,
+        )
+        print(json.dumps(repair, ensure_ascii=False, indent=2))
+        return EXIT_OK if repair.get('ok') else EXIT_RUNTIME_ERROR
     if args.buy:
         return do_buy(dry_run=args.dry_run)
     elif args.add_position:

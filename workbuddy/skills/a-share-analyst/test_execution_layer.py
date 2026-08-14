@@ -3189,5 +3189,44 @@ class ChallengerExecutionTests(unittest.TestCase):
         summary_mock.assert_called_once_with("status", [], fast=True)
 
 
+class VerifiedMxFillLedgerTests(unittest.TestCase):
+    def test_verified_mx_fills_override_reference_prices_during_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            trade_log_file = tmp / "trades.jsonl"
+            verified_fills_file = tmp / "verified_fills.json"
+            events = [
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B1", "quantity": 2000, "ref_price": 14.39, "logged_at": "2026-08-10 17:54:28"},
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B2", "quantity": 2100, "ref_price": 14.39, "logged_at": "2026-08-10 19:30:40"},
+                {"event_type": "trade_result", "ok": True, "action": "sell", "code": "002487", "order_id": "S1", "quantity": 4100, "ref_price": 43.38, "logged_at": "2026-08-13 10:45:38"},
+            ]
+            trade_log_file.write_text(
+                "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in events),
+                encoding="utf-8",
+            )
+            verified_fills_file.write_text(json.dumps({
+                "version": 1,
+                "fills": {
+                    "B1": {"order_id": "B1", "code": "002487", "action": "buy", "trade_price": 41.0, "trade_count": 2000, "trade_date": "2026-08-10", "trade_time": "17:54:28"},
+                    "B2": {"order_id": "B2", "code": "002487", "action": "buy", "trade_price": 42.0, "trade_count": 2100, "trade_date": "2026-08-10", "trade_time": "19:30:40"},
+                    "S1": {"order_id": "S1", "code": "002487", "action": "sell", "trade_price": 43.38, "trade_count": 4100, "trade_date": "2026-08-13", "trade_time": "10:45:38"},
+                },
+            }, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                patch.object(trader, "TRADE_API_LOG_FILE", str(trade_log_file)),
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", str(verified_fills_file)),
+            ):
+                closed, _open = trader._build_runtime_trade_records(decision_reference={})
+
+        self.assertEqual(len(closed), 1)
+        record = closed[0]
+        expected_entry = round((41.0 * 2000 + 42.0 * 2100) / 4100, 4)
+        self.assertAlmostEqual(float(record["entry_price"]), expected_entry, places=4)
+        self.assertAlmostEqual(float(record["sell_price"]), 43.38, places=2)
+        self.assertAlmostEqual(float(record["pnl"]), round((43.38 - expected_entry) * 4100, 2), places=2)
+        self.assertNotEqual(float(record["entry_price"]), 14.39)
+
+
 if __name__ == "__main__":
     unittest.main()

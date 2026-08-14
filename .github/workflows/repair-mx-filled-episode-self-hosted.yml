@@ -1,0 +1,127 @@
+name: Repair MX Filled Episode Self-Hosted
+
+on:
+  workflow_dispatch:
+    inputs:
+      code:
+        description: Closed record stock code to repair.
+        required: true
+        default: '002487'
+        type: string
+      buy_order_ids:
+        description: Comma-separated MX filled buy order IDs.
+        required: true
+        default: '262214600000064468,262214500000070240'
+        type: string
+      sell_order_id:
+        description: MX filled sell order ID.
+        required: true
+        default: '262244500000038738'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stockbot-trading-day
+  cancel-in-progress: false
+
+jobs:
+  repair-mx-filled-episode:
+    runs-on:
+      - self-hosted
+      - linux
+      - stockbot-do
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify checkout provenance
+        shell: bash
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/github-actions/verify_checkout_provenance.sh" \
+            "$GITHUB_WORKSPACE" \
+            "$GITHUB_SHA" \
+            "${{ github.ref_name }}"
+
+      - name: Sync checkout to DO repo
+        shell: bash
+        env:
+          SYNC_SOURCE_SHA: ${{ github.sha }}
+          SYNC_SOURCE_BRANCH: ${{ github.ref_name }}
+          SYNC_SOURCE_REMOTE_URL: https://github.com/${{ github.repository }}
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/github-actions/sync_repo_to_do.sh" "$GITHUB_WORKSPACE" /opt/stockbot
+
+      - name: Prepare runtime environment
+        shell: bash
+        run: |
+          repo_root="/opt/stockbot"
+          workbuddy_root="$repo_root/workbuddy"
+          skill_root="$workbuddy_root/skills/a-share-analyst"
+          data_dir="$repo_root/workbuddy/a-share-analyst"
+          pool_dir="$repo_root/workbuddy_pool"
+          python_exe="$(bash "$GITHUB_WORKSPACE/scripts/github-actions/resolve_runtime_python.sh" "$repo_root" "${{ vars.TLFZ_PYTHON_EXE }}")"
+          mkdir -p "$data_dir" "$pool_dir"
+          mx_api_url="${{ vars.MX_API_URL }}"
+          {
+            echo "TLFZ_ARKCLAW_ROOT=$repo_root"
+            echo "TLFZ_WORKBUDDY_ROOT=$workbuddy_root"
+            echo "TLFZ_WORKBUDDY_SKILL_ROOT=$skill_root"
+            echo "TLFZ_WORKBUDDY_DATA_DIR=$data_dir"
+            echo "TLFZ_WORKBUDDY_POOL_DIR=$pool_dir"
+            echo "TLFZ_PYTHON_EXE=$python_exe"
+            echo "MX_APIKEY=${{ secrets.MX_APIKEY }}"
+            if [ -n "$mx_api_url" ]; then
+              echo "MX_API_URL=$mx_api_url"
+            fi
+          } >> "$GITHUB_ENV"
+          "$python_exe" --version
+
+      - name: Verify MX fills and rebuild one closed episode
+        shell: bash
+        env:
+          REPAIR_CODE: ${{ inputs.code }}
+          REPAIR_BUY_ORDER_IDS: ${{ inputs.buy_order_ids }}
+          REPAIR_SELL_ORDER_ID: ${{ inputs.sell_order_id }}
+        run: |
+          if ! [[ "$REPAIR_CODE" =~ ^[0-9]{6}$ ]]; then
+            echo "Invalid stock code"
+            exit 2
+          fi
+          if ! [[ "$REPAIR_SELL_ORDER_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid sell order ID"
+            exit 2
+          fi
+          IFS=',' read -r -a buy_order_ids <<< "$REPAIR_BUY_ORDER_IDS"
+          args=(
+            "/opt/stockbot/workbuddy/skills/a-share-analyst/v10_moni_trader.py"
+            --repair-closed-episode "$REPAIR_CODE"
+            --repair-sell-order-id "$REPAIR_SELL_ORDER_ID"
+          )
+          for order_id in "${buy_order_ids[@]}"; do
+            order_id="$(printf '%s' "$order_id" | tr -d '[:space:]')"
+            if ! [[ "$order_id" =~ ^[0-9]+$ ]]; then
+              echo "Invalid buy order ID"
+              exit 2
+            fi
+            args+=(--repair-buy-order-id "$order_id")
+          done
+          "$TLFZ_PYTHON_EXE" "${args[@]}"
+
+      - name: Upload repair evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx-filled-episode-repair-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            /opt/stockbot/workbuddy/a-share-analyst/v10_mx_verified_fills.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_mx_fill_repair_latest.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_trade_episode_history_latest.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_account_summary_latest.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_orders_cache.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_positions_cache.json
