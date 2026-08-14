@@ -30,10 +30,14 @@ import argparse
 import subprocess
 import time
 import re
+import socket
 import urllib.request
+from decimal import Decimal, ROUND_DOWN
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -42,7 +46,7 @@ from pytdx.hq import TdxHq_API
 
 from market_resolver import build_today_exclusion_map, exclusion_reason_text
 from mx_api_env import ensure_mx_runtime_env
-from package_paths import DATA_DIR
+from package_paths import DATA_DIR, assert_runtime_write_identity
 from trading_calendar import previous_trading_day
 from evolving_model import (
     model_summary as get_evolving_model_summary,
@@ -63,14 +67,14 @@ def _configure_stdio():
                 pass
 
 
-#region debug-point A:buywatch-1450-fail-server
-_DEBUG_ROOT = Path(__file__).resolve().parents[2] / '.dbg'
-_DEBUG_ENV_FILE = _DEBUG_ROOT / 'buywatch-1450-fail.env'
+#region debug-point A:buy-window-timeout-server
+_DEBUG_ROOT = Path(__file__).resolve().parents[3] / '.dbg'
+_DEBUG_ENV_FILE = _DEBUG_ROOT / 'buy-window-timeout.env'
 
 
 def _debug_emit_event(hypothesis_id: str, location: str, msg: str, data: dict) -> None:
     url = 'http://127.0.0.1:7777/event'
-    session_id = 'buywatch-1450-fail'
+    session_id = 'buy-window-timeout'
     try:
         content = _DEBUG_ENV_FILE.read_text(encoding='utf-8')
         for raw_line in content.splitlines():
@@ -269,13 +273,10 @@ TRACK_FILE = str(DATA_DIR / 'v10_track_record.csv')
 POSITION_STATE_FILE = str(DATA_DIR / 'v10_position_state.json')
 NAV_FILE = str(DATA_DIR / 'v10_nav_history.csv')
 SUMMARY_FILE = str(DATA_DIR / 'v10_account_summary_latest.json')
+BUY_DIAGNOSTIC_FILE = str(DATA_DIR / 'v10_buy_diagnostic_latest.json')
 BALANCE_CACHE_FILE = str(DATA_DIR / 'v10_balance_cache.json')
 POSITIONS_CACHE_FILE = str(DATA_DIR / 'v10_positions_cache.json')
 ORDERS_CACHE_FILE = str(DATA_DIR / 'v10_orders_cache.json')
-MIDDAY_REVIEW_FILE = str(DATA_DIR / 'v10_midday_review_latest.json')
-MIDDAY_NODE_FILE = str(DATA_DIR / 'v10_midday_node_latest.json')
-MIDDAY_GATE_FILE = str(DATA_DIR / 'v10_midday_gate_latest.json')
-PM_GATE_FILE = str(DATA_DIR / 'v10_pm_gate_status.json')
 CLOSE_NODE_FILE = str(DATA_DIR / 'v10_close_node_latest.json')
 LEARNING_GATE_FILE = str(DATA_DIR / 'v10_learning_gate_status.json')
 READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS = 600
@@ -306,7 +307,20 @@ TRADE_MIN_INTERVAL_SECONDS = 2.0
 TRADE_BUY_MIN_INTERVAL_SECONDS = 2.5
 TRADE_SELL_MIN_INTERVAL_SECONDS = 3.5
 TRADE_RETRYABLE_CODES = {'112'}
+TRADE_RETRYABLE_TRANSPORT_ERROR_TOKENS = (
+    'read timed out',
+    'connection reset by peer',
+    'network is unreachable',
+    'failed to establish a new connection',
+    'remote end closed connection',
+    'remote disconnected',
+    'temporarily unavailable',
+)
 TRADE_MAX_RETRIES = 4
+MX_FORCE_IPV4 = str(os.environ.get('MX_FORCE_IPV4', '1')).strip().lower() not in {'0', 'false', 'no'}
+MX_IPV4_ONLY_HOSTS = {
+    'mkapi2.dfcfs.com',
+}
 TRADE_RETRY_BASE_SECONDS = 2.5
 TRADE_RETRY_JITTER_SECONDS = 0.4
 TRADE_TAIL_RETRY_DELAY_SECONDS = 6.0
@@ -429,6 +443,13 @@ EXIT_RUNTIME_ERROR = 3
 EXIT_STALE_SCAN = 4
 EXIT_NO_SIGNAL = 10
 EXIT_NO_ACTION = 11
+_LAST_POSITIONS_FETCH_STATUS = {
+    'source': 'unknown',
+    'ok': False,
+    'message': '',
+    'cache_age_seconds': None,
+    'count': 0,
+}
 TRACK_FIELDNAMES = [
     'date', 'buy_time', 'code', 'name', 'tier', 'entry_price', 'quantity',
     'buy_amount', 'buy_order_ids', 'sell_date', 'sell_time', 'sell_price',
@@ -440,7 +461,7 @@ TRACK_FIELDNAMES = [
     'big_meat_confirmed_at', 'big_meat_last_eval_at',
     'holding_big_meat_score', 'holding_big_meat_reason', 'holding_big_meat_promoted_at',
     'big_meat_hold_state', 'big_meat_core_qty', 'big_meat_trade_qty',
-    'big_meat_hold_lock_until',
+    'big_meat_hold_lock_until', 'big_meat_last_risk_trim_at',
     'last_synced_at',
 ]
 
@@ -648,6 +669,42 @@ def _trade_result_ok(result):
     return _trade_result_code(result) in ['0', 0, '200', 200]
 
 
+def _resolve_mx_ipv4_only_host(url) -> str:
+    if not MX_FORCE_IPV4:
+        return ''
+    host = (urlparse(str(url)).hostname or '').strip().lower()
+    if host in MX_IPV4_ONLY_HOSTS:
+        return host
+    return ''
+
+
+@contextmanager
+def _mx_force_ipv4_resolution(url):
+    host = _resolve_mx_ipv4_only_host(url)
+    if not host:
+        yield
+        return
+    original_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(target_host, port, family=0, type=0, proto=0, flags=0):
+        if str(target_host).strip().lower() == host:
+            return original_getaddrinfo(target_host, port, socket.AF_INET, type, proto, flags)
+        return original_getaddrinfo(target_host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = original_getaddrinfo
+
+
+def _is_retryable_trade_transport_error(error) -> bool:
+    text = str(error or '').strip().lower()
+    if not text:
+        return True
+    return any(token in text for token in TRADE_RETRYABLE_TRANSPORT_ERROR_TOKENS)
+
+
 def _annotate_trade_response(response, *, retry_attempts=0, min_interval_seconds=None):
     payload = dict(response) if isinstance(response, dict) else {}
     if not payload.get('message'):
@@ -658,6 +715,20 @@ def _annotate_trade_response(response, *, retry_attempts=0, min_interval_seconds
         2,
     )
     return payload
+
+
+def _build_transport_trade_response(error, *, retry_attempts=0, min_interval_seconds=None):
+    payload = {
+        'code': 'NETWORK',
+        'message': str(error or '网络错误').strip() or '网络错误',
+    }
+    if error is not None:
+        payload['error_type'] = type(error).__name__
+    return _annotate_trade_response(
+        payload,
+        retry_attempts=retry_attempts,
+        min_interval_seconds=min_interval_seconds,
+    )
 
 
 def _resolve_trade_min_interval(base_interval_seconds, order_context=None):
@@ -808,6 +879,19 @@ def _write_json_atomic(path, payload):
     tmp_path.replace(json_path)
 
 
+def _write_buy_diagnostic(reason, **details):
+    payload = {
+        'generated_at': _now_str(),
+        'trade_date': _market_today(),
+        'action': 'buy',
+        'status': 'no_action',
+        'reason': str(reason or 'unknown').strip() or 'unknown',
+        'details': details,
+    }
+    _write_json_atomic(BUY_DIAGNOSTIC_FILE, payload)
+    return payload
+
+
 def _write_live_endpoint_cache(path, data):
     safe_data = json.loads(json.dumps(data, ensure_ascii=False, default=str))
     _write_json_atomic(path, {
@@ -829,6 +913,22 @@ def _read_live_endpoint_cache(path, *, max_age_seconds=READ_ONLY_ENDPOINT_CACHE_
     if max_age_seconds > 0 and age_seconds > max_age_seconds:
         return None, age_seconds
     return data, age_seconds
+
+
+def _set_last_positions_fetch_status(**fields):
+    global _LAST_POSITIONS_FETCH_STATUS
+    _LAST_POSITIONS_FETCH_STATUS = {
+        'source': 'unknown',
+        'ok': False,
+        'message': '',
+        'cache_age_seconds': None,
+        'count': 0,
+        **fields,
+    }
+
+
+def _get_last_positions_fetch_status():
+    return dict(_LAST_POSITIONS_FETCH_STATUS)
 
 
 def _rehydrate_cached_orders(items):
@@ -1909,6 +2009,7 @@ def _apply_big_meat_state(record, *, state='', profile=None, reason='', window_t
         item['big_meat_core_qty'] = ''
         item['big_meat_trade_qty'] = ''
         item['big_meat_hold_lock_until'] = ''
+        item['big_meat_last_risk_trim_at'] = ''
     item['big_meat_state'] = normalized_state
     item['big_meat_score'] = f"{_fnum(profile.get('score', 0.0), 0.0):.2f}" if normalized_state else ''
     item['big_meat_aggressive_score'] = f"{_fnum(profile.get('aggressive_score', 0.0), 0.0):.2f}" if normalized_state else ''
@@ -1946,6 +2047,7 @@ def _big_meat_record_snapshot(record):
         str(record.get('big_meat_core_qty', '')).strip(),
         str(record.get('big_meat_trade_qty', '')).strip(),
         str(record.get('big_meat_hold_lock_until', '')).strip(),
+        str(record.get('big_meat_last_risk_trim_at', '')).strip(),
     )
 
 
@@ -2029,7 +2131,8 @@ def _is_big_meat_hold_lock_active(record, *, trade_date=''):
 
 
 def _apply_holding_big_meat_profile(record, *, profile=None, promote=False, hold_state=''):
-    record = _normalize_record(record)
+    target = record if isinstance(record, dict) else {}
+    record = _normalize_record(target)
     profile = profile if isinstance(profile, dict) else {}
     state = str(record.get('big_meat_state', '')).strip()
     now_text = _now_str()
@@ -2041,6 +2144,11 @@ def _apply_holding_big_meat_profile(record, *, profile=None, promote=False, hold
         record['big_meat_core_qty'] = ''
         record['big_meat_trade_qty'] = ''
         record['big_meat_hold_lock_until'] = ''
+        record['big_meat_last_risk_trim_at'] = ''
+        if isinstance(target, dict):
+            target.clear()
+            target.update(record)
+            return target
         return record
 
     score = _fnum(profile.get('holding_score', 0.0), 0.0)
@@ -2074,6 +2182,10 @@ def _apply_holding_big_meat_profile(record, *, profile=None, promote=False, hold
                 record['big_meat_hold_lock_until'] = target_text
     else:
         record = _sync_big_meat_position_split(record)
+    if isinstance(target, dict):
+        target.clear()
+        target.update(record)
+        return target
     return record
 
 
@@ -2176,8 +2288,18 @@ def _build_holding_big_meat_profile(record=None, *, profit_pct=0.0, add_profile=
     }
 
 
-def _resolve_big_meat_state_action(record, *, should_sell=False, decay_score=0.0, decay_reason='', holding_profile=None, learning_action=None):
+def _resolve_big_meat_state_action(
+    record,
+    *,
+    should_sell=False,
+    decay_score=0.0,
+    decay_reason='',
+    decay_detail=None,
+    holding_profile=None,
+    learning_action=None,
+):
     record = _normalize_record(record)
+    decay_detail = decay_detail if isinstance(decay_detail, dict) else {}
     holding_profile = holding_profile if isinstance(holding_profile, dict) else {}
     learning_action = learning_action if isinstance(learning_action, dict) else {}
     state = str(record.get('big_meat_state', '')).strip()
@@ -2190,8 +2312,8 @@ def _resolve_big_meat_state_action(record, *, should_sell=False, decay_score=0.0
         and '连跌2日' not in reason_text
         and '放量滞涨' not in reason_text
     )
-    state_trade_date = _state_eval_trade_date(record.get('big_meat_last_eval_at', ''))
-    same_day_state = state_trade_date == datetime.now().strftime('%Y-%m-%d')
+    confirmed_trade_date = _state_eval_trade_date(record.get('big_meat_confirmed_at', ''))
+    same_day_state = confirmed_trade_date == _market_today()
     if not should_sell:
         return {
             'action': BIG_MEAT_ACTION_HOLD_CORE if state == BIG_MEAT_STATE_CONFIRMED else '',
@@ -2231,11 +2353,22 @@ def _resolve_big_meat_state_action(record, *, should_sell=False, decay_score=0.0
             'reason': f'{state} 开盘强震荡但未趋势终结，先保护观察等待二次确认',
             'state': state,
         }
-    severe = (
-        _fnum(decay_score, 0.0) >= BIG_MEAT_STATE_MIN_DECAY_FOR_HARD_EXIT
-        or '趋势终结' in reason_text
-        or '连跌2日' in reason_text
+    detail_available = bool(decay_detail)
+    provisional_only = bool(decay_detail.get('provisional_only'))
+    confirmed_structural_break = bool(decay_detail.get('has_confirmed_structural_break'))
+    confirmed_score = _fnum(
+        decay_detail.get('confirmed_score', decay_score if not detail_available else 0.0),
+        0.0,
     )
+    if provisional_only and _state_eval_trade_date(record.get('big_meat_last_risk_trim_at', '')) == _market_today():
+        return {
+            'action': BIG_MEAT_ACTION_HOLD_CORE,
+            'reason': f'{state} 当日未完成周期形态已处理过，不重复减仓',
+            'state': state,
+        }
+    severe = confirmed_structural_break or confirmed_score >= BIG_MEAT_STATE_MIN_DECAY_FOR_HARD_EXIT
+    if not detail_available:
+        severe = severe or '趋势终结' in reason_text or '连跌2日' in reason_text
     if severe:
         return {
             'action': BIG_MEAT_ACTION_HARD_EXIT,
@@ -2718,12 +2851,13 @@ def api_request(
         if is_trade:
             _throttle_trade_api(min_interval_seconds=min_interval_seconds)
         try:
-            response_obj = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=request_timeout,
-            )
+            with _mx_force_ipv4_resolution(url):
+                response_obj = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=request_timeout,
+                )
             response_obj.raise_for_status()
             try:
                 response = response_obj.json()
@@ -2763,7 +2897,34 @@ def api_request(
             )
             # #endregion
             print(f"[ERROR] request failed: {e}")
-            response = None
+            if not is_trade:
+                response = None
+                continue
+            if attempt < attempts and _is_retryable_trade_transport_error(e):
+                sleep_seconds = _resolve_trade_rate_limit_sleep_seconds(attempt, trade_meta)
+                if trade_meta:
+                    _trade_log_retry_event(
+                        trade_meta,
+                        result_code='NETWORK',
+                        sleep_seconds=sleep_seconds,
+                        attempt=attempt,
+                        total_attempts=attempts,
+                    )
+                _mark_trade_api_cooldown(_resolve_trade_rate_limit_cooldown_seconds(trade_meta))
+                print(f"[WARN] trade 接口网络抖动，{sleep_seconds:.1f}s 后重试第 {attempt + 1}/{attempts} 次")
+                time.sleep(sleep_seconds)
+                continue
+            _mark_trade_api_cooldown(
+                _resolve_trade_rate_limit_cooldown_seconds(
+                    trade_meta,
+                    final_failure=True,
+                )
+            )
+            return _build_transport_trade_response(
+                e,
+                retry_attempts=attempt - 1,
+                min_interval_seconds=min_interval_seconds,
+            )
         except Exception as e:
             # #region debug-point E:python-exception
             _midday_api_fail_debug_emit(
@@ -2879,6 +3040,13 @@ def get_positions():
     if not result or result.get('code') not in ['0', 0, '200', 200]:
         cached_positions, cache_age_seconds = _read_live_endpoint_cache(POSITIONS_CACHE_FILE)
         if isinstance(cached_positions, list):
+            _set_last_positions_fetch_status(
+                source='cache',
+                ok=False,
+                message='' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+                cache_age_seconds=cache_age_seconds,
+                count=len(cached_positions),
+            )
             # #region debug-point F:positions-cache-fallback
             _mx_api_flap_debug_emit(
                 'F',
@@ -2892,6 +3060,13 @@ def get_positions():
             )
             # #endregion
             return cached_positions
+        _set_last_positions_fetch_status(
+            source='unavailable',
+            ok=False,
+            message='' if not isinstance(result, dict) else str(result.get('message', ''))[:160],
+            cache_age_seconds=cache_age_seconds,
+            count=0,
+        )
         return []
     data = result['data']
     pos_list = data.get('posList', [])
@@ -2917,6 +3092,13 @@ def get_positions():
             continue
         positions.append(item)
     _write_live_endpoint_cache(POSITIONS_CACHE_FILE, positions)
+    _set_last_positions_fetch_status(
+        source='api',
+        ok=True,
+        message='',
+        cache_age_seconds=0,
+        count=len(positions),
+    )
     return positions
 
 
@@ -2956,6 +3138,23 @@ def buy_stock(code, quantity, ref_price=None, order_context=None):
         'ref_price': p,
         **order_context,
     }, min_interval_seconds=min_interval_seconds)
+    #region debug-point J:buy-window-timeout-trade
+    _debug_emit_event(
+        'B',
+        'v10_moni_trader.py:buy_stock',
+        '[DEBUG] buy trade api returned',
+        {
+            'code': str(code or '').zfill(6),
+            'quantity': _inum(quantity, 0),
+            'ref_price': _fnum(p, 0.0),
+            'execution_phase': str(order_context.get('execution_phase', '')),
+            'strategy_action': str(order_context.get('strategy_action', '')),
+            'result_code': str(_trade_result_code(result)),
+            'message': str((result or {}).get('message', '')),
+            'order_id': str(_extract_order_id(result) or ''),
+        },
+    )
+    #endregion
     _log_trade_api('buy', code, quantity, p, result, extra=order_context)
     if _trade_result_ok(result):
         order_id = _extract_order_id(result)
@@ -3320,9 +3519,10 @@ def _run_sell_tail_retry_queue(
     sold_count,
     confirmed_count,
     skipped_count,
+    trade_failed_count,
 ):
     if not sell_retry_queue:
-        return records, balance, positions, sold_count, confirmed_count, skipped_count
+        return records, balance, positions, sold_count, confirmed_count, skipped_count, trade_failed_count
     tail_delay_seconds = _resolve_tail_retry_delay_seconds(action)
     print(
         f"\n [INFO] smart sell 首轮存在 {len(sell_retry_queue)} 只 112 限流，"
@@ -3359,6 +3559,8 @@ def _run_sell_tail_retry_queue(
             if is_rate_limited_trade_result(trade_result):
                 _mark_smart_sell_rate_limit(code, retry_qty)
                 print(f"  [COOLDOWN] {code} {item['name']} 尾部重试后仍触发112，进入下一窗口冷却")
+            else:
+                trade_failed_count += 1
             skipped_count += 1
             continue
         _clear_smart_sell_retry_state(code)
@@ -3393,7 +3595,7 @@ def _run_sell_tail_retry_queue(
                 f"  [PENDING] {code} {item['name']} T{item['tier']} | {item.get('sell_reason', '')} | "
                 f"尾部重试卖单已受理 {reserved_qty} 股，等待后续成交确认"
             )
-    return records, balance, positions, sold_count, confirmed_count, skipped_count
+    return records, balance, positions, sold_count, confirmed_count, skipped_count, trade_failed_count
 
 
 def get_order_timestamp(code, direction='buy', lookback_minutes=5):
@@ -4075,7 +4277,7 @@ POSITION_STATE_FIELDS = (
     'big_meat_confirmed_at', 'big_meat_last_eval_at',
     'holding_big_meat_score', 'holding_big_meat_reason', 'holding_big_meat_promoted_at',
     'big_meat_hold_state', 'big_meat_core_qty', 'big_meat_trade_qty',
-    'big_meat_hold_lock_until',
+    'big_meat_hold_lock_until', 'big_meat_last_risk_trim_at',
 )
 
 
@@ -5410,16 +5612,6 @@ def _collect_reconcile_context():
     }
 
 
-def _derive_midday_gate(issues):
-    if any(issue.get('blocks_all') for issue in issues):
-        return 'block_all'
-    if any(issue.get('blocks_buy') for issue in issues):
-        return 'block_buy'
-    if issues:
-        return 'pass_with_limit'
-    return 'pass'
-
-
 def _derive_review_status(issues):
     if any(issue.get('blocks_all') for issue in issues):
         return 'BLOCK'
@@ -5447,449 +5639,6 @@ def _dedupe_codes(values):
         seen.add(code)
         result.append(code)
     return result
-
-
-def _build_intraday_judgment(*, context, review_payload, review_status, pm_gate_status):
-    balance = context.get('balance') or {}
-    pending_summary = context.get('pending_summary') or {}
-    review_payload = review_payload if isinstance(review_payload, dict) else {}
-    account_total_assets = _fnum(balance.get('total_assets', 0.0), 0.0)
-    avg_profit_pct = _fnum(review_payload.get('avg_profit_pct', 0.0), 0.0)
-    market_temperature = str(review_payload.get('market_temperature', 'neutral')).strip() or 'neutral'
-    opening_liquidity = review_payload.get('opening_liquidity', {}) if isinstance(review_payload.get('opening_liquidity', {}), dict) else {}
-    external_market = review_payload.get('external_market', {}) if isinstance(review_payload.get('external_market', {}), dict) else {}
-    scan_status = review_payload.get('scan_status', {}) if isinstance(review_payload.get('scan_status', {}), dict) else {}
-    signals_by_tier = scan_status.get('signals_by_tier', {}) if isinstance(scan_status.get('signals_by_tier', {}), dict) else {}
-    scan_is_fresh = bool(scan_status.get('is_fresh'))
-    stocks_with_signal = _inum(scan_status.get('stocks_with_signal', 0), 0)
-    tier1_signal_count = _inum(signals_by_tier.get('T1', signals_by_tier.get('1', 0)), 0)
-    tier2_signal_count = _inum(signals_by_tier.get('T2', signals_by_tier.get('2', 0)), 0)
-    tier3_signal_count = _inum(signals_by_tier.get('T3', signals_by_tier.get('3', 0)), 0)
-    active_sell_codes = _dedupe_codes(pending_summary.get('active_sell_codes', []))
-    high_priority_review = _dedupe_codes(((review_payload.get('afternoon_watchlist') or {}).get('high_priority_review') or []))
-    watch_close = _dedupe_codes(((review_payload.get('afternoon_watchlist') or {}).get('watch_close') or []))
-    review_items = review_payload.get('holdings_review_top15', []) or []
-    strong_hold_codes = _dedupe_codes(
-        item.get('code')
-        for item in review_items
-        if str(item.get('afternoon_action', '')).strip() == 'hold_observe'
-        and _fnum(item.get('profit_pct', 0.0), 0.0) >= 0.0
-    )
-    reduce_watch_codes = _dedupe_codes(active_sell_codes + high_priority_review + watch_close)
-    defensive_pressure = 0
-    if market_temperature == 'risk_off':
-        defensive_pressure += 2
-    elif market_temperature == 'neutral':
-        defensive_pressure += 1
-    if pm_gate_status in {'block_all', 'block_buy', 'pass_with_limit'}:
-        defensive_pressure += 1
-    if active_sell_codes:
-        defensive_pressure += 1
-    if len(high_priority_review) >= 2:
-        defensive_pressure += 1
-    if avg_profit_pct < 0:
-        defensive_pressure += 1
-    opening_liquidity_verdict = str(opening_liquidity.get('verdict', '')).strip()
-    if opening_liquidity.get('available'):
-        if not bool(opening_liquidity.get('in_0931_window')):
-            defensive_pressure += 1
-        if opening_liquidity_verdict == 'fragile':
-            defensive_pressure += 2
-        elif opening_liquidity_verdict == 'mixed':
-            defensive_pressure += 1
-    external_risk_level = str(external_market.get('risk_level', '')).strip().lower()
-    external_bias = str(external_market.get('a_share_bias', '')).strip().lower()
-    external_negative_sectors = _normalize_sector_names(external_market.get('negative_sectors', []), limit=4)
-    external_neutral_sectors = _normalize_sector_names(external_market.get('neutral_sectors', []), limit=4)
-    external_positive_sectors = _normalize_sector_names(external_market.get('positive_sectors', []), limit=4)
-    external_actions = external_market.get('recommended_actions', {}) if isinstance(external_market.get('recommended_actions', {}), dict) else {}
-    external_opening_gate_bias = str(external_actions.get('opening_gate_bias', '')).strip().lower()
-    external_horizon = external_market.get('horizon_assessment', {}) if isinstance(external_market.get('horizon_assessment', {}), dict) else {}
-    short_flow_monitor = external_market.get('short_flow_monitor', {}) if isinstance(external_market.get('short_flow_monitor', {}), dict) else {}
-    short_flow_level = str(short_flow_monitor.get('pressure_level', '')).strip().lower()
-    short_flow_sectors = _normalize_sector_names(short_flow_monitor.get('targeted_sectors', []), limit=4)
-    opening_anchor_monitor = external_market.get('opening_anchor_break_monitor', {}) if isinstance(external_market.get('opening_anchor_break_monitor', {}), dict) else {}
-    opening_anchor_level = str(opening_anchor_monitor.get('pressure_level', '')).strip().lower()
-    broken_anchor_names = [str(item).strip() for item in opening_anchor_monitor.get('broken_anchor_names', []) if str(item).strip()][:6]
-    weekend_digest_monitor = external_market.get('weekend_digest_monitor', {}) if isinstance(external_market.get('weekend_digest_monitor', {}), dict) else {}
-    weekend_digest_bias = str(weekend_digest_monitor.get('bias', '')).strip().lower()
-    weekend_negative_sectors = _normalize_sector_names(weekend_digest_monitor.get('negative_sectors', []), limit=4)
-    weekend_positive_sectors = _normalize_sector_names(weekend_digest_monitor.get('positive_sectors', []), limit=4)
-    short_term_view = external_horizon.get('short_term', {}) if isinstance(external_horizon.get('short_term', {}), dict) else {}
-    short_term_bias = str(short_term_view.get('bias', '')).strip().lower()
-    mid_term_view = external_horizon.get('mid_term', {}) if isinstance(external_horizon.get('mid_term', {}), dict) else {}
-    long_term_view = external_horizon.get('long_term', {}) if isinstance(external_horizon.get('long_term', {}), dict) else {}
-    midday_release_soft_ready = (
-        scan_is_fresh
-        and stocks_with_signal >= MIDDAY_RELEASE_SIGNAL_FLOOR
-        and tier2_signal_count >= MIDDAY_RELEASE_T2_FLOOR
-    )
-    midday_release_ready = (
-        midday_release_soft_ready
-        and tier1_signal_count >= MIDDAY_RELEASE_T1_FLOOR
-    )
-    midday_release_context_ready = (
-        market_temperature == 'risk_on'
-        and pm_gate_status == 'pass'
-    )
-    if external_market.get('available'):
-        if external_risk_level in {'high', 'severe'}:
-            defensive_pressure += 2
-        elif external_risk_level in {'medium', 'elevated'}:
-            defensive_pressure += 1
-        if external_bias in {'risk_off', 'defensive', 'cautious'}:
-            defensive_pressure += 1
-        elif external_bias == 'selective_supportive':
-            defensive_pressure -= 1
-        elif external_bias == 'broad_supportive':
-            defensive_pressure -= 2
-        if short_term_bias == 'negative':
-            defensive_pressure += 1
-        elif short_term_bias == 'selective_positive':
-            defensive_pressure -= 1
-        elif short_term_bias == 'broad_positive':
-            defensive_pressure -= 2
-            if external_opening_gate_bias == 'supportive' and short_flow_level != 'high' and opening_anchor_level != 'high':
-                defensive_pressure -= 1
-        if short_flow_level == 'high':
-            defensive_pressure += 2
-        elif short_flow_level == 'medium':
-            defensive_pressure += 1
-        if opening_anchor_level == 'high':
-            defensive_pressure += 2
-        elif opening_anchor_level == 'medium':
-            defensive_pressure += 1
-        if weekend_digest_bias == 'negative':
-            defensive_pressure += 1
-        elif weekend_digest_bias == 'positive':
-            defensive_pressure -= 1
-    if midday_release_context_ready and midday_release_soft_ready:
-        defensive_pressure -= 1
-    if midday_release_context_ready and midday_release_ready:
-        defensive_pressure -= 1
-    if midday_release_context_ready and short_flow_level != 'high':
-        defensive_pressure -= 1
-    if midday_release_context_ready and opening_anchor_level != 'high':
-        defensive_pressure -= 1
-    if midday_release_context_ready and opening_liquidity_verdict in {'healthy', 'mixed'}:
-        defensive_pressure -= 1
-    defensive_pressure = max(0, defensive_pressure)
-
-    if defensive_pressure >= 4:
-        risk_bias = 'defensive'
-        rebound_bias = 'avoid_broad_rebound'
-    elif defensive_pressure >= 2:
-        risk_bias = 'balanced'
-        rebound_bias = 'selective_only'
-    else:
-        if external_bias in {'broad_supportive', 'selective_supportive'} and short_term_bias == 'broad_positive' and external_opening_gate_bias == 'supportive':
-            risk_bias = 'offensive'
-            rebound_bias = 'can_expand'
-        else:
-            risk_bias = 'balanced'
-            rebound_bias = 'selective_only'
-    midday_release_override = (
-        midday_release_context_ready
-        and midday_release_ready
-        and short_flow_level != 'high'
-        and opening_anchor_level != 'high'
-    )
-    if midday_release_override and risk_bias == 'defensive':
-        risk_bias = 'balanced'
-        rebound_bias = 'selective_only'
-
-    confidence = 0.45
-    if market_temperature != 'neutral':
-        confidence += 0.15
-    if review_status == 'PASS':
-        confidence += 0.1
-    elif review_status == 'WARN':
-        confidence += 0.05
-    if high_priority_review or active_sell_codes:
-        confidence += 0.1
-    if midday_release_ready:
-        confidence += 0.05
-    confidence = round(max(0.25, min(0.9, confidence)), 2)
-
-    notes = []
-    if market_temperature == 'risk_off':
-        notes.append('午盘识别为风险偏好收缩，下午优先防守而非抢普反。')
-    elif market_temperature == 'risk_on':
-        notes.append('午盘识别为偏暖环境，下午可保留强票利润奔跑。')
-    else:
-        notes.append('午盘识别为中性偏分化环境，下午只做结构化处理。')
-    if scan_is_fresh:
-        notes.append(
-            f'午盘扫描仍新鲜，候选强度 signals={stocks_with_signal} '
-            f'(T1={tier1_signal_count}/T2={tier2_signal_count}/T3={tier3_signal_count})。'
-        )
-        if midday_release_context_ready and midday_release_ready:
-            notes.append('午盘门控已放行且强候选达标，下午不再机械延续早盘防守偏置。')
-        elif midday_release_context_ready and midday_release_soft_ready:
-            notes.append('午盘门控已放行且候选密度充足，下午至少按结构性扩张处理。')
-    elif stocks_with_signal > 0:
-        notes.append(f'午盘扫描候选总量 {stocks_with_signal}，但样本已过时，释放权重自动下调。')
-    if external_market.get('available'):
-        window_tag = str(external_market.get('window_tag', '')).strip()
-        if external_risk_level in {'high', 'severe', 'medium', 'elevated'}:
-            notes.append(
-                f'外部资讯在 {window_tag or "预开盘"} 窗口提示风险等级 {external_risk_level}，'
-                f'先按板块冲击做防守映射。'
-            )
-        if external_bias == 'neutral':
-            notes.append('外部资讯偏中性分化，不支持脑补普反，先做结构性验证。')
-        elif external_bias == 'selective_supportive':
-            notes.append('外部资讯偏结构性利好，可围绕强分支做选择性应变。')
-        elif external_bias == 'broad_supportive':
-            notes.append('外部资讯偏全面利好，但仍需尊重 09:31 流动性确认。')
-        if external_negative_sectors:
-            notes.append(f'隔夜/开盘资讯预警的承压板块: {", ".join(external_negative_sectors)}。')
-        if external_neutral_sectors:
-            notes.append(f'隔夜/开盘资讯提示应观察而非追价的板块: {", ".join(external_neutral_sectors)}。')
-        if external_positive_sectors:
-            notes.append(f'隔夜/开盘资讯相对受益板块: {", ".join(external_positive_sectors)}。')
-        if short_flow_level in {'high', 'medium', 'low'}:
-            notes.append(
-                f'做空资金动向压力等级 {short_flow_level}，'
-                f'{str(short_flow_monitor.get("summary", "")).strip()}'
-            )
-        if short_flow_sectors:
-            notes.append(f'空头/卖压重点指向板块: {", ".join(short_flow_sectors)}。')
-        if opening_anchor_level in {'high', 'medium', 'low'}:
-            notes.append(
-                f'09:31 核心锚股破位压力等级 {opening_anchor_level}，'
-                f'{str(opening_anchor_monitor.get("summary", "")).strip()}'
-            )
-        if broken_anchor_names:
-            notes.append(f'开盘被明显压制的核心锚股: {", ".join(broken_anchor_names)}。')
-        if weekend_digest_monitor.get('active'):
-            notes.append(
-                f'周一周末汇总判断 {weekend_digest_bias or "neutral"}，'
-                f'{str(weekend_digest_monitor.get("summary", "")).strip()}'
-            )
-        if weekend_negative_sectors:
-            notes.append(f'周末汇总预警承压板块: {", ".join(weekend_negative_sectors)}。')
-        if weekend_positive_sectors:
-            notes.append(f'周末汇总关注受益板块: {", ".join(weekend_positive_sectors)}。')
-        if str(short_term_view.get('summary', '')).strip():
-            notes.append(f'短期判断: {str(short_term_view.get("summary", "")).strip()}')
-        if str(mid_term_view.get('summary', '')).strip():
-            notes.append(f'中期判断: {str(mid_term_view.get("summary", "")).strip()}')
-        if str(long_term_view.get('summary', '')).strip():
-            notes.append(f'长期判断: {str(long_term_view.get("summary", "")).strip()}')
-    if opening_liquidity.get('available'):
-        if opening_liquidity.get('in_0931_window'):
-            notes.append('09:31 开盘流动性检查已纳入午盘判断。')
-        elif opening_liquidity_verdict:
-            notes.append('开盘流动性样本不在 09:31 窗口，门控权重已自动下调。')
-    if reduce_watch_codes:
-        notes.append(f'下午重点减压/复检名单: {", ".join(reduce_watch_codes[:6])}。')
-    if strong_hold_codes:
-        notes.append(f'下午允许继续观察的强票: {", ".join(strong_hold_codes[:6])}。')
-
-    return {
-        'available': True,
-        'trade_date': _market_today(),
-        'generated_at': _now_str(),
-        'market_temperature': market_temperature,
-        'review_status': review_status,
-        'pm_gate_status': pm_gate_status,
-        'risk_bias': risk_bias,
-        'rebound_bias': rebound_bias,
-        'confidence': confidence,
-        'avg_profit_pct': round(avg_profit_pct, 2),
-        'cash_ratio': _safe_ratio(balance.get('avail_balance', 0.0), account_total_assets),
-        'position_exposure_ratio': _safe_ratio(balance.get('total_pos_value', 0.0), account_total_assets),
-        'strong_hold_codes': strong_hold_codes[:10],
-        'reduce_watch_codes': reduce_watch_codes[:10],
-        'active_sell_codes': active_sell_codes[:10],
-        'scan_status': {
-            'is_fresh': scan_is_fresh,
-            'stocks_with_signal': stocks_with_signal,
-            'signals_by_tier': {
-                'T1': tier1_signal_count,
-                'T2': tier2_signal_count,
-                'T3': tier3_signal_count,
-            },
-            'midday_release_soft_ready': midday_release_soft_ready,
-            'midday_release_ready': midday_release_ready,
-            'midday_release_override': midday_release_override,
-        },
-        'opening_liquidity': {
-            'available': bool(opening_liquidity.get('available')),
-            'generated_at': opening_liquidity.get('generated_at', ''),
-            'verdict': opening_liquidity_verdict,
-            'in_0931_window': bool(opening_liquidity.get('in_0931_window')),
-            'issue_ratio': _fnum(opening_liquidity.get('issue_ratio', 0.0), 0.0),
-            'excluded_today_count': _inum(opening_liquidity.get('excluded_today_count', 0), 0),
-            'review_only_count': _inum(opening_liquidity.get('review_only_count', 0), 0),
-        },
-        'external_market': {
-            'available': bool(external_market.get('available')),
-            'generated_at': external_market.get('generated_at', ''),
-            'window_tag': external_market.get('window_tag', ''),
-            'risk_level': external_risk_level or 'unknown',
-            'a_share_bias': external_market.get('a_share_bias', ''),
-            'negative_sectors': external_negative_sectors,
-            'neutral_sectors': external_neutral_sectors,
-            'positive_sectors': external_positive_sectors,
-            'recommended_actions': external_actions,
-            'horizon_assessment': external_horizon,
-            'short_flow_monitor': short_flow_monitor,
-            'opening_anchor_break_monitor': opening_anchor_monitor,
-            'weekend_digest_monitor': weekend_digest_monitor,
-            'headline': external_market.get('headline', ''),
-        },
-        'notes': notes,
-    }
-
-
-def _build_midday_node_payload(*, context, review_payload, stage):
-    records = context['records']
-    positions = context['positions']
-    pending_summary = context['pending_summary']
-    reconcile_summary = context['reconcile_summary']
-    account_snapshot = context['account_snapshot']
-    holding_records = len([r for r in records if r.get('status') == 'holding'])
-    real_positions = len(_active_position_map(positions))
-    imported_positions = _inum(reconcile_summary.get('imported_positions', 0), 0)
-    overlaid_positions = _inum(reconcile_summary.get('overlaid_positions', 0), 0)
-    paused_records = _inum(reconcile_summary.get('paused_records', 0), 0)
-    stale_count = _inum((pending_summary.get('counts') or {}).get('stale', 0), 0)
-    active_buy_codes = list(pending_summary.get('active_buy_codes', []))
-    active_sell_codes = list(pending_summary.get('active_sell_codes', []))
-
-    issues = []
-    repair_actions = []
-
-    if not account_snapshot.get('live'):
-        issues.append(_review_issue(
-            'account_snapshot', 'critical', 'account_snapshot_unavailable',
-            '账户接口快照不可用，当前仅能依赖旧摘要，下午自动交易应降级。',
-            action='block_pm_until_account_live',
-            blocks_buy=True,
-            blocks_all=True,
-        ))
-    if imported_positions > 0:
-        issues.append(_review_issue(
-            'ledger_sync', 'warn', 'auto_imported_positions',
-            f'午间对仓自动导入 {imported_positions} 条真实持仓到账本。',
-            action='review_auto_imported_positions',
-        ))
-        repair_actions.append('full_reconcile_import_positions')
-    if overlaid_positions > 0:
-        issues.append(_review_issue(
-            'ledger_sync', 'warn', 'overlay_applied',
-            f'午间对仓用真实持仓覆盖更新了 {overlaid_positions} 条账本记录。',
-            action='review_overlaid_positions',
-        ))
-        repair_actions.append('full_reconcile_overlay_positions')
-    if paused_records > 0:
-        issues.append(_review_issue(
-            'ledger_sync', 'repair_required', 'holding_paused_after_reconcile',
-            f'午间对仓暂停了 {paused_records} 条缺失真实仓位的 holding 记录。',
-            action='review_paused_holdings_before_pm',
-            blocks_buy=True,
-        ))
-        repair_actions.append('pause_missing_holdings')
-    if holding_records != real_positions:
-        issues.append(_review_issue(
-            'base_position', 'repair_required', 'holding_position_count_mismatch',
-            f'账本 holding 数 {holding_records} 与真实持仓数 {real_positions} 仍不一致。',
-            action='block_buy_until_ledger_matches_positions',
-            blocks_buy=True,
-        ))
-    if stale_count > 0:
-        issues.append(_review_issue(
-            'pending_orders', 'repair_required', 'stale_pending_orders',
-            f'当前仍有 {stale_count} 条 stale pending 订单，下午买单存在冲突风险。',
-            action='rebuild_pending_and_review_open_orders',
-            blocks_buy=True,
-        ))
-        repair_actions.append('refresh_pending_orders')
-    if active_buy_codes:
-        issues.append(_review_issue(
-            'pending_orders', 'warn', 'active_buy_orders_present',
-            f'当前仍有未完成买单占用：{", ".join(active_buy_codes)}。',
-            action='block_codes_from_pm_buy',
-            blocks_buy=True,
-        ))
-    if active_sell_codes:
-        issues.append(_review_issue(
-            'pending_orders', 'warn', 'active_sell_orders_present',
-            f'当前仍有未完成卖单：{", ".join(active_sell_codes)}。',
-            action='keep_sell_watch_and_skip_duplicate_sell',
-        ))
-    if context['changed']:
-        repair_actions.append('sync_track_record')
-        repair_actions.append('save_track_record')
-
-    seen_actions = []
-    for action in repair_actions:
-        if action and action not in seen_actions:
-            seen_actions.append(action)
-
-    review_status = _derive_review_status(issues)
-    pm_gate_status = _derive_midday_gate(issues)
-    intraday_judgment = _build_intraday_judgment(
-        context=context,
-        review_payload=review_payload,
-        review_status=review_status,
-        pm_gate_status=pm_gate_status,
-    )
-    payload = {
-        'generated_at': _now_str(),
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        'node': 'midday_node',
-        'stage': stage,
-        'trigger_slot': MIDDAY_NODE_TRIGGER_SLOT,
-        'realtime_correction_window': PM_REALTIME_CORRECTION_WINDOW,
-        'hard_deadline': MIDDAY_NODE_HARD_DEADLINE,
-        'review_status': review_status,
-        'pm_gate_status': pm_gate_status,
-        'blocked_buy_codes': active_buy_codes,
-        'account': account_snapshot,
-        'pending_orders': pending_summary,
-        'reconcile': reconcile_summary,
-        'issues': issues,
-        'repair_actions_executed': seen_actions,
-        'summary': {
-            'holding_records': holding_records,
-            'real_positions': real_positions,
-            'active_buy_codes': active_buy_codes,
-            'active_sell_codes': active_sell_codes,
-            'notes': [
-                '午间节点先复核上午已发生事实，再决定下午是否放行。',
-                '13:00-13:05 仅保留低风险实时纠偏窗口，不在该窗口内自动做高风险改单动作。',
-            ],
-        },
-        'midday_review': {
-            'market_temperature': review_payload.get('market_temperature', 'neutral'),
-            'avg_profit_pct': review_payload.get('avg_profit_pct', 0.0),
-            'opening_liquidity': review_payload.get('opening_liquidity', {}),
-            'external_market': review_payload.get('external_market', {}),
-            'focus_sell_watch': review_payload.get('focus_sell_watch', [])[:10],
-            'afternoon_watchlist': review_payload.get('afternoon_watchlist', {}),
-        },
-        'intraday_judgment': intraday_judgment,
-    }
-    return payload
-
-
-def _write_pm_gate_payload(payload, *, file_path):
-    gate_payload = {
-        'generated_at': payload.get('generated_at', _now_str()),
-        'date': payload.get('date', datetime.now().strftime('%Y-%m-%d')),
-        'node': payload.get('node', 'midday_node'),
-        'stage': payload.get('stage', ''),
-        'review_status': payload.get('review_status', 'PASS'),
-        'pm_gate_status': payload.get('pm_gate_status', 'pass'),
-        'blocked_buy_codes': payload.get('blocked_buy_codes', []),
-        'hard_deadline': payload.get('hard_deadline', MIDDAY_NODE_HARD_DEADLINE),
-        'reason_codes': [item.get('code', '') for item in payload.get('issues', []) if item.get('code')],
-    }
-    _write_json_atomic(file_path, gate_payload)
-    return gate_payload
 
 
 def _date_key(value):
@@ -6633,117 +6382,27 @@ def _build_daily_evolution_bundle(*, summary, records, trade_date=None):
     return bundle
 
 
-def _load_latest_midday_payload():
-    for file_path in [MIDDAY_GATE_FILE, MIDDAY_NODE_FILE]:
-        if not os.path.exists(file_path):
-            continue
-        payload = _read_json(file_path)
-        if isinstance(payload, dict) and payload.get('intraday_judgment'):
-            return payload
-    return {}
-
-
 def _build_pm_buy_guardrails():
-    today = _market_today()
-    payload = _load_latest_midday_payload()
-    if not payload and os.path.exists(PM_GATE_FILE):
-        payload = _read_json(PM_GATE_FILE)
-    payload = payload if isinstance(payload, dict) else {}
-    judgment = payload.get('intraday_judgment', {}) if isinstance(payload.get('intraday_judgment', {}), dict) else {}
-    payload_date = _date_key(judgment.get('trade_date') or payload.get('date') or '')
-    is_today = payload_date == today
-    available = bool(judgment) and is_today
-    pm_gate_status = str(judgment.get('pm_gate_status') or payload.get('pm_gate_status') or 'pass').strip() or 'pass'
-    risk_bias = str(judgment.get('risk_bias', '')).strip()
-    rebound_bias = str(judgment.get('rebound_bias', '')).strip()
-    market_temperature = str(judgment.get('market_temperature', '')).strip()
-    confidence = _fnum(judgment.get('confidence', 0.0), 0.0)
-    judgment_scan_status = judgment.get('scan_status', {}) if isinstance(judgment.get('scan_status', {}), dict) else {}
-    midday_release_ready = bool(judgment_scan_status.get('midday_release_ready'))
-    midday_release_override = bool(judgment_scan_status.get('midday_release_override'))
-    learning_actions = _load_learning_actions()
-    learning_summary = (
-        learning_actions.get('summary', {})
-        if isinstance(learning_actions, dict) and isinstance(learning_actions.get('summary', {}), dict)
-        else {}
-    )
-    missed_positive_opportunity_count = _inum(learning_summary.get('missed_opportunity_positive_count', 0), 0)
-    missed_opportunity_avg_return_pct = _fnum(learning_summary.get('missed_opportunity_avg_return_pct', 0.0), 0.0)
     blocked_modes = set()
     limited_modes = set()
-    allow_buy = pm_gate_status not in {'block_all', 'block_buy'}
-    allow_full_v9_build = False
+    allow_buy = True
+    allow_full_v9_build = True
     global_amount_ratio = 1.0
     mode_amount_ratio = 1.0
     max_new_positions = 0
-    notes = []
-    reason = 'midday_judgment_missing'
+    notes = ['midday logic removed: 尾盘 buy 不再读取或使用任何午盘 judgment/gate 样本。']
+    reason = 'midday_logic_removed'
 
-    if not available:
-        blocked_modes.add('V9_full')
-        limited_modes.update(PM_BUY_RESTRICTED_MODES - blocked_modes)
-        mode_amount_ratio = 0.75
-        max_new_positions = PM_BUY_MAX_NEW_POSITIONS_LIMITED
-        notes.append('缺少当日有效午盘判断样本，尾盘不放行激进模式。')
-    elif not allow_buy:
-        reason = f'pm_gate_{pm_gate_status}'
-        notes.append(f'午盘门控状态={pm_gate_status}，尾盘新开仓直接阻断。')
-    else:
-        strong_confirm = (
-            pm_gate_status == 'pass'
-            and market_temperature == 'risk_on'
-            and risk_bias == 'offensive'
-            and rebound_bias == 'can_expand'
-            and confidence >= PM_STRONG_CONFIRM_MIN_CONFIDENCE
-        )
-        release_opportunity_confirm = (
-            pm_gate_status == 'pass'
-            and market_temperature == 'risk_on'
-            and (midday_release_ready or midday_release_override)
-            and missed_positive_opportunity_count > 0
-            and missed_opportunity_avg_return_pct > 0
-        )
-        if strong_confirm:
-            allow_full_v9_build = True
-            reason = 'strong_confirm'
-            notes.append('午盘判断给出强确认，允许保留强势模式的正常尾盘首建。')
-        elif release_opportunity_confirm:
-            limited_modes.update(PM_BUY_RESTRICTED_MODES - {'V9_full'})
-            mode_amount_ratio = max(mode_amount_ratio, PM_BUY_LIMITED_MODE_RATIO)
-            max_new_positions = max(PM_BUY_MAX_NEW_POSITIONS_LIMITED, 2)
-            reason = 'release_opportunity_confirm'
-            notes.append('近期已验证存在正向错失机会，午盘放行优先围绕盈利机会做选择性扩张。')
-        else:
-            blocked_modes.add('V9_full')
-            if pm_gate_status == 'pass_with_limit' or risk_bias == 'defensive':
-                blocked_modes.update(PM_BUY_RESTRICTED_MODES)
-                global_amount_ratio = PM_BUY_DEFENSIVE_GLOBAL_RATIO
-                max_new_positions = (
-                    PM_BUY_MAX_NEW_POSITIONS_DEFENSIVE
-                    if risk_bias == 'defensive' else
-                    PM_BUY_MAX_NEW_POSITIONS_LIMITED
-                )
-                reason = 'defensive_limit'
-                notes.append('午盘偏防守或仅限放行，尾盘只允许极少量试错且整体缩仓。')
-            else:
-                limited_modes.update(PM_BUY_RESTRICTED_MODES - blocked_modes)
-                mode_amount_ratio = PM_BUY_LIMITED_MODE_RATIO
-                if rebound_bias != 'can_expand' or market_temperature != 'risk_on':
-                    max_new_positions = PM_BUY_MAX_NEW_POSITIONS_LIMITED
-                reason = 'selective_limit'
-                notes.append('午盘未形成强确认，尾盘仅保留选择性试错并收紧高波动模式。')
-
-    limited_modes -= blocked_modes
     if PARTIAL_ROLLBACK_DISABLE_FULL_V9_BUILD:
         allow_full_v9_build = False
         notes.append('部分回退生效: T1 V9_full 恢复为普通首建，不再允许满仓首建。')
     return {
-        'available': available,
-        'pm_gate_status': pm_gate_status,
-        'risk_bias': risk_bias,
-        'rebound_bias': rebound_bias,
-        'market_temperature': market_temperature,
-        'confidence': round(confidence, 2),
+        'available': False,
+        'guard_status': '',
+        'risk_bias': '',
+        'rebound_bias': '',
+        'market_temperature': '',
+        'confidence': 0.0,
         'allow_buy': allow_buy,
         'allow_full_v9_build': allow_full_v9_build,
         'blocked_modes': sorted(blocked_modes),
@@ -6757,202 +6416,13 @@ def _build_pm_buy_guardrails():
 
 
 def _build_intraday_judgment_review(*, bundle, summary, records=None, positions=None):
-    midday_payload = _load_latest_midday_payload()
-    judgment = midday_payload.get('intraday_judgment', {}) if isinstance(midday_payload, dict) else {}
     trade_date = _date_key((bundle or {}).get('trade_date') or datetime.now().strftime('%Y-%m-%d'))
-    if not judgment:
-        return {
-            'available': False,
-            'trade_date': trade_date,
-            'verdict': 'missing_midday_judgment',
-            'score': 0,
-            'notes': ['当日未发现可用的午盘判断样本，尾盘无法做判断校准。'],
-        }
-    if _date_key(judgment.get('trade_date') or midday_payload.get('date')) != trade_date:
-        return {
-            'available': False,
-            'trade_date': trade_date,
-            'verdict': 'stale_midday_judgment',
-            'score': 0,
-            'notes': ['午盘判断样本日期与收盘节点不一致，跳过当日校准。'],
-        }
-
-    records = [_normalize_record(r) for r in (records or [])]
-    positions = positions or []
-    bundle = bundle if isinstance(bundle, dict) else {}
-    close_account = summary.get('account', {}) if isinstance(summary, dict) else {}
-    close_total_assets = _fnum(close_account.get('total_assets', 0.0), 0.0)
-    midday_cash_ratio = _fnum(judgment.get('cash_ratio', 0.0), 0.0)
-    midday_exposure_ratio = _fnum(judgment.get('position_exposure_ratio', 0.0), 0.0)
-    close_cash_ratio = _safe_ratio(close_account.get('avail_balance', 0.0), close_total_assets)
-    close_exposure_ratio = _safe_ratio(close_account.get('total_pos_value', 0.0), close_total_assets)
-    cash_ratio_change = round(close_cash_ratio - midday_cash_ratio, 4)
-    exposure_ratio_change = round(close_exposure_ratio - midday_exposure_ratio, 4)
-    today_closed_codes = _dedupe_codes(
-        [item.get('code') for item in (bundle.get('direct_learn_items') or [])]
-        + [item.get('code') for item in (bundle.get('observe_only_items') or [])]
-    )
-    holding_codes = _dedupe_codes(
-        [row.get('code') for row in records if str(row.get('status', '')).strip() == 'holding']
-        + [row.get('code') for row in (positions or [])]
-    )
-    reduce_watch_codes = _dedupe_codes(judgment.get('reduce_watch_codes', []))
-    strong_hold_codes = _dedupe_codes(judgment.get('strong_hold_codes', []))
-    reduced_focus_codes = [code for code in reduce_watch_codes if code in today_closed_codes]
-    retained_strong_codes = [code for code in strong_hold_codes if code in holding_codes]
-    opening_liquidity = judgment.get('opening_liquidity', {}) if isinstance(judgment.get('opening_liquidity', {}), dict) else {}
-    external_market = judgment.get('external_market', {}) if isinstance(judgment.get('external_market', {}), dict) else {}
-    risk_bias = str(judgment.get('risk_bias', '')).strip()
-    market_temperature = str(judgment.get('market_temperature', '')).strip()
-    pm_gate_status = str(judgment.get('pm_gate_status') or midday_payload.get('pm_gate_status') or 'pass').strip() or 'pass'
-    source_stats = bundle.get('source_stats', {}) if isinstance(bundle.get('source_stats', {}), dict) else {}
-    scan_status = summary.get('scan_status', {}) if isinstance(summary, dict) and isinstance(summary.get('scan_status', {}), dict) else {}
-    stocks_with_signal = _inum(scan_status.get('stocks_with_signal', 0), 0)
-    today_opened_count = _inum(source_stats.get('today_opened_count', 0), 0)
-    evidence = 0
-    notes = []
-
-    if risk_bias == 'defensive':
-        if cash_ratio_change >= 0.05 or close_cash_ratio >= 0.65:
-            evidence += 2
-            notes.append('尾盘现金占比较午盘明显提升，防守判断得到兑现。')
-        elif cash_ratio_change >= 0.02:
-            evidence += 1
-        if exposure_ratio_change <= -0.05 or close_exposure_ratio <= 0.35:
-            evidence += 2
-            notes.append('尾盘仓位暴露显著下降，说明下午执行以收缩风险为主。')
-        elif exposure_ratio_change <= -0.02:
-            evidence += 1
-        if reduced_focus_codes:
-            evidence += 1
-            notes.append(f'午盘减压名单在尾盘得到处理: {", ".join(reduced_focus_codes[:6])}。')
-        if retained_strong_codes:
-            evidence += 1
-            notes.append(f'同时保留了相对强势仓位: {", ".join(retained_strong_codes[:6])}。')
-        if str(external_market.get('risk_level', '')).strip().lower() in {'high', 'severe', 'medium', 'elevated'}:
-            evidence += 1
-            notes.append('隔夜/开盘外部风险信号与尾盘防守收缩动作基本一致。')
-    elif risk_bias == 'offensive':
-        if exposure_ratio_change >= -0.02:
-            evidence += 2
-        if cash_ratio_change <= 0.02:
-            evidence += 1
-        if retained_strong_codes:
-            evidence += 1
-            notes.append(f'午盘看多保留的强票尾盘仍在: {", ".join(retained_strong_codes[:6])}。')
-    else:
-        if reduced_focus_codes:
-            evidence += 1
-            notes.append(f'午盘复检名单尾盘已有兑现: {", ".join(reduced_focus_codes[:6])}。')
-        if retained_strong_codes:
-            evidence += 1
-            notes.append(f'午盘允许观察的强票尾盘继续保留: {", ".join(retained_strong_codes[:6])}。')
-        if cash_ratio_change >= 0.02 or exposure_ratio_change <= -0.02:
-            evidence += 1
-    if opening_liquidity.get('available') and bool(opening_liquidity.get('in_0931_window')):
-        notes.append('本次复检参考了 09:31 开盘流动性样本。')
-    elif opening_liquidity.get('available'):
-        notes.append('开盘流动性样本不在 09:31 窗口，本次只作辅助证据。')
-    if external_market.get('available'):
-        negative_sectors = _normalize_sector_names(external_market.get('negative_sectors', []), limit=4)
-        neutral_sectors = _normalize_sector_names(external_market.get('neutral_sectors', []), limit=4)
-        positive_sectors = _normalize_sector_names(external_market.get('positive_sectors', []), limit=4)
-        short_flow_monitor = external_market.get('short_flow_monitor', {}) if isinstance(external_market.get('short_flow_monitor', {}), dict) else {}
-        short_flow_level = str(short_flow_monitor.get('pressure_level', '')).strip().lower()
-        opening_anchor_monitor = external_market.get('opening_anchor_break_monitor', {}) if isinstance(external_market.get('opening_anchor_break_monitor', {}), dict) else {}
-        opening_anchor_level = str(opening_anchor_monitor.get('pressure_level', '')).strip().lower()
-        weekend_digest_monitor = external_market.get('weekend_digest_monitor', {}) if isinstance(external_market.get('weekend_digest_monitor', {}), dict) else {}
-        weekend_digest_bias = str(weekend_digest_monitor.get('bias', '')).strip().lower()
-        short_term = (external_market.get('horizon_assessment', {}) or {}).get('short_term', {})
-        if negative_sectors:
-            notes.append(f'外部资讯预警承压板块: {", ".join(negative_sectors)}。')
-        if neutral_sectors:
-            notes.append(f'外部资讯提示先观察的中性板块: {", ".join(neutral_sectors)}。')
-        if positive_sectors:
-            notes.append(f'外部资讯相对受益板块: {", ".join(positive_sectors)}。')
-        if short_flow_level in {'high', 'medium', 'low'}:
-            notes.append(f'做空资金压力等级 {short_flow_level}: {str(short_flow_monitor.get("summary", "")).strip()}')
-        if opening_anchor_level in {'high', 'medium', 'low'}:
-            notes.append(f'核心锚股开盘破位等级 {opening_anchor_level}: {str(opening_anchor_monitor.get("summary", "")).strip()}')
-        if weekend_digest_monitor.get('active'):
-            notes.append(f'周一周末汇总判断 {weekend_digest_bias or "neutral"}: {str(weekend_digest_monitor.get("summary", "")).strip()}')
-        if isinstance(short_term, dict) and str(short_term.get('summary', '')).strip():
-            notes.append(f'短期资讯判断: {str(short_term.get("summary", "")).strip()}')
-
-    if evidence >= 4:
-        verdict = 'validated'
-    elif evidence >= 2:
-        verdict = 'mixed'
-    else:
-        verdict = 'invalidated'
-    score = min(100, max(20, 20 + evidence * 20))
-    missed_risk_on_deployment = (
-        market_temperature == 'risk_on'
-        and pm_gate_status == 'pass'
-        and stocks_with_signal >= REGIME_EXECUTION_RISK_ON_SIGNAL_FLOOR
-        and today_opened_count <= 0
-        and close_exposure_ratio <= 0.05
-    )
-    if missed_risk_on_deployment:
-        notes.append(
-            f'午盘已转 risk_on 且门控放行，但 signals={stocks_with_signal} 仍零开仓并维持低仓，'
-            '本次更适合作为午盘释放校准样本，不应直接视为完全验证。'
-        )
-        if verdict == 'validated':
-            verdict = 'mixed'
-            score = min(score, 70)
-    if not notes:
-        notes.append('尾盘验证信号有限，午盘判断需要继续累计样本观察。')
-
     return {
-        'available': True,
+        'available': False,
         'trade_date': trade_date,
-        'midday_generated_at': judgment.get('generated_at', midday_payload.get('generated_at', '')),
-        'midday_stage': midday_payload.get('stage', ''),
-        'risk_bias': risk_bias,
-        'market_temperature': market_temperature,
-        'pm_gate_status': pm_gate_status,
-        'rebound_bias': str(judgment.get('rebound_bias', '')).strip(),
-        'confidence': _fnum(judgment.get('confidence', 0.0), 0.0),
-        'verdict': verdict,
-        'score': score,
-        'stocks_with_signal': stocks_with_signal,
-        'today_opened_count': today_opened_count,
-        'missed_risk_on_deployment': bool(missed_risk_on_deployment),
-        'midday_cash_ratio': round(midday_cash_ratio, 4),
-        'close_cash_ratio': round(close_cash_ratio, 4),
-        'cash_ratio_change': cash_ratio_change,
-        'midday_exposure_ratio': round(midday_exposure_ratio, 4),
-        'close_exposure_ratio': round(close_exposure_ratio, 4),
-        'exposure_ratio_change': exposure_ratio_change,
-        'reduce_watch_codes': reduce_watch_codes[:10],
-        'reduced_focus_codes': reduced_focus_codes[:10],
-        'strong_hold_codes': strong_hold_codes[:10],
-        'retained_strong_codes': retained_strong_codes[:10],
-        'opening_liquidity': {
-            'available': bool(opening_liquidity.get('available')),
-            'generated_at': opening_liquidity.get('generated_at', ''),
-            'verdict': str(opening_liquidity.get('verdict', '')).strip(),
-            'in_0931_window': bool(opening_liquidity.get('in_0931_window')),
-            'issue_ratio': _fnum(opening_liquidity.get('issue_ratio', 0.0), 0.0),
-        },
-        'external_market': {
-            'available': bool(external_market.get('available')),
-            'generated_at': external_market.get('generated_at', ''),
-            'window_tag': str(external_market.get('window_tag', '')).strip(),
-            'risk_level': str(external_market.get('risk_level', '')).strip().lower(),
-            'a_share_bias': str(external_market.get('a_share_bias', '')).strip(),
-            'negative_sectors': _normalize_sector_names(external_market.get('negative_sectors', [])),
-            'neutral_sectors': _normalize_sector_names(external_market.get('neutral_sectors', [])),
-            'positive_sectors': _normalize_sector_names(external_market.get('positive_sectors', [])),
-            'recommended_actions': external_market.get('recommended_actions', {}) if isinstance(external_market.get('recommended_actions', {}), dict) else {},
-            'horizon_assessment': external_market.get('horizon_assessment', {}) if isinstance(external_market.get('horizon_assessment', {}), dict) else {},
-            'short_flow_monitor': external_market.get('short_flow_monitor', {}) if isinstance(external_market.get('short_flow_monitor', {}), dict) else {},
-            'opening_anchor_break_monitor': external_market.get('opening_anchor_break_monitor', {}) if isinstance(external_market.get('opening_anchor_break_monitor', {}), dict) else {},
-            'weekend_digest_monitor': external_market.get('weekend_digest_monitor', {}) if isinstance(external_market.get('weekend_digest_monitor', {}), dict) else {},
-            'headline': str(external_market.get('headline', '')).strip(),
-        },
-        'notes': notes,
+        'verdict': 'midday_logic_removed',
+        'score': 0,
+        'notes': ['midday logic removed: 收盘学习链不再读取或校准任何午盘 judgment/gate 样本。'],
     }
 
 
@@ -7078,7 +6548,6 @@ def _build_regime_execution_review(*, bundle, summary):
     )
     risk_on_release_missed = (
         str(intraday_review.get('market_temperature', '')).strip().lower() == 'risk_on'
-        and str(intraday_review.get('pm_gate_status', '')).strip().lower() == 'pass'
         and stocks_with_signal >= REGIME_EXECUTION_RISK_ON_SIGNAL_FLOOR
         and no_new_openings_today
     )
@@ -7120,7 +6589,7 @@ def _build_regime_execution_review(*, bundle, summary):
         notes.append('午盘判断与尾盘结果一致，验证了防守型仓位执行。')
     if risk_on_release_missed:
         notes.append(
-            f'午盘门控已 pass 且市场转为 risk_on，但 signals={stocks_with_signal} 时仍零开仓；'
+            f'市场已转为 risk_on，但 signals={stocks_with_signal} 时仍零开仓；'
             '该样本应进入释放校准，不应计入 defensive 正样本。'
         )
     if current_bias == 'risk_off' and recent_negative_sectors:
@@ -8097,7 +7566,7 @@ def _build_engineering_review(*, trade_date=''):
         phase = str(row.get('phase', '')).strip()
         step = str(row.get('step', '')).strip()
         recurrence_count = history_counts.get((phase, step, failure_kind), 1)
-        impact_level = 'high' if phase in {'buy', 'add-position', 'smart-sell', 'midday-gate', 'close-node'} else 'medium'
+        impact_level = 'high' if phase in {'buy', 'add-position', 'smart-sell', 'close-node'} else 'medium'
         if impact_level == 'high':
             high_severity_count += 1
         if recurrence_count > 1:
@@ -8341,12 +7810,40 @@ def _build_close_node_payload(*, summary, reconcile_summary, daily_evolution_bun
     return payload
 
 
-def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT):
-    """计算买入数量（整百股），amount=目标买入金额（元）"""
+def _buy_min_lot(code=''):
+    code_text = str(code or '').strip().zfill(6)
+    if code_text.startswith('688'):
+        return 200
+    return 100
+
+
+def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT, code=''):
+    """计算买入数量，按板块最小委托手数向下取整。"""
     if entry_price <= 0 or amount <= 0:
         return 0
-    qty = int(amount / entry_price / 100) * 100
-    return qty if qty >= 100 else 0  # 买不起100股就返回0
+    min_lot = _buy_min_lot(code)
+    price_dec = Decimal(str(entry_price))
+    amount_dec = Decimal(str(amount))
+    lot_dec = Decimal(str(min_lot))
+    if price_dec <= 0 or amount_dec <= 0:
+        return 0
+    raw_lots = (amount_dec / (price_dec * lot_dec)).to_integral_value(rounding=ROUND_DOWN)
+    qty = int(raw_lots) * min_lot
+    #region debug-point H:buy-window-timeout-qty
+    _debug_emit_event(
+        'A',
+        'v10_moni_trader.py:calc_buy_quantity',
+        '[DEBUG] buy quantity calculated',
+        {
+            'entry_price': _fnum(entry_price, 0.0),
+            'amount': _fnum(amount, 0.0),
+            'code_hint': str(code or '').strip().zfill(6),
+            'raw_qty': int(qty),
+            'normalized_min_lot': int(min_lot),
+        },
+    )
+    #endregion
+    return qty if qty >= min_lot else 0
 
 
 # ─── TDX 连接（信号衰减检测用） ───
@@ -8453,6 +7950,19 @@ def ensure_trade_window(action, *, dry_run=False):
     sell_cutoff = f'{SELL_CUTOFF_TIME[0]:02d}:{SELL_CUTOFF_TIME[1]:02d}'
     if action == 'buy':
         if not _time_in_range(now, BUY_WINDOW[0], BUY_WINDOW[1]):
+            #region debug-point I:buy-window-timeout-window
+            _debug_emit_event(
+                'D',
+                'v10_moni_trader.py:ensure_trade_window',
+                '[DEBUG] buy window rejected current time',
+                {
+                    'action': str(action or ''),
+                    'current': current,
+                    'buy_window_start': f'{BUY_WINDOW[0][0]:02d}:{BUY_WINDOW[0][1]:02d}',
+                    'buy_window_end': f'{BUY_WINDOW[1][0]:02d}:{BUY_WINDOW[1][1]:02d}',
+                },
+            )
+            #endregion
             print(f"[WARN] 当前 {current} 不在买入窗口 14:50-14:57，已跳过自动买入。")
             return False
     elif action == 'smart_sell':
@@ -8515,27 +8025,40 @@ def market_from_code(code):
 
 # ─── 信号衰减检测 ───
 
-def evaluate_signal_decay(api, code, entry_price, buy_mode, *, profit_pct=0.0):
-    """
-    评估持仓股的信号是否衰减，返回 (should_sell, reason, decay_score)
+def _bar_is_provisional(bar_datetime, *, period='daily', now=None):
+    try:
+        bar_dt = pd.to_datetime(bar_datetime, errors='coerce')
+        if pd.isna(bar_dt):
+            return False
+        current = now or _market_now()
+        if period == 'weekly':
+            bar_iso = bar_dt.date().isocalendar()
+            now_iso = current.date().isocalendar()
+            if (bar_iso.year, bar_iso.week) != (now_iso.year, now_iso.week):
+                return False
+            return current.weekday() < 4 or (current.weekday() == 4 and (current.hour, current.minute) < (15, 0))
+        return bar_dt.date() == current.date() and (current.hour, current.minute) < (15, 0)
+    except Exception:
+        return False
 
-    decay_score: 0=信号完好, 越高越应卖
-    触发条件（任一命中即建议卖出）:
-      1. 尾盘拉高出货: bz_direction 从杀跌(负)变拉高(正>+0.5%) → 主力出逃
-      2. 放量滞涨: 今日量比>1.3 但涨幅<0.5% → 资金进场不涨=出货
-      3. 冲高回落上影线: 日内最高>收盘*1.01 且 收盘<开盘 → 多头力竭
-      4. 周线slope走平/转跌: weekly_slope 从正变<=0 → 趋势终结
-      5. 有利润+信号弱化: 浮盈>2% + decay_score>=2 → 落袋为安
-      6. 高盈利仓位对转弱更敏感，优先兑现
 
-    T+5是兜底框架，信号衰减随时走人！
-    """
+def evaluate_signal_decay_detail(api, code, entry_price, buy_mode, *, profit_pct=0.0):
+    """返回带证据来源和完成状态的信号衰减评估。"""
     market = market_from_code(code)
-    decay_score = 0
+    evidence = []
     reasons = []
     should_sell = False
 
-    # ── 1. 日线数据：冲高回落、量价背离 ──
+    def add_evidence(family, score, reason, *, provisional=False, structural=False):
+        evidence.append({
+            'family': str(family),
+            'score': _fnum(score, 0.0),
+            'reason': str(reason),
+            'provisional': bool(provisional),
+            'structural': bool(structural),
+        })
+        reasons.append(str(reason))
+
     daily_bars = api.get_security_bars(9, market, code, 0, 10)
     if daily_bars:
         try:
@@ -8544,43 +8067,56 @@ def evaluate_signal_decay(api, code, entry_price, buy_mode, *, profit_pct=0.0):
                 ddf = ddf.sort_values('datetime').reset_index(drop=True)
                 last = ddf.iloc[-1]
                 prev = ddf.iloc[-2]
-
-                # 冲高回落上影线: 最高>收盘*1.01 且 收盘<开盘
+                daily_provisional = _bar_is_provisional(last.get('datetime'), period='daily')
                 high = last['high']
                 close = last['close']
                 open_ = last['open']
+
                 if high > close * 1.01 and close < open_:
                     upper_shadow = (high - close) / close * 100
-                    if upper_shadow > 1.0:  # 上影线>1%
-                        decay_score += 2
-                        reasons.append(f"冲高回落上影线{upper_shadow:.1f}%")
+                    if upper_shadow > 1.0:
+                        add_evidence(
+                            'daily_candle_reversal',
+                            2,
+                            f"冲高回落上影线{upper_shadow:.1f}%",
+                            provisional=daily_provisional,
+                        )
 
-                # 放量滞涨: 量比>1.3 但涨幅<0.5%
                 if prev['amount'] > 0:
                     amt_ratio = last['amount'] / prev['amount']
                     chg_pct = (close - prev['close']) / prev['close'] * 100
                     if amt_ratio > 1.3 and chg_pct < 0.5:
-                        decay_score += 2
-                        reasons.append(f"放量滞涨(量比{amt_ratio:.1f}涨幅{chg_pct:+.1f}%)")
+                        add_evidence(
+                            'daily_volume_stall',
+                            2,
+                            f"放量滞涨(量比{amt_ratio:.1f}涨幅{chg_pct:+.1f}%)",
+                            provisional=daily_provisional,
+                        )
 
-                # 大阴线: 跌幅>2%
                 chg_from_open = (close - open_) / open_ * 100
                 if chg_from_open < -2.0:
-                    decay_score += 3
-                    reasons.append(f"大阴线{chg_from_open:+.1f}%")
+                    add_evidence(
+                        'daily_candle_reversal',
+                        3,
+                        f"大阴线{chg_from_open:+.1f}%",
+                        provisional=daily_provisional,
+                    )
 
-                # 连跌2日
                 if len(ddf) >= 3:
                     c0 = ddf.iloc[-1]['close']
                     c1 = ddf.iloc[-2]['close']
                     c2 = ddf.iloc[-3]['close']
                     if c0 < c1 < c2:
-                        decay_score += 1
-                        reasons.append("连跌2日")
+                        add_evidence(
+                            'daily_decline_sequence',
+                            1,
+                            "连跌2日",
+                            provisional=daily_provisional,
+                            structural=True,
+                        )
         except Exception:
             pass
 
-    # ── 2. 5分钟数据：尾盘拉高出货 ──
     min5_bars = api.get_security_bars(0, market, code, 0, 50)
     if min5_bars:
         try:
@@ -8589,29 +8125,20 @@ def evaluate_signal_decay(api, code, entry_price, buy_mode, *, profit_pct=0.0):
                 mdf = mdf.sort_values('datetime').reset_index(drop=True)
                 mdf['hour'] = mdf['datetime'].dt.hour
                 mdf['minute'] = mdf['datetime'].dt.minute
-
-                # 尾盘14:30-15:00区间
                 bz = mdf[(mdf['hour'] == 14) & (mdf['minute'] >= 30)]
                 if len(bz) >= 3:
                     bz_open = bz.iloc[0]['open']
                     bz_close = bz.iloc[-1]['close']
                     bz_dir = (bz_close - bz_open) / bz_open * 100 if bz_open > 0 else 0
-
-                    # 如果买入时是杀跌(bz<0)，现在变成拉高出货(bz>+0.5%) → 主力出逃
                     if 'kill' in buy_mode and bz_dir > 0.5:
-                        decay_score += 2
-                        reasons.append(f"尾盘杀跌→拉高出货(bz={bz_dir:+.2f}%)")
-
-                    # 尾盘无量阴跌
+                        add_evidence('intraday_tail_flow', 2, f"尾盘杀跌→拉高出货(bz={bz_dir:+.2f}%)")
                     bz_avg_vol = bz['vol'].mean()
                     total_avg_vol = mdf['vol'].mean()
                     if bz_dir < -0.2 and bz_avg_vol < total_avg_vol * 0.8:
-                        decay_score += 1
-                        reasons.append(f"尾盘无量阴跌(bz={bz_dir:+.2f}%)")
+                        add_evidence('intraday_tail_flow', 1, f"尾盘无量阴跌(bz={bz_dir:+.2f}%)")
         except Exception:
             pass
 
-    # ── 3. 周线趋势 ──
     weekly_bars = api.get_security_bars(5, market, code, 0, 30)
     if weekly_bars:
         try:
@@ -8620,40 +8147,70 @@ def evaluate_signal_decay(api, code, entry_price, buy_mode, *, profit_pct=0.0):
                 wdf = wdf.sort_values('datetime').reset_index(drop=True)
                 wdf['wma5'] = wdf['close'].rolling(5).mean()
                 wdf['wma20'] = wdf['close'].rolling(20).mean()
-
                 last_w = wdf.iloc[-1]
+                weekly_provisional = _bar_is_provisional(last_w.get('datetime'), period='weekly')
                 if pd.notna(last_w.get('wma5')) and pd.notna(last_w.get('wma20')):
                     w20 = last_w['wma20']
                     if w20 > 0:
                         ws = (last_w['wma5'] - w20) / w20 * 100
                         if ws <= 0 and 'trend' in buy_mode:
-                            decay_score += 3
-                            reasons.append(f"周线slope转负({ws:+.1f}%)趋势终结")
+                            add_evidence(
+                                'weekly_structure',
+                                3,
+                                f"周线slope转负({ws:+.1f}%)趋势终结",
+                                provisional=weekly_provisional,
+                                structural=True,
+                            )
                         elif ws <= 1.0 and 'trend' in buy_mode:
-                            decay_score += 1
-                            reasons.append(f"周线slope走平({ws:+.1f}%)")
+                            add_evidence(
+                                'weekly_structure',
+                                1,
+                                f"周线slope走平({ws:+.1f}%)",
+                                provisional=weekly_provisional,
+                            )
         except Exception:
             pass
 
-    # ── 决策：是否应该卖出 ──
+    families = {}
+    for item in evidence:
+        family = item['family']
+        grouped = families.setdefault(family, {
+            'family': family,
+            'score': 0.0,
+            'provisional': True,
+            'structural': False,
+            'reasons': [],
+        })
+        grouped['score'] = max(_fnum(grouped.get('score', 0.0), 0.0), _fnum(item.get('score', 0.0), 0.0))
+        grouped['provisional'] = bool(grouped['provisional'] and item.get('provisional'))
+        grouped['structural'] = bool(grouped['structural'] or item.get('structural'))
+        grouped['reasons'].append(item['reason'])
+
+    decay_score = sum(_fnum(item.get('score', 0.0), 0.0) for item in families.values())
+    confirmed_families = [item for item in families.values() if not item.get('provisional')]
+    provisional_families = [item for item in families.values() if item.get('provisional')]
+    confirmed_score = sum(_fnum(item.get('score', 0.0), 0.0) for item in confirmed_families)
+    provisional_score = sum(_fnum(item.get('score', 0.0), 0.0) for item in provisional_families)
+    has_confirmed_structural_break = any(
+        item.get('structural') and not item.get('provisional')
+        for item in families.values()
+    )
+
     if decay_score >= 3:
         should_sell = True
     elif decay_score >= 2:
-        # 有利润+信号弱化 → 落袋为安
         cur_vs_entry = profit_pct
-        if entry_price > 0:
-            # 尝试从日线获取当前价
-            if daily_bars:
-                try:
-                    ddf = api.to_df(daily_bars)
-                    if ddf is not None and len(ddf) >= 1:
-                        cur_price = ddf.sort_values('datetime').iloc[-1]['close']
-                        cur_vs_entry = (cur_price - entry_price) / entry_price * 100
-                        if cur_vs_entry > 2.0:  # 浮盈>2%+信号弱化
-                            should_sell = True
-                            reasons.append(f"浮盈{cur_vs_entry:+.1f}%落袋为安")
-                except Exception:
-                    pass
+        if entry_price > 0 and daily_bars:
+            try:
+                ddf = api.to_df(daily_bars)
+                if ddf is not None and len(ddf) >= 1:
+                    cur_price = ddf.sort_values('datetime').iloc[-1]['close']
+                    cur_vs_entry = (cur_price - entry_price) / entry_price * 100
+                    if cur_vs_entry > 2.0:
+                        should_sell = True
+                        reasons.append(f"浮盈{cur_vs_entry:+.1f}%落袋为安")
+            except Exception:
+                pass
 
     if not should_sell and profit_pct >= HIGH_PROFIT_TAKE_PROFIT_PCT and decay_score >= 1:
         should_sell = True
@@ -8662,8 +8219,74 @@ def evaluate_signal_decay(api, code, entry_price, buy_mode, *, profit_pct=0.0):
         should_sell = True
         reasons.append(f"中高盈利{profit_pct:+.1f}%且信号转弱")
 
-    reason_str = " | ".join(reasons) if reasons else "信号完好"
-    return should_sell, reason_str, decay_score
+    return {
+        'should_sell': bool(should_sell),
+        'reason': " | ".join(reasons) if reasons else "信号完好",
+        'score': decay_score,
+        'evidence': evidence,
+        'families': list(families.values()),
+        'provisional_only': bool(families) and not bool(confirmed_families),
+        'has_provisional_evidence': bool(provisional_families),
+        'has_confirmed_evidence': bool(confirmed_families),
+        'has_confirmed_structural_break': bool(has_confirmed_structural_break),
+        'confirmed_score': confirmed_score,
+        'provisional_score': provisional_score,
+        'block_add': bool(decay_score > 0),
+    }
+
+
+def evaluate_signal_decay(api, code, entry_price, buy_mode, *, profit_pct=0.0, return_detail=False):
+    """默认返回旧三元结果；内部调用可请求结构化 detail。"""
+    detail = evaluate_signal_decay_detail(
+        api,
+        code,
+        entry_price,
+        buy_mode,
+        profit_pct=profit_pct,
+    )
+    if return_detail:
+        return detail
+    return detail['should_sell'], detail['reason'], detail['score']
+
+
+def _coerce_decay_detail(result):
+    if isinstance(result, dict):
+        detail = dict(result)
+        detail.setdefault('should_sell', False)
+        detail.setdefault('reason', '信号完好')
+        detail.setdefault('score', 0.0)
+        detail.setdefault('confirmed_score', detail.get('score', 0.0))
+        detail.setdefault('provisional_score', 0.0)
+        detail.setdefault('provisional_only', False)
+        detail.setdefault('has_confirmed_structural_break', False)
+        detail.setdefault('block_add', _fnum(detail.get('score', 0.0), 0.0) > 0)
+        return detail
+    if isinstance(result, (tuple, list)) and len(result) >= 3:
+        should_sell, reason, score = result[:3]
+        return {
+            'should_sell': bool(should_sell),
+            'reason': str(reason or '信号完好'),
+            'score': _fnum(score, 0.0),
+            'confirmed_score': _fnum(score, 0.0),
+            'provisional_score': 0.0,
+            'provisional_only': False,
+            'has_confirmed_structural_break': False,
+            'block_add': bool(should_sell) or _fnum(score, 0.0) > 0,
+            'evidence': [],
+            'families': [],
+        }
+    return {
+        'should_sell': False,
+        'reason': '信号完好',
+        'score': 0.0,
+        'confirmed_score': 0.0,
+        'provisional_score': 0.0,
+        'provisional_only': False,
+        'has_confirmed_structural_break': False,
+        'block_add': False,
+        'evidence': [],
+        'families': [],
+    }
 
 
 def _market_from_code(code):
@@ -8977,7 +8600,7 @@ def do_buy(dry_run=False):
     market_regime = _normalize_market_regime(model_market.get('regime', ''))
     pm_buy_guard = _build_pm_buy_guardrails()
     print(
-        f" 午盘闸门: {pm_buy_guard['pm_gate_status']} "
+        f" 尾盘买入护栏: {pm_buy_guard['guard_status']} "
         f"| 风险={pm_buy_guard['risk_bias'] or 'unknown'} "
         f"| 反弹={pm_buy_guard['rebound_bias'] or 'unknown'} "
         f"| 置信={pm_buy_guard['confidence']:.2f}"
@@ -8991,7 +8614,7 @@ def do_buy(dry_run=False):
             'v10_moni_trader.py:do_buy',
             '[DEBUG] pm guard blocked buy',
             {
-                'pm_gate_status': str(pm_buy_guard.get('pm_gate_status', '')),
+                'guard_status': str(pm_buy_guard.get('guard_status', '')),
                 'risk_bias': str(pm_buy_guard.get('risk_bias', '')),
                 'rebound_bias': str(pm_buy_guard.get('rebound_bias', '')),
                 'confidence': _fnum(pm_buy_guard.get('confidence', 0.0), 0.0),
@@ -9000,6 +8623,13 @@ def do_buy(dry_run=False):
         )
         #endregion
         print(" 午盘/尾盘仓位闸门未放行，尾盘取消新开仓。")
+        _write_buy_diagnostic(
+            'pm_guard_blocked',
+            guard_status=str(pm_buy_guard.get('guard_status', '')),
+            risk_bias=str(pm_buy_guard.get('risk_bias', '')),
+            rebound_bias=str(pm_buy_guard.get('rebound_bias', '')),
+            signal_count=total_signals,
+        )
         return EXIT_NO_ACTION
 
     # 每个 tier 的每只股票满仓目标金额 = 总资产 × position_pct%
@@ -9107,7 +8737,7 @@ def do_buy(dry_run=False):
             global_amount_ratio = _fnum(pm_buy_guard.get('global_amount_ratio', 1.0), 1.0)
             if global_amount_ratio < 0.999:
                 amount_per_stock_this = round(amount_per_stock_this * global_amount_ratio, 2)
-                build_note = f"{build_note}; 午盘闸门{global_amount_ratio:.2f}x"
+                build_note = f"{build_note}; 买入护栏{global_amount_ratio:.2f}x"
             if mode in set(pm_buy_guard.get('limited_modes', [])):
                 mode_amount_ratio = _fnum(pm_buy_guard.get('mode_amount_ratio', 1.0), 1.0)
                 amount_per_stock_this = round(amount_per_stock_this * mode_amount_ratio, 2)
@@ -9165,9 +8795,9 @@ def do_buy(dry_run=False):
     if skipped_low_model:
         print(f" 模型过滤低分候选: {', '.join(skipped_low_model[:10])}")
     if skipped_guard_modes:
-        print(f" 午盘闸门拦截模式: {', '.join(sorted(set(skipped_guard_modes))[:10])}")
+        print(f" 买入护栏拦截模式: {', '.join(sorted(set(skipped_guard_modes))[:10])}")
     if limited_mode_hits:
-        print(f" 午盘闸门收紧模式: {', '.join(sorted(set(limited_mode_hits))[:10])}")
+        print(f" 买入护栏收紧模式: {', '.join(sorted(set(limited_mode_hits))[:10])}")
     if skipped_partial_rollback:
         print(f" 部分回退拦截候选: {', '.join(sorted(set(skipped_partial_rollback))[:10])}")
     if skipped_recent_reentry:
@@ -9194,6 +8824,16 @@ def do_buy(dry_run=False):
 
     if not buy_list:
         print(" 有扫描信号，但因资金/价格/仓位约束未形成可买清单")
+        _write_buy_diagnostic(
+            'candidate_filters',
+            signal_count=total_signals,
+            min_model_score=round(min_model_score, 4),
+            skipped_low_model=skipped_low_model,
+            skipped_guard_modes=skipped_guard_modes,
+            skipped_partial_rollback=skipped_partial_rollback,
+            skipped_recent_reentry=skipped_recent_reentry,
+            skipped_learning_guard=skipped_learning_guard,
+        )
         return EXIT_NO_ACTION
     max_new_positions = _inum(pm_buy_guard.get('max_new_positions', 0), 0)
     if max_new_positions > 0 and len(buy_list) > max_new_positions:
@@ -9210,7 +8850,7 @@ def do_buy(dry_run=False):
         buy_list = ranked_buy_list[:max_new_positions]
         if skipped_due_to_gate:
             print(
-                " 午盘闸门压缩尾盘新开仓数量: "
+                " 买入护栏压缩尾盘新开仓数量: "
                 + ', '.join(f"{item['code']}[{item.get('mode', '')}]" for item in skipped_due_to_gate[:10])
             )
 
@@ -9270,6 +8910,13 @@ def do_buy(dry_run=False):
         print(f" 当前存在未完成买单: {', '.join(pending_summary['active_buy_codes'])}")
     if not buy_list:
         print(" 买入候选已被现有持仓或未完成买单过滤，尾盘不再重复报单")
+        _write_buy_diagnostic(
+            'existing_position_or_pending_order',
+            candidate_count=len(filtered_buy_list) + len(skipped_existing) + len(skipped_today_exclusion),
+            skipped_existing=sorted(set(skipped_existing)),
+            skipped_today_exclusion=skipped_today_exclusion,
+            active_buy_codes=list(pending_summary.get('active_buy_codes', []) or []),
+        )
         return EXIT_NO_ACTION
     funded_buy_list = []
     skipped_budget = []
@@ -9279,14 +8926,14 @@ def do_buy(dry_run=False):
         planned_build_amount = _fnum(item.get('planned_build_amount', 0.0), 0.0)
         if entry_price <= 0 or planned_build_amount <= 0:
             continue
-        qty = calc_buy_quantity(entry_price, planned_build_amount)
+        qty = calc_buy_quantity(entry_price, planned_build_amount, code=item.get('code', ''))
         if qty <= 0:
             skipped_budget.append(f"{item['code']}(too_small)")
             continue
         cost = qty * entry_price
         if cost > avail:
-            qty = int(avail / entry_price / 100) * 100
-            if qty < 100:
+            qty = calc_buy_quantity(entry_price, avail, code=item.get('code', ''))
+            if qty < _buy_min_lot(item.get('code', '')):
                 skipped_budget.append(f"{item['code']}(cash)")
                 continue
             cost = qty * entry_price
@@ -9300,6 +8947,12 @@ def do_buy(dry_run=False):
         print(f" 资金约束压缩候选: {', '.join(skipped_budget[:10])}")
     if not buy_list:
         print(" 候选在最终资金分配后未形成可执行买单")
+        _write_buy_diagnostic(
+            'budget_or_lot_size',
+            candidate_count=len(funded_buy_list) + len(skipped_budget),
+            available_balance=round(_fnum(balance.get('avail_balance', 0.0), 0.0), 2),
+            skipped_budget=skipped_budget,
+        )
         return EXIT_NO_ACTION
     if buy_list:
         run_slot = str((scan_ctx.get('meta') or {}).get('run_slot') or (scan_ctx.get('run_slot') or '')).strip()
@@ -9478,10 +9131,27 @@ def _do_sell_core(smart=False, dry_run=False):
     initial_refresh_started_at = time.perf_counter()
     #endregion
     positions = get_positions()
+    positions_fetch_status = _get_last_positions_fetch_status()
     local_pending_items = load_pending_orders()
     local_pending_summary = summarize_pending_orders(local_pending_items)
+    positions_unavailable = (
+        not positions
+        and str(positions_fetch_status.get('source', '')).strip() == 'unavailable'
+    )
     no_live_holding = not track_holding and not positions
     no_active_pending = not local_pending_summary.get('active_buy_codes') and not local_pending_summary.get('active_sell_codes')
+    if positions_unavailable:
+        if smart:
+            _debug_report_smart_sell(
+                "do_smart_sell.positions_unavailable",
+                holding_records=len(track_holding),
+                pending_count=len(local_pending_items or []),
+                message=str(positions_fetch_status.get('message', '') or ''),
+                cache_age_seconds=positions_fetch_status.get('cache_age_seconds'),
+                elapsed_ms=round((time.perf_counter() - initial_refresh_started_at) * 1000, 2),
+            )
+        print(" [ERROR] 持仓接口不可用且无缓存，smart-sell 无法确认真实持仓")
+        return EXIT_RUNTIME_ERROR
     if no_live_holding and no_active_pending:
         if smart:
             _debug_report_smart_sell(
@@ -9569,6 +9239,21 @@ def _do_sell_core(smart=False, dry_run=False):
     pos_price_map = {code: pos.get('price', 0.0) for code, pos in active_pos_map.items()}
 
     holding = [r for r in records if r.get('status') == 'holding']
+    positions_inconclusive_with_holding = (
+        not positions
+        and bool(holding)
+        and str(positions_fetch_status.get('source', '')).strip() != 'api'
+    )
+    if positions_inconclusive_with_holding:
+        if smart:
+            _debug_report_smart_sell(
+                "do_smart_sell.positions_inconclusive_with_holding",
+                holding_records=len(holding),
+                source=str(positions_fetch_status.get('source', '') or ''),
+                cache_age_seconds=positions_fetch_status.get('cache_age_seconds'),
+            )
+        print(" [ERROR] 持仓来源不可信：账本仍有 holding，但 live positions 无法确认")
+        return EXIT_RUNTIME_ERROR
     if not holding:
         print(" 当前无持仓")
         return EXIT_NO_ACTION
@@ -9598,6 +9283,7 @@ def _do_sell_core(smart=False, dry_run=False):
     sold_count = 0
     confirmed_count = 0
     skipped_count = 0
+    trade_failed_count = 0
     hold_count = 0
     state_changed = False
     tradability_exclusions = _load_today_tradability_exclusions()
@@ -9719,9 +9405,12 @@ def _do_sell_core(smart=False, dry_run=False):
             #region debug-point smart-sell-decay-start
             decay_started_at = time.perf_counter()
             #endregion
-            should_sell, decay_reason, decay_score = evaluate_signal_decay(
-                tdx_api, code, entry_price, mode, profit_pct=pnl_pct
-            )
+            decay_detail = _coerce_decay_detail(evaluate_signal_decay(
+                tdx_api, code, entry_price, mode, profit_pct=pnl_pct, return_detail=True
+            ))
+            should_sell = bool(decay_detail.get('should_sell'))
+            decay_reason = str(decay_detail.get('reason', '信号完好'))
+            decay_score = _fnum(decay_detail.get('score', 0.0), 0.0)
             if smart:
                 #region debug-point smart-sell-decay-done
                 _debug_report_smart_sell(
@@ -9777,6 +9466,7 @@ def _do_sell_core(smart=False, dry_run=False):
                 should_sell=should_sell,
                 decay_score=decay_score,
                 decay_reason=decay_reason,
+                decay_detail=decay_detail,
                 holding_profile=holding_big_meat_profile,
                 learning_action=learning_action,
             )
@@ -9827,17 +9517,9 @@ def _do_sell_core(smart=False, dry_run=False):
                         )
                         continue
                     qty = trimmed_qty
-                    r = _apply_holding_big_meat_profile(
-                        r,
-                        profile=holding_big_meat_profile,
-                        hold_state=BIG_MEAT_ACTION_RISK_TRIM,
-                    )
-                    state_changed = True
                     sell_reason = f"risk_trim[{decay_reason}](持仓{hold_days}天)"
                 elif sell_action == BIG_MEAT_ACTION_HARD_EXIT:
                     sell_reason = f"hard_exit[{decay_reason}](持仓{hold_days}天)"
-                    r = _apply_big_meat_state(r, state='')
-                    state_changed = True
                 else:
                     sell_reason = f"信号衰减[{decay_reason}](持仓{hold_days}天)"
             else:
@@ -9896,6 +9578,17 @@ def _do_sell_core(smart=False, dry_run=False):
                     strategy_action=action,
                 )
                 if trade_result['success']:
+                    if sell_action == BIG_MEAT_ACTION_RISK_TRIM:
+                        r = _apply_holding_big_meat_profile(
+                            r,
+                            profile=holding_big_meat_profile,
+                            hold_state=BIG_MEAT_ACTION_RISK_TRIM,
+                        )
+                        r['big_meat_last_risk_trim_at'] = _now_str()
+                        state_changed = True
+                    elif sell_action == BIG_MEAT_ACTION_HARD_EXIT:
+                        r = _apply_big_meat_state(r, state='')
+                        state_changed = True
                     if smart:
                         _debug_report_smart_sell(
                             "do_smart_sell.trade_success",
@@ -9954,7 +9647,7 @@ def _do_sell_core(smart=False, dry_run=False):
                         sell_reason=sell_reason,
                     )
                 else:
-                    skipped_count += 1
+                    trade_failed_count += 1
                     if smart:
                         #region debug-point smart-sell-trade-failed
                         _debug_report_smart_sell(
@@ -9987,7 +9680,7 @@ def _do_sell_core(smart=False, dry_run=False):
 
     if smart and sell_retry_queue:
         _debug_report_smart_sell("do_smart_sell.before_tail_retry", queue_size=len(sell_retry_queue))
-        records, balance, positions, sold_count, confirmed_count, skipped_count = _run_sell_tail_retry_queue(
+        records, balance, positions, sold_count, confirmed_count, skipped_count, trade_failed_count = _run_sell_tail_retry_queue(
             sell_retry_queue,
             action=action,
             records=records,
@@ -9996,6 +9689,7 @@ def _do_sell_core(smart=False, dry_run=False):
             sold_count=sold_count,
             confirmed_count=confirmed_count,
             skipped_count=skipped_count,
+            trade_failed_count=trade_failed_count,
         )
     if state_changed and not dry_run:
         save_track_record(records)
@@ -10014,6 +9708,7 @@ def _do_sell_core(smart=False, dry_run=False):
                 confirmed_count=_inum(confirmed_count, 0),
                 hold_count=_inum(hold_count, 0),
                 skipped_count=_inum(skipped_count, 0),
+                trade_failed_count=_inum(trade_failed_count, 0),
             )
         #region debug-point smart-sell-refresh-artifacts-start
         artifact_refresh_started_at = time.perf_counter()
@@ -10058,7 +9753,7 @@ def _do_sell_core(smart=False, dry_run=False):
     print(f" {mode_label} 结果")
     print(
         f"  卖单受理: {sold_count} 只 | 已闭合: {confirmed_count} 只 | "
-        f"继续持有: {hold_count} 只 | 失败: {skipped_count} 只"
+        f"继续持有: {hold_count} 只 | 跳过: {skipped_count} 只 | 失败: {trade_failed_count} 只"
     )
     print(f"{'='*50}")
     if smart:
@@ -10069,6 +9764,7 @@ def _do_sell_core(smart=False, dry_run=False):
             confirmed_count=_inum(confirmed_count, 0),
             hold_count=_inum(hold_count, 0),
             skipped_count=_inum(skipped_count, 0),
+            trade_failed_count=_inum(trade_failed_count, 0),
             elapsed_ms=round((time.perf_counter() - sell_core_started_at) * 1000, 2),
         )
         #endregion
@@ -10077,6 +9773,8 @@ def _do_sell_core(smart=False, dry_run=False):
     _print_stats(records)
     if dry_run:
         return EXIT_OK
+    if trade_failed_count > 0:
+        return EXIT_RUNTIME_ERROR
     if sold_count > 0:
         return EXIT_OK
     if skipped_count > 0 and hold_count <= 0:
@@ -10500,9 +10198,12 @@ def do_add_position(dry_run=False):
                 code=str(code).zfill(6),
             )
             # #endregion
-            should_sell, decay_reason, decay_score = evaluate_signal_decay(
-                tdx_api, code, entry_price, mode, profit_pct=profit_pct
-            )
+            decay_detail = _coerce_decay_detail(evaluate_signal_decay(
+                tdx_api, code, entry_price, mode, profit_pct=profit_pct, return_detail=True
+            ))
+            should_sell = bool(decay_detail.get('should_sell'))
+            decay_reason = str(decay_detail.get('reason', '信号完好'))
+            decay_score = _fnum(decay_detail.get('score', 0.0), 0.0)
             # #region debug-point A:add-position-decay-done
             _dbg_emit(
                 'A',
@@ -10515,11 +10216,9 @@ def do_add_position(dry_run=False):
                 decay_score=_fnum(decay_score, 0.0),
             )
             # #endregion
-            if should_sell:
-                if str(r.get('big_meat_state', '')).strip():
-                    r = _apply_big_meat_state(r, state='')
-                    state_changed = True
-                print(f"   {code} {name} 信号衰减({decay_reason})，不加仓")
+            if bool(decay_detail.get('block_add')):
+                provisional_note = '未完成周期形态' if decay_detail.get('provisional_only') else '信号衰减'
+                print(f"   {code} {name} {provisional_note}({decay_reason})，本轮不加仓但保留大肉/core状态")
                 continue
             big_meat_profile = _build_big_meat_add_profile(
                 tdx_api,
@@ -10659,7 +10358,7 @@ def do_add_position(dry_run=False):
         if cur_price <= 0:
             continue
 
-        qty = calc_buy_quantity(cur_price, add_amount)
+        qty = calc_buy_quantity(cur_price, add_amount, code=code)
         if qty <= 0:
             continue
 
@@ -10680,8 +10379,8 @@ def do_add_position(dry_run=False):
             print(f"  [SKIP] {code} {name} 跳过加仓: 非激进加仓名额已满，优先保留尾盘新机会")
             continue
         if cost > usable_avail:
-            qty = int(usable_avail / cur_price / 100) * 100
-            if qty < 100:
+            qty = calc_buy_quantity(cur_price, usable_avail, code=code)
+            if qty < _buy_min_lot(code):
                 if not is_aggressive:
                     skipped_yield_new.append(f"{code}({mode} reserve)")
                     print(f"  [SKIP] {code} {name} 跳过加仓: 需保留新机会预留现金")
@@ -11137,43 +10836,15 @@ def do_close_node():
 
 
 def do_midday_node():
-    """午间节点：午盘事实复核 + 自动安全纠偏 + 形成下午放行建议。"""
-    context = _collect_reconcile_context()
-    review_payload = build_midday_review(
-        balance=context['balance'],
-        positions=context['positions'],
-        orders=context['orders'],
-        records=context['records'],
-    )
-    review_payload['full_reconcile'] = context['reconcile_summary']
-    node_payload = _build_midday_node_payload(context=context, review_payload=review_payload, stage='midday_node')
-    review_payload['node_status'] = {
-        'review_status': node_payload['review_status'],
-        'pm_gate_status': node_payload['pm_gate_status'],
-        'blocked_buy_codes': node_payload['blocked_buy_codes'],
-    }
-    _write_json_atomic(MIDDAY_REVIEW_FILE, review_payload)
-    _write_json_atomic(MIDDAY_NODE_FILE, node_payload)
-    _write_pm_gate_payload(node_payload, file_path=PM_GATE_FILE)
-    print(json.dumps(node_payload, ensure_ascii=False, indent=2))
-    return EXIT_OK
+    """午盘逻辑已摘除。"""
+    print(json.dumps({'status': 'disabled', 'reason': 'midday_logic_removed'}, ensure_ascii=False, indent=2))
+    return EXIT_NO_ACTION
 
 
 def do_midday_gate():
-    """午间节点最终放行门：13:00-13:05 快速复查并输出最终下午放行状态。"""
-    context = _collect_reconcile_context()
-    review_payload = build_midday_review(
-        balance=context['balance'],
-        positions=context['positions'],
-        orders=context['orders'],
-        records=context['records'],
-    )
-    review_payload['full_reconcile'] = context['reconcile_summary']
-    gate_payload = _build_midday_node_payload(context=context, review_payload=review_payload, stage='pm_gate')
-    _write_json_atomic(MIDDAY_GATE_FILE, gate_payload)
-    _write_pm_gate_payload(gate_payload, file_path=PM_GATE_FILE)
-    print(json.dumps(gate_payload, ensure_ascii=False, indent=2))
-    return EXIT_OK
+    """午盘逻辑已摘除。"""
+    print(json.dumps({'status': 'disabled', 'reason': 'midday_logic_removed'}, ensure_ascii=False, indent=2))
+    return EXIT_NO_ACTION
 
 
 def do_report():
@@ -11182,11 +10853,13 @@ def do_report():
 
 
 def do_midday_review():
-    """兼容旧入口：午间节点。"""
-    return do_midday_node()
+    """午盘逻辑已摘除。"""
+    print(json.dumps({'status': 'disabled', 'reason': 'midday_logic_removed'}, ensure_ascii=False, indent=2))
+    return EXIT_NO_ACTION
 
 
 def main():
+    assert_runtime_write_identity(AUTOMATION_STATUS_DIR)
     parser = argparse.ArgumentParser(description='V10 + mx-moni 模拟交易')
     parser.add_argument('--buy', action='store_true', help='按V10信号分批建仓（首仓不满仓）')
     parser.add_argument('--add-position', action='store_true',
@@ -11195,9 +10868,6 @@ def main():
     parser.add_argument('--smart-sell', action='store_true',
                         help='智能卖出：信号衰减随时走人 + T+5兜底')
     parser.add_argument('--status', action='store_true', help='查看持仓和战绩')
-    parser.add_argument('--midday-node', action='store_true', help='午间节点：事实复核、自动安全纠偏、下午放行')
-    parser.add_argument('--midday-gate', action='store_true', help='午间节点最终放行门：13:00-13:05 快速复查')
-    parser.add_argument('--midday-review', action='store_true', help='午间复盘：中场校准与下午观察清单')
     parser.add_argument('--close-node', action='store_true', help='收盘节点：全天复核复盘与学习放行')
     parser.add_argument('--report', action='store_true', help='生成账户摘要、NAV历史和学习循环报告')
     parser.add_argument('--dry-run', action='store_true', help='模拟运行，不实际下单')
@@ -11215,12 +10885,6 @@ def main():
         return do_smart_sell(dry_run=args.dry_run)
     elif args.sell:
         return do_sell(dry_run=args.dry_run)
-    elif args.midday_node:
-        return do_midday_node()
-    elif args.midday_gate:
-        return do_midday_gate()
-    elif args.midday_review:
-        return do_midday_review()
     elif args.close_node:
         return do_close_node()
     elif args.report:

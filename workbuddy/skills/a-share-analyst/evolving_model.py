@@ -46,6 +46,7 @@ DEFAULT_MODE_PRIOR = {
     "trend_ride+vol": 3.0,
     "trend_ride+green": 2.0,
     "vol_breakout": 1.5,
+    "near_kill+weekly+MA20": -1.2,
     "trend_only": 0.5,
     "kill_only": -1.0,
 }

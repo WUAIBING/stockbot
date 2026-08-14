@@ -22,6 +22,15 @@ from trading_calendar import CALENDAR_SOURCE, is_trading_day
 MARKET_TZ = timezone(timedelta(hours=8), name="UTC+08")
 WAIT_CHUNK_SECONDS = 30
 DEFAULT_MAX_LAG_SECONDS = 15 * 60
+AUXILIARY_PHASE_PREFIX = "workbuddy-"
+AUXILIARY_PHASE_TIMEOUTS = {
+    "workbuddy-refresh": 240,
+    "workbuddy-buy": 180,
+    "workbuddy-sell": 120,
+    "workbuddy-smart-sell": 180,
+    "workbuddy-status": 45,
+}
+AUXILIARY_NEXT_CRITICAL_GUARD_SECONDS = 60
 
 
 def market_now() -> datetime:
@@ -79,6 +88,46 @@ def wait_until(target_at: datetime, *, dry_run: bool) -> None:
         time.sleep(sleep_seconds)
 
 
+def is_auxiliary_spec(spec: TaskSpec) -> bool:
+    return spec.phase.startswith(AUXILIARY_PHASE_PREFIX)
+
+
+def auxiliary_timeout_seconds(spec: TaskSpec) -> int | None:
+    return AUXILIARY_PHASE_TIMEOUTS.get(spec.phase)
+
+
+def next_critical_target(specs: list[TaskSpec], current_index: int, trade_date: date) -> datetime | None:
+    for next_spec in specs[current_index + 1:]:
+        if not is_auxiliary_spec(next_spec):
+            return target_datetime(next_spec, trade_date)
+    return None
+
+
+def should_skip_auxiliary_task(
+    spec: TaskSpec,
+    *,
+    now: datetime,
+    current_index: int,
+    specs: list[TaskSpec],
+    trade_date: date,
+) -> tuple[bool, str]:
+    timeout_seconds = auxiliary_timeout_seconds(spec)
+    next_critical_at = next_critical_target(specs, current_index, trade_date)
+    if timeout_seconds is None or next_critical_at is None:
+        return False, ""
+    seconds_until_next_critical = int((next_critical_at - now).total_seconds())
+    required_budget = timeout_seconds + AUXILIARY_NEXT_CRITICAL_GUARD_SECONDS
+    if seconds_until_next_critical <= required_budget:
+        return (
+            True,
+            (
+                f"{spec.suffix} slot={spec.time_hhmm} skipped to preserve next critical slot "
+                f"{next_critical_at:%H:%M}; remaining={seconds_until_next_critical}s budget={required_budget}s"
+            ),
+        )
+    return False, ""
+
+
 def run_task(spec: TaskSpec, *, env: dict[str, str], run_prefix: str, dry_run: bool) -> int:
     args = build_task_args(spec)
     args.extend(["--run-id", f"{run_prefix}-{spec.suffix.lower()}"])
@@ -86,9 +135,14 @@ def run_task(spec: TaskSpec, *, env: dict[str, str], run_prefix: str, dry_run: b
     print(f"[RUN] {spec.suffix} -> {command_text}")
     if dry_run:
         return 0
-    completed = subprocess.run(args, cwd=ROOT, env=env)
-    print(f"[DONE] {spec.suffix} exit_code={completed.returncode}")
-    return completed.returncode
+    timeout_seconds = auxiliary_timeout_seconds(spec) if is_auxiliary_spec(spec) else None
+    try:
+        completed = subprocess.run(args, cwd=ROOT, env=env, timeout=timeout_seconds)
+        print(f"[DONE] {spec.suffix} exit_code={completed.returncode}")
+        return completed.returncode
+    except subprocess.TimeoutExpired:
+        print(f"[TIMEOUT] {spec.suffix} exceeded auxiliary timeout={timeout_seconds}s")
+        return 124
 
 
 def iter_selected_specs(start_from_slot: str) -> list[TaskSpec]:
@@ -120,30 +174,59 @@ def main() -> int:
         return 0
 
     print(f"[PLAN] trade_date={trade_date.isoformat()} start_from_slot={args.start_from_slot or 'ALL'} task_count={len(selected_specs)}")
-    failures: list[tuple[str, int]] = []
+    critical_failures: list[tuple[str, int]] = []
+    auxiliary_failures: list[tuple[str, int]] = []
     overdue_skips: list[str] = []
-    for spec in selected_specs:
+    auxiliary_skips: list[str] = []
+    for index, spec in enumerate(selected_specs):
         target_at = target_datetime(spec, trade_date)
         now = market_now()
         lag_seconds = int((now - target_at).total_seconds())
         if lag_seconds > args.max_lag_seconds:
             print(f"[SKIP] {spec.suffix} slot={spec.time_hhmm} overdue_by={lag_seconds}s exceeds max_lag_seconds={args.max_lag_seconds}")
-            overdue_skips.append(f"{spec.suffix}@{spec.time_hhmm}")
+            target_list = auxiliary_skips if is_auxiliary_spec(spec) else overdue_skips
+            target_list.append(f"{spec.suffix}@{spec.time_hhmm}")
             continue
         if now < target_at:
             wait_until(target_at, dry_run=args.dry_run)
+        now = market_now()
+        if is_auxiliary_spec(spec):
+            should_skip, reason = should_skip_auxiliary_task(
+                spec,
+                now=now,
+                current_index=index,
+                specs=selected_specs,
+                trade_date=trade_date,
+            )
+            if should_skip:
+                print(f"[SKIP] {reason}")
+                auxiliary_skips.append(f"{spec.suffix}@{spec.time_hhmm}")
+                continue
         exit_code = run_task(spec, env=env, run_prefix=run_prefix, dry_run=args.dry_run)
         if exit_code != 0:
-            failures.append((spec.suffix, exit_code))
+            target_list = auxiliary_failures if is_auxiliary_spec(spec) else critical_failures
+            target_list.append((spec.suffix, exit_code))
 
     if overdue_skips and not args.dry_run:
         summary = ", ".join(overdue_skips)
         print(f"[FAIL] missed scheduled slots because the workflow started too late -> {summary}")
         return 86
-    if failures:
-        summary = ", ".join(f"{suffix}:{code}" for suffix, code in failures)
+    if critical_failures:
+        summary = ", ".join(f"{suffix}:{code}" for suffix, code in critical_failures)
         print(f"[FAIL] one or more scheduled tasks failed -> {summary}")
-        return failures[-1][1]
+        if auxiliary_failures:
+            aux_summary = ", ".join(f"{suffix}:{code}" for suffix, code in auxiliary_failures)
+            print(f"[WARN] auxiliary challenger/workbuddy tasks also failed -> {aux_summary}")
+        if auxiliary_skips:
+            skip_summary = ", ".join(auxiliary_skips)
+            print(f"[WARN] auxiliary challenger/workbuddy tasks skipped -> {skip_summary}")
+        return critical_failures[-1][1]
+    if auxiliary_failures:
+        summary = ", ".join(f"{suffix}:{code}" for suffix, code in auxiliary_failures)
+        print(f"[WARN] auxiliary challenger/workbuddy tasks failed but mainline stayed healthy -> {summary}")
+    if auxiliary_skips:
+        summary = ", ".join(auxiliary_skips)
+        print(f"[WARN] auxiliary challenger/workbuddy tasks skipped to protect mainline -> {summary}")
     print("[OK] trade-day schedule completed without task failures.")
     return 0
 

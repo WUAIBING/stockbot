@@ -11,10 +11,94 @@ from unittest.mock import patch
 
 import pandas as pd
 
+import evolving_model
 import scanner_v10 as scanner
 
 
 class ScannerHybridRefreshTests(unittest.TestCase):
+    def test_classify_signal_prefers_trend_ride_for_strong_trend_mild_pullback(self) -> None:
+        tier, mode, position, desc = scanner.classify_signal(
+            -0.2,
+            -0.05,
+            True,
+            8.5,
+            -1.0,
+            True,
+            58.0,
+            True,
+            1.8,
+        )
+
+        self.assertEqual(tier, 2)
+        self.assertEqual(mode, "trend_ride+vol")
+        self.assertEqual(position, 0.6)
+        self.assertIn("vol_expand", desc)
+
+    def test_classify_signal_rejects_near_kill_when_tail_is_still_weakening(self) -> None:
+        tier, mode, position, desc = scanner.classify_signal(
+            -0.2,
+            -0.28,
+            True,
+            3.5,
+            -1.0,
+            False,
+            54.0,
+            False,
+            1.1,
+        )
+
+        self.assertEqual((tier, mode, position, desc), (0, "no_signal", 0.0, ""))
+
+    def test_classify_signal_keeps_near_kill_when_pullback_has_stabilized(self) -> None:
+        tier, mode, position, desc = scanner.classify_signal(
+            -0.2,
+            -0.06,
+            True,
+            3.5,
+            -1.0,
+            False,
+            54.0,
+            False,
+            1.1,
+        )
+
+        self.assertEqual(tier, 2)
+        self.assertEqual(mode, "near_kill+weekly+MA20")
+        self.assertEqual(position, 0.5)
+        self.assertIn("stabilizing", desc)
+
+    def test_evolving_model_penalizes_near_kill_vs_trend_ride(self) -> None:
+        base_row = {
+            "code": "000001",
+            "tier": 2,
+            "weekly_slope": 8.0,
+            "close_vs_ma20_pct": -0.8,
+            "amt_ratio": 1.7,
+            "rsi14": 58.0,
+            "is_green": True,
+            "bz_direction": -0.15,
+            "bz_rt_direction": -0.04,
+            "vol_expand": True,
+        }
+        context = {
+            "state": {"weights": dict(evolving_model.DEFAULT_WEIGHTS), "tier_bias": {"2": 2.0}, "mode_bias": {}},
+            "market": {"score": 62.0, "breakdown": {}},
+            "industry_map": {},
+            "sector_stats": {},
+        }
+
+        near_kill_score = evolving_model.score_row(
+            {**base_row, "mode": "near_kill+weekly+MA20"},
+            context,
+        )["score"]
+        trend_ride_score = evolving_model.score_row(
+            {**base_row, "mode": "trend_ride+vol"},
+            context,
+        )["score"]
+
+        self.assertGreater(trend_ride_score, near_kill_score)
+        self.assertGreaterEqual(trend_ride_score - near_kill_score, 4.0)
+
     def test_write_outputs_stringifies_non_string_display_fields(self) -> None:
         df = pd.DataFrame(
             [
@@ -108,6 +192,52 @@ class ScannerHybridRefreshTests(unittest.TestCase):
         refreshed = write_outputs.call_args.kwargs["df"]
         self.assertEqual(set(refreshed["code"]), {"000001", "000002"})
         self.assertEqual(write_outputs.call_args.kwargs["scanned_count"], 2)
+
+    def test_decision_fast_caps_refresh_to_highest_liquidity_candidates(self) -> None:
+        cached = pd.DataFrame(columns=["code", "name", "market"])
+        stocks = pd.DataFrame(
+            [
+                {"code": "000001", "name": "one", "market": 0},
+                {"code": "000002", "name": "two", "market": 0},
+                {"code": "000003", "name": "three", "market": 1},
+            ]
+        )
+        filtered = [
+            {"code": "000003", "name": "three", "market": 1, "latest_amt": 3e8},
+            {"code": "000002", "name": "two", "market": 0, "latest_amt": 2e8},
+            {"code": "000001", "name": "one", "market": 0, "latest_amt": 1e8},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "v10_scan_full.csv").write_text("placeholder\n", encoding="utf-8")
+            with (
+                patch.object(scanner, "OUTPUT_DIR", output_dir),
+                patch.object(scanner.pd, "read_csv", return_value=cached),
+                patch.object(scanner, "get_stock_list", return_value=stocks),
+                patch.object(scanner, "_collect_amount_snapshot", return_value=[]),
+                patch.object(
+                    scanner,
+                    "_select_amount_candidates",
+                    return_value=(filtered, 4200.0, "正常市", scanner.SCAN_CONFIG["min_amount_yuan"]),
+                ),
+                patch.object(scanner, "DECISION_MAX_CANDIDATES", 2),
+                patch.object(
+                    scanner,
+                    "_build_signal_row",
+                    side_effect=lambda _api, *, code, **_kwargs: {"code": code, "tier": 0},
+                ) as build_signal_row,
+                patch.object(scanner, "_main_strategy_debug_emit"),
+                patch.object(scanner, "_write_outputs") as write_outputs,
+            ):
+                scanner._run_decision_fast(api=object(), run_time="2026-07-15 14:49:00")
+
+        self.assertEqual([call.kwargs["code"] for call in build_signal_row.call_args_list], ["000003", "000002"])
+        self.assertEqual(write_outputs.call_args.kwargs["scanned_count"], 2)
+
+    def test_positive_int_env_uses_default_for_invalid_values(self) -> None:
+        with patch.dict(scanner.os.environ, {"TLFZ_DECISION_MAX_CANDIDATES": "invalid"}):
+            self.assertEqual(scanner._positive_int_env("TLFZ_DECISION_MAX_CANDIDATES", 120), 120)
 
     def test_build_signal_row_refreshes_daily_sensitive_fields_before_classification(self) -> None:
         fresh_daily = {

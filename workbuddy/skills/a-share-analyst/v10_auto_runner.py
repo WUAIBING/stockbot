@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from package_paths import DATA_DIR
+from package_paths import DATA_DIR, assert_runtime_write_identity
 from trading_calendar import CALENDAR_SOURCE, is_trading_day
 from workbuddy_runtime import (
     BUILD_WORKBUDDY_DISTILL_DAILY_REVIEW_SCRIPT,
@@ -40,19 +40,15 @@ STATUS_HISTORY = STATUS_DIR / 'phase_history.csv'
 STATUS_HISTORY_DETAILED = STATUS_DIR / 'phase_history_detailed.csv'
 PREWARM_TIMING_SIGNAL = STATUS_DIR / 'prewarm_timing_signal.json'
 OPENING_NODE_FILE = DATA_DIR / 'v10_opening_node_latest.json'
-MIDDAY_INSPECTION_FILE = DATA_DIR / 'v10_midday_inspection_latest.json'
 CLOSE_NODE_FILE = DATA_DIR / 'v10_close_node_latest.json'
 CLOSE_NODE_MX_REVIEW_FILE = DATA_DIR / 'v10_close_node_mx_review_latest.json'
 SECURITY_MASTER_FILE = DATA_DIR / 'security_master_latest.json'
 OPENING_TRADABILITY_FILE = DATA_DIR / 'opening_tradability_latest.json'
 EXTERNAL_MARKET_REVIEW_FILE = DATA_DIR / 'v10_external_market_review_latest.json'
-MIDDAY_REVIEW_FILE = DATA_DIR / 'v10_midday_review_latest.json'
-MIDDAY_NODE_FILE = DATA_DIR / 'v10_midday_node_latest.json'
-MIDDAY_GATE_FILE = DATA_DIR / 'v10_midday_gate_latest.json'
-PM_GATE_FILE = DATA_DIR / 'v10_pm_gate_status.json'
 WORKBUDDY_LOCAL_REVIEW_FILE = DATA_DIR / 'workbuddy_local_review_latest.json'
 WORKBUDDY_LEARNING_ADVICE_FILE = DATA_DIR / 'workbuddy_learning_advice_latest.json'
 ACCOUNT_SUMMARY_FILE = DATA_DIR / 'v10_account_summary_latest.json'
+BUY_DIAGNOSTIC_FILE = DATA_DIR / 'v10_buy_diagnostic_latest.json'
 DISTILL_DAILY_REVIEW_SCRIPT = BUILD_WORKBUDDY_DISTILL_DAILY_REVIEW_SCRIPT
 DISTILL_DAILY_REVIEW_FILE = WORKBUDDY_DISTILL_DAILY_REVIEW_FILE
 WATCH_RETRYABLE_CODES = {2, 3, 4, 124}
@@ -94,13 +90,11 @@ STEP_TIMEOUTS = {
     ('decision', 'scanner_v10.py'): 300,
     ('decision', 'data_freshness_probe.py'): 20,
     ('buy', 'data_freshness_probe.py'): 20,
-    ('buy', 'v10_moni_trader.py'): 180,
+    ('buy', 'v10_moni_trader.py'): 420,
     ('add-position', 'v10_moni_trader.py'): 240,
     ('smart-sell', 'v10_moni_trader.py'): 300,
     ('sell', 'v10_moni_trader.py'): 240,
     ('status', 'v10_moni_trader.py'): 180,
-    ('midday-node', 'v10_moni_trader.py'): 240,
-    ('midday-gate', 'v10_moni_trader.py'): 300,
     ('close-node', 'v10_moni_trader.py'): 420,
     ('close-node', 'external_market_review.py'): 360,
     ('close-node', 'mx_enrich_candidates.py'): 300,
@@ -128,13 +122,9 @@ TRADING_DAY_ONLY_PHASES = {
     'add-position',
     'smart-sell',
     'sell',
-    'midday-node',
-    'midday-gate',
     'close-node',
 }
-PHASE_HARD_DEADLINES = {
-    'midday-gate': (13, 5),
-}
+PHASE_HARD_DEADLINES = {}
 CLOSE_NODE_OPTIONAL_STEPS = {
     'mx_enrich_candidates.py',
     'mx_event_review.py',
@@ -296,85 +286,6 @@ def build_opening_node_snapshot(
     }
 
 
-def build_midday_inspection_snapshot(
-    *,
-    run_meta: dict[str, str],
-    phase: str,
-    phase_status: str,
-    phase_exit_code: int,
-) -> dict[str, object]:
-    midday_review = summarize_detail_file(
-        MIDDAY_REVIEW_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('market_temperature',),
-    )
-    midday_node = summarize_detail_file(
-        MIDDAY_NODE_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes'),
-    )
-    midday_gate = summarize_detail_file(
-        MIDDAY_GATE_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes'),
-    )
-    pm_gate = summarize_detail_file(
-        PM_GATE_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes', 'reason_codes'),
-    )
-    account_summary_payload = read_json(ACCOUNT_SUMMARY_FILE)
-    latest_execution_result = account_summary_payload.get('latest_execution_result', {}) if isinstance(account_summary_payload, dict) else {}
-    account_summary = summarize_detail_file(
-        ACCOUNT_SUMMARY_FILE,
-        date_keys=('trade_date', 'date'),
-    )
-    account_summary['latest_execution_action'] = str(latest_execution_result.get('action', '')).strip() if isinstance(latest_execution_result, dict) else ''
-    account_summary['latest_execution_status'] = str(latest_execution_result.get('status', '')).strip() if isinstance(latest_execution_result, dict) else ''
-    current_stage_ready = bool(midday_node['is_today']) if phase == 'midday-node' else bool(midday_gate['is_today'] and pm_gate['is_today'])
-    checklist = {
-        'midday_review_today': bool(midday_review['is_today']),
-        'midday_node_today': bool(midday_node['is_today']),
-        'midday_gate_today': bool(midday_gate['is_today']),
-        'pm_gate_today': bool(pm_gate['is_today']),
-        'current_stage_ready': current_stage_ready,
-    }
-    notes: list[str] = []
-    if phase == 'midday-node':
-        notes.append('11:35 午间节点已落盘，当前巡检用于事实复核与下午放行建议。')
-    else:
-        notes.append('13:00 午盘闸门已落盘，当前巡检用于最终下午放行确认。')
-    if not checklist['midday_review_today']:
-        notes.append('v10_midday_review_latest.json 未确认是今日版本。')
-    if phase == 'midday-gate' and not checklist['pm_gate_today']:
-        notes.append('v10_pm_gate_status.json 未确认是今日版本。')
-    if phase_status == 'ok' and current_stage_ready:
-        inspection_status = 'ok'
-    elif phase_status in {'ok', 'no_action', 'no_signal', 'skipped'}:
-        inspection_status = 'warning'
-    else:
-        inspection_status = 'failed'
-    return {
-        'generated_at': format_timestamp(datetime.now()),
-        'trade_date': datetime.now().strftime('%Y-%m-%d'),
-        'node': 'midday_inspection',
-        'stage': phase,
-        'run_id': run_meta['run_id'],
-        'task_name': run_meta['task_name'],
-        'trigger_slot': run_meta['trigger_slot'],
-        'phase_status': phase_status,
-        'phase_exit_code': phase_exit_code,
-        'inspection_status': inspection_status,
-        'checklist': checklist,
-        'midday_review': midday_review,
-        'midday_node': midday_node,
-        'midday_gate': midday_gate,
-        'pm_gate': pm_gate,
-        'account_summary': account_summary,
-        'notes': notes,
-    }
-
-
 def write_phase_inspection_snapshot(
     *,
     run_meta: dict[str, str],
@@ -390,15 +301,6 @@ def write_phase_inspection_snapshot(
         )
         write_json_atomic(OPENING_NODE_FILE, payload)
         return OPENING_NODE_FILE
-    if phase in {'midday-node', 'midday-gate'}:
-        payload = build_midday_inspection_snapshot(
-            run_meta=run_meta,
-            phase=phase,
-            phase_status=phase_status,
-            phase_exit_code=phase_exit_code,
-        )
-        write_json_atomic(MIDDAY_INSPECTION_FILE, payload)
-        return MIDDAY_INSPECTION_FILE
     return None
 
 
@@ -691,7 +593,6 @@ def build_run_id(*, phase: str, task_name: str, trigger_slot: str) -> str:
 def canonical_phase_name(phase: str) -> str:
     mapping = {
         'buy-watch': 'buy',
-        'midday-review': 'midday-node',
         'report': 'close-node',
     }
     return mapping.get(phase, phase)
@@ -734,7 +635,7 @@ def evaluate_prewarm_timing(
     elif should_move_earlier:
         note = (
             f'prewarm completed too close to decision or ran too long; '
-            f'suggest moving start from {run_meta["trigger_slot"] or "14:30"} to {PREWARM_RECOMMENDED_START_SLOT}'
+            f'suggest moving start from {run_meta["trigger_slot"] or PREWARM_RECOMMENDED_START_SLOT} to {PREWARM_RECOMMENDED_START_SLOT}'
         )
         action = 'suggest_move_to_14_25'
     else:
@@ -747,7 +648,7 @@ def evaluate_prewarm_timing(
         'phase': 'prewarm',
         'status': status,
         'current_trigger_slot': run_meta['trigger_slot'],
-        'recommended_trigger_slot': PREWARM_RECOMMENDED_START_SLOT if should_move_earlier else (run_meta['trigger_slot'] or '14:30'),
+        'recommended_trigger_slot': PREWARM_RECOMMENDED_START_SLOT if should_move_earlier else (run_meta['trigger_slot'] or PREWARM_RECOMMENDED_START_SLOT),
         'started_at': format_timestamp(started_at),
         'finished_at': format_timestamp(finished_at),
         'duration_seconds': duration_seconds if duration_seconds is not None else '',
@@ -864,6 +765,18 @@ def phase_completion_detail(status: str) -> str:
         'skipped': 'phase finished with window skipped',
     }
     return detail_map.get(status, 'phase finished')
+
+
+def enrich_buy_detail(phase: str, step_name: str, detail: str) -> str:
+    if phase != 'buy' or step_name != 'v10_moni_trader.py':
+        return detail
+    diagnostic = read_json(BUY_DIAGNOSTIC_FILE)
+    if str(diagnostic.get('action', '')).strip() != 'buy':
+        return detail
+    reason = str(diagnostic.get('reason', '')).strip()
+    if not reason:
+        return detail
+    return f"{detail} | buy_no_action_reason={reason}"
 
 
 def enrich_add_position_detail(phase: str, step_name: str, detail: str) -> str:
@@ -1010,10 +923,6 @@ def build_steps(phase: str, *, with_email: bool) -> list[list[str] | None]:
         return [['v10_moni_trader.py', '--sell']]
     elif phase == 'status':
         return [['v10_moni_trader.py', '--status']]
-    elif phase == 'midday-node':
-        return [['v10_moni_trader.py', '--midday-node']]
-    elif phase == 'midday-gate':
-        return [['v10_moni_trader.py', '--midday-gate']]
     elif phase == 'close-node':
         return [
             ['v10_moni_trader.py', '--close-node'],
@@ -1176,6 +1085,7 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
                 except RuntimeValidationError as exc:
                     code = 3
                     step_detail = f"step output validation failed: {exc}"
+            step_detail = enrich_buy_detail(phase, step_name, step_detail)
             step_detail = enrich_add_position_detail(phase, step_name, step_detail)
             step_status = classify_step_status(phase, step_name, code)
             record_status(
@@ -1371,11 +1281,12 @@ def run_phase_watch(
 
 
 def main() -> int:
+    assert_runtime_write_identity(STATUS_DIR)
     parser = argparse.ArgumentParser(description='V10 自动化阶段执行器')
     parser.add_argument(
         '--phase',
         required=True,
-        choices=['opening-data', 'workbuddy-refresh', 'workbuddy-buy', 'workbuddy-sell', 'workbuddy-smart-sell', 'workbuddy-status', 'prewarm', 'decision', 'buy', 'buy-watch', 'add-position', 'smart-sell', 'sell', 'status', 'midday-node', 'midday-gate', 'midday-review', 'close-node', 'report'],
+        choices=['opening-data', 'workbuddy-refresh', 'workbuddy-buy', 'workbuddy-sell', 'workbuddy-smart-sell', 'workbuddy-status', 'prewarm', 'decision', 'buy', 'buy-watch', 'add-position', 'smart-sell', 'sell', 'status', 'close-node', 'report'],
         help='要执行的自动化阶段',
     )
     parser.add_argument('--with-email', action='store_true', help='阶段完成后发送对应邮件')

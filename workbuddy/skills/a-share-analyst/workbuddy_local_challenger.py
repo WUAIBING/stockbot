@@ -25,7 +25,7 @@ from typing import Any
 
 import v10_moni_trader as base
 from market_resolver import build_today_exclusion_map, exclusion_reason_text, resolve_market_info
-from package_paths import DATA_DIR
+from package_paths import DATA_DIR, assert_runtime_write_identity
 from trading_calendar import latest_workbuddy_source_trade_date
 from workbuddy_runtime import (
     ARKCLAW_ROOT,
@@ -45,6 +45,7 @@ PORTFOLIO_NAME = "Workbuddy"
 PORTFOLIO_TYPE = "local_challenger_paper_account"
 INITIAL_CAPITAL = 1_000_000.0
 SOURCE_FILE = WORKBUDDY_CANDIDATE_POOL_FILE
+SOURCE_REFRESH_TIMEOUT_SECONDS = 75
 
 TRACK_FILE = WORKBUDDY_LOCAL_TRACK_RECORD_FILE
 NAV_FILE = DATA_DIR / "workbuddy_local_nav_history.csv"
@@ -58,6 +59,10 @@ EXECUTION_STATE_FILE = WORKBUDDY_LOCAL_EXECUTION_STATE_FILE
 # #region debug-point A:challenger-zero-pnl-server
 _DEBUG_ROOT = Path(__file__).resolve().parents[2] / ".dbg"
 _DEBUG_ENV_FILE = _DEBUG_ROOT / "challenger-zero-pnl.env"
+
+
+class ChallengerSourceUnavailable(RuntimeError):
+    """Raised when the challenger source payload cannot be prepared safely."""
 
 
 def _debug_emit_event(hypothesis_id: str, location: str, msg: str, data: dict[str, Any]) -> None:
@@ -932,25 +937,34 @@ def _load_source_payload() -> dict[str, Any]:
 
 def _refresh_source_payload(expected_trade_date: str) -> tuple[dict[str, Any], str]:
     if not REFRESH_DISTILL_PIPELINE_SCRIPT.exists():
-        raise RuntimeError(f"refresh_distill_pipeline.py 不存在: {REFRESH_DISTILL_PIPELINE_SCRIPT}")
+        raise ChallengerSourceUnavailable(
+            f"refresh_distill_pipeline.py 不存在: {REFRESH_DISTILL_PIPELINE_SCRIPT}"
+        )
     cmd = [
         sys.executable,
         str(REFRESH_DISTILL_PIPELINE_SCRIPT),
         "--trade-date",
         expected_trade_date,
     ]
-    result = subprocess.run(
-        cmd,
-        cwd=ARKCLAW_ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=900,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=ARKCLAW_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=SOURCE_REFRESH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = ((exc.stdout or "") or (exc.stderr or "")).strip()
+        raise ChallengerSourceUnavailable(
+            "刷新候选池超时: "
+            f"trade_date={expected_trade_date}, timeout={SOURCE_REFRESH_TIMEOUT_SECONDS}s, detail={detail[:500]}"
+        ) from exc
     detail = (result.stdout or result.stderr or "").strip()
     if result.returncode != 0:
-        raise RuntimeError(
+        raise ChallengerSourceUnavailable(
             f"刷新候选池失败，exit={result.returncode}, trade_date={expected_trade_date}, detail={detail[:500]}"
         )
     return _load_source_payload(), detail[:500]
@@ -962,19 +976,35 @@ def _ensure_fresh_source_payload() -> dict[str, Any]:
     current_trade_date = str(payload.get("trade_date", payload.get("source_trade_date", ""))).strip()
     current_status = str(payload.get("status", "")).strip()
     if current_status == "ok" and current_trade_date >= expected_trade_date:
-        validate_candidate_pool_artifact(path=SOURCE_FILE, expected_trade_date=expected_trade_date)
-        return payload
+        try:
+            validate_candidate_pool_artifact(path=SOURCE_FILE, expected_trade_date=expected_trade_date)
+            return payload
+        except RuntimeValidationError:
+            pass
 
-    payload, refresh_detail = _refresh_source_payload(expected_trade_date)
+    try:
+        payload, refresh_detail = _refresh_source_payload(expected_trade_date)
+    except ChallengerSourceUnavailable as exc:
+        raise ChallengerSourceUnavailable(
+            "候选池未就绪，跳过本轮买入: "
+            f"expected={expected_trade_date}, current_trade_date={current_trade_date or 'missing'}, "
+            f"current_status={current_status or 'missing'}, detail={exc}"
+        ) from exc
     refreshed_trade_date = str(payload.get("trade_date", payload.get("source_trade_date", ""))).strip()
     refreshed_status = str(payload.get("status", "")).strip()
     if refreshed_status != "ok" or refreshed_trade_date < expected_trade_date:
-        raise RuntimeError(
+        raise ChallengerSourceUnavailable(
             "候选池刷新后仍未达到可接受交易日: "
             f"expected={expected_trade_date}, actual={refreshed_trade_date}, "
             f"status={refreshed_status}, detail={refresh_detail}"
         )
-    validate_candidate_pool_artifact(path=SOURCE_FILE, expected_trade_date=expected_trade_date)
+    try:
+        validate_candidate_pool_artifact(path=SOURCE_FILE, expected_trade_date=expected_trade_date)
+    except RuntimeValidationError as exc:
+        raise ChallengerSourceUnavailable(
+            "候选池刷新后校验失败，跳过本轮买入: "
+            f"expected={expected_trade_date}, actual={refreshed_trade_date}, detail={exc}"
+        ) from exc
     return payload
 
 
@@ -1487,8 +1517,8 @@ def build_buy_plan(
         if payload.get("status") != "ok":
             raise RuntimeError("workbuddy_candidate_pool_latest.json 不可用")
         selected_records = payload.get("selected_records", [])
-    if not isinstance(selected_records, list) or not selected_records:
-        raise RuntimeError("Workbuddy 候选池为空")
+    if not isinstance(selected_records, list):
+        raise RuntimeError("Workbuddy 候选池格式异常：selected_records 不是 list")
 
     records = load_track_record()
     execution_state = _prune_execution_state(_load_execution_state(), records)
@@ -1804,7 +1834,11 @@ def do_buy(*, dry_run: bool = False, force: bool = False, trigger_slot: str = ""
         print(" Workbuddy 本地 Challenger 当前不在配置买入窗口")
         return base.EXIT_NO_ACTION
 
-    plan_payload, buy_list, skipped, execution_state = build_buy_plan(trigger_slot=trigger_slot, force=force)
+    try:
+        plan_payload, buy_list, skipped, execution_state = build_buy_plan(trigger_slot=trigger_slot, force=force)
+    except (ChallengerSourceUnavailable, RuntimeValidationError) as exc:
+        print(f" [WARN] Workbuddy 候选池未就绪，本轮跳过买入: {exc}")
+        return base.EXIT_NO_ACTION
     print(f"\n{'=' * 60}")
     print(f" Workbuddy 本地 Challenger 买入 {'[DRY RUN]' if dry_run else '[LOCAL FILL]'}")
     print(
@@ -2245,6 +2279,7 @@ def do_status() -> int:
 
 
 def main() -> int:
+    assert_runtime_write_identity(DATA_DIR / "automation_status")
     parser = argparse.ArgumentParser(description="Workbuddy challenger 本地模拟下单")
     parser.add_argument("--buy", action="store_true", help="按 workbuddy 主链候选池执行本地模拟买入")
     parser.add_argument("--sell", action="store_true", help="按 T+5 规则执行本地模拟卖出")

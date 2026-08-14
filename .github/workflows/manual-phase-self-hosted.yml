@@ -23,9 +23,6 @@ on:
           - smart-sell
           - sell
           - status
-          - midday-node
-          - midday-gate
-          - midday-review
           - close-node
           - report
       trigger_slot:

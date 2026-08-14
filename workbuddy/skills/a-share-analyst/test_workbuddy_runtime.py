@@ -7,8 +7,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import package_paths
 import workbuddy_runtime as runtime
 
 
@@ -86,6 +88,29 @@ class WorkbuddyRuntimeValidationTests(unittest.TestCase):
 
         validate_mock.assert_called_once()
         self.assertEqual(reports[0].name, "opening_tradability_latest.json")
+
+    def test_assert_runtime_write_identity_rejects_root_on_runner_owned_path(self) -> None:
+        fake_pwd = SimpleNamespace(getpwuid=lambda uid: SimpleNamespace(pw_name={0: "root", 1001: "stockbotrunner"}[uid]))
+        fake_stat = SimpleNamespace(st_uid=1001)
+        with (
+            patch.object(package_paths, "pwd", fake_pwd),
+            patch.object(package_paths.os, "name", "posix"),
+            patch.object(package_paths.os, "geteuid", return_value=0, create=True),
+            patch.object(Path, "stat", return_value=fake_stat),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "current_user=root, expected_owner=stockbotrunner"):
+                package_paths.assert_runtime_write_identity(Path("/opt/stockbot/workbuddy/a-share-analyst/automation_status"))
+
+    def test_assert_runtime_write_identity_allows_matching_owner(self) -> None:
+        fake_pwd = SimpleNamespace(getpwuid=lambda uid: SimpleNamespace(pw_name={1001: "stockbotrunner"}[uid]))
+        fake_stat = SimpleNamespace(st_uid=1001)
+        with (
+            patch.object(package_paths, "pwd", fake_pwd),
+            patch.object(package_paths.os, "name", "posix"),
+            patch.object(package_paths.os, "geteuid", return_value=1001, create=True),
+            patch.object(Path, "stat", return_value=fake_stat),
+        ):
+            package_paths.assert_runtime_write_identity(Path("/opt/stockbot/workbuddy/a-share-analyst/automation_status"))
 
 
 if __name__ == "__main__":
