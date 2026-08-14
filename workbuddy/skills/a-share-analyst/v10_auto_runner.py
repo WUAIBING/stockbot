@@ -1295,7 +1295,7 @@ def main() -> int:
     parser.add_argument(
         '--phase',
         required=True,
-        choices=['opening-data', 'workbuddy-refresh', 'workbuddy-buy', 'workbuddy-sell', 'workbuddy-smart-sell', 'workbuddy-status', 'prewarm', 'decision', 'buy', 'buy-watch', 'add-position', 'smart-sell', 'sell', 'status', 'close-node', 'report'],
+        choices=['opening-data', 'workbuddy-refresh', 'workbuddy-buy', 'workbuddy-sell', 'workbuddy-smart-sell', 'workbuddy-status', 'prewarm', 'decision', 'buy', 'buy-watch', 'add-position', 'smart-sell', 'sell', 'repair-mx-002487', 'status', 'close-node', 'report'],
         help='要执行的自动化阶段',
     )
     parser.add_argument('--with-email', action='store_true', help='阶段完成后发送对应邮件')
