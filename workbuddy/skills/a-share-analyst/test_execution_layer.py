@@ -4497,5 +4497,106 @@ class VerifiedMxFillLedgerTests(unittest.TestCase):
 
 
 
+
+class BuyRefPriceSanityTests(unittest.TestCase):
+    """Guards the sizing path: quantity = target_amount / ref_price.
+
+    A wrong ref_price does not just misreport - it multiplies the position.
+    On 2026-08-24 the bot sized 688205 with ref_price 22.92 against a real
+    155.81, committing 62,400 for a slot it had priced at 9,168.
+    """
+
+    def _payload(self, code, last_close, trade_date="2026-08-24"):
+        return {
+            "trade_date": trade_date,
+            "records": [{"code": code, "last_close": last_close}],
+        }
+
+    def test_rejects_the_688205_incident(self) -> None:
+        with (
+            patch.object(trader, "_load_opening_tradability_payload",
+                         return_value=self._payload("688205", 159.36)),
+            patch.object(trader, "_market_today", return_value="2026-08-24"),
+        ):
+            ok, detail = trader._check_buy_ref_price_sanity("688205", 22.92)
+        self.assertFalse(ok)
+        self.assertEqual(detail["reason"], "ref_price_out_of_range")
+        self.assertAlmostEqual(detail["deviation_pct"], 85.62, places=1)
+        self.assertEqual(detail["tolerance_pct"], 40.0)
+
+    def test_allows_601609_which_moved_within_its_limit(self) -> None:
+        """Same day, 10.1% off - a legitimate intraday move, must not trip."""
+        with (
+            patch.object(trader, "_load_opening_tradability_payload",
+                         return_value=self._payload("601609", 13.23)),
+            patch.object(trader, "_market_today", return_value="2026-08-24"),
+        ):
+            ok, detail = trader._check_buy_ref_price_sanity("601609", 11.89)
+        self.assertTrue(ok, detail)
+        self.assertEqual(detail["reason"], "ok")
+
+    def test_rejects_the_002487_oversize(self) -> None:
+        with (
+            patch.object(trader, "_load_opening_tradability_payload",
+                         return_value=self._payload("002487", 42.10)),
+            patch.object(trader, "_market_today", return_value="2026-08-10"),
+        ):
+            ok, detail = trader._check_buy_ref_price_sanity("002487", 7.42)
+        self.assertFalse(ok)
+        self.assertEqual(detail["tolerance_pct"], 25.0)
+
+    def test_market_price_placeholder_is_not_checked(self) -> None:
+        ok, detail = trader._check_buy_ref_price_sanity("600664", 0)
+        self.assertTrue(ok)
+        self.assertEqual(detail["reason"], "market_price_placeholder")
+
+    def test_fails_open_when_reference_missing(self) -> None:
+        with patch.object(trader, "_load_opening_tradability_payload", return_value={}):
+            ok, detail = trader._check_buy_ref_price_sanity("600664", 8.20)
+        self.assertTrue(ok)
+        self.assertEqual(detail["reason"], "no_reference_price")
+
+    def test_fails_open_when_reference_is_stale(self) -> None:
+        with (
+            patch.object(trader, "_load_opening_tradability_payload",
+                         return_value=self._payload("600664", 8.23, trade_date="2026-08-01")),
+            patch.object(trader, "_market_today", return_value="2026-08-24"),
+        ):
+            ok, detail = trader._check_buy_ref_price_sanity("600664", 25.00)
+        self.assertTrue(ok)
+        self.assertEqual(detail["reason"], "reference_stale")
+
+    def test_star_board_gets_the_wider_tolerance(self) -> None:
+        with (
+            patch.object(trader, "_load_opening_tradability_payload",
+                         return_value=self._payload("688205", 100.0)),
+            patch.object(trader, "_market_today", return_value="2026-08-24"),
+        ):
+            ok, _ = trader._check_buy_ref_price_sanity("688205", 135.0)   # 35% < 40%
+            bad, _ = trader._check_buy_ref_price_sanity("688205", 145.0)  # 45% > 40%
+        self.assertTrue(ok)
+        self.assertFalse(bad)
+
+    def test_buy_stock_blocks_the_order_and_logs_it(self) -> None:
+        logged = {}
+
+        def capture(action, code, quantity, ref_price, result, extra=None):
+            logged.update({"code": code, "qty": quantity, "result": result, "extra": extra or {}})
+
+        with (
+            patch.object(trader, "_load_opening_tradability_payload",
+                         return_value=self._payload("688205", 159.36)),
+            patch.object(trader, "_market_today", return_value="2026-08-24"),
+            patch.object(trader, "_log_trade_api", side_effect=capture),
+            patch.object(trader, "_write_buy_diagnostic"),
+            patch.object(trader, "api_request") as api_mock,
+        ):
+            out = trader.buy_stock("688205", 400, ref_price=22.92)
+
+        api_mock.assert_not_called()
+        self.assertFalse(out["success"])
+        self.assertEqual(out["result_code"], "PRICE_SANITY")
+        self.assertEqual(logged["extra"]["final_outcome"], "price_sanity_rejected")
+
 if __name__ == "__main__":
     unittest.main()
