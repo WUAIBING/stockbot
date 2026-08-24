@@ -29,6 +29,14 @@ _output_base = os.path.expanduser('~/.workbuddy/a-share-analyst')
 OUTPUT_DIR = os.environ.get('MX_MONI_OUTPUT_DIR', _output_base)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+def _redact_api_key(value):
+    """Return diagnostic text without exposing the configured API key."""
+    text = str(value or '')
+    if MX_APIKEY:
+        text = text.replace(MX_APIKEY, '<redacted>')
+    return text
+
+
 def api_request(endpoint, payload):
     """发送 API 请求到妙想服务器"""
     url = f"{MX_API_URL}{endpoint}"
@@ -41,17 +49,24 @@ def api_request(endpoint, payload):
     try:
         result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=30)
         if result.returncode != 0:
-            print(f"[ERROR] curl failed: {result.stderr}")
+            print(f"[ERROR] curl failed: {_redact_api_key(result.stderr)}")
             return None
         # 尝试解析 JSON
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as e:
             print(f"[ERROR] JSON decode failed: {e}")
-            print(f"[DEBUG] raw output: {result.stdout[:200]}...")
+            print(f"[DEBUG] raw output: {_redact_api_key(result.stdout[:200])}...")
             return None
+    except subprocess.TimeoutExpired:
+        # TimeoutExpired includes the full command in its string form, including
+        # header values. Never interpolate the exception into diagnostics.
+        print("[ERROR] API request timed out after 30 seconds")
+        return None
     except Exception as e:
-        print(f"[ERROR] API request failed: {e}")
+        # The exception message may embed subprocess arguments. The type is
+        # sufficient for diagnosis and cannot contain the API key.
+        print(f"[ERROR] API request failed: {type(e).__name__}")
         return None
 
 def parse_query(query_text):

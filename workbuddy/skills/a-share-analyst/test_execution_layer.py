@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -23,6 +24,61 @@ import v10_auto_runner as auto_runner
 import v10_moni_trader as trader
 import workbuddy_local_challenger as challenger
 import workbuddy_local_review as challenger_review
+
+
+def _write_valid_decision_snapshot(root: Path, *, trade_date: str = "2026-07-14") -> tuple[dict, Path]:
+    producer_run_id = "decision-run-1"
+    run_slot = f"{trade_date}_145030_000001_1"
+    cutoff = f"{trade_date} 14:50:00"
+    profile_id = trader._ACTIVE_STRATEGY_PROFILE_ID
+    profile_hash = trader._ACTIVE_STRATEGY_PROFILE_HASH
+    csv_path = root / f"v10_scan_full.{run_slot}.csv"
+    meta_path = root / f"v10_scan_meta.{run_slot}.json"
+    pointer_path = root / "v10_decision_latest.json"
+    csv_path.write_text(
+        "code,tier,mode,strategy_profile_id,strategy_profile_hash,"
+        "decision_cutoff_at,decision_cutoff_ready,source_bar_end_at\n"
+        f"000001,1,V9_full,{profile_id},{profile_hash},{cutoff},True,{cutoff}\n",
+        encoding="utf-8-sig",
+    )
+    csv_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    protocol = {
+        "schema_version": 1,
+        "artifact_id": f"{trade_date}:decision:{producer_run_id}",
+        "producer_run_id": producer_run_id,
+        "started_at": f"{trade_date} 14:49:00.000000+08:00",
+        "published_at": f"{trade_date} 14:50:30.000000+08:00",
+        "market_timezone": "UTC+08",
+        "scan_csv_sha256": csv_hash,
+        "cutoff_not_ready_count": 0,
+        "run_time": f"{trade_date} 14:49:00",
+        "run_slot": run_slot,
+        "phase": "decision",
+        "trade_date": trade_date,
+        "decision_cutoff_at": cutoff,
+        "complete": True,
+        "requested_count": 1,
+        "refreshed_count": 1,
+        "strategy_profile_id": profile_id,
+        "strategy_profile_hash": profile_hash,
+        "stocks_with_signal": 1,
+        "signals_by_tier": {"T1": 1, "T2": 0, "T3": 0},
+    }
+    paths = {
+        "scan_csv": str(csv_path),
+        "scan_meta": str(meta_path),
+        "latest_scan_csv": str(root / "v10_scan_full.csv"),
+        "latest_scan_meta": str(root / "v10_scan_meta.json"),
+        "snapshot_scan_csv": str(csv_path),
+        "snapshot_scan_meta": str(meta_path),
+    }
+    meta_path.write_text(
+        json.dumps({**protocol, **paths, "stocks_scanned": 1}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    pointer = {**protocol, **paths}
+    pointer_path.write_text(json.dumps(pointer, ensure_ascii=False), encoding="utf-8")
+    return pointer, pointer_path
 
 
 class RunPhaseWatchTests(unittest.TestCase):
@@ -53,7 +109,11 @@ class RunPhaseWatchTests(unittest.TestCase):
     def test_buy_watch_retries_on_decision_not_ready(self) -> None:
         fixed_now = datetime(2026, 6, 25, 14, 50, 0)
         with (
-            patch.object(auto_runner, "run_phase_once", side_effect=[1, 0]) as run_once,
+            patch.object(
+                auto_runner,
+                "run_phase_once",
+                side_effect=[auto_runner.EXIT_DECISION_NOT_READY, 0],
+            ) as run_once,
             patch.object(auto_runner, "record_status") as record_status,
             patch.object(auto_runner.time, "sleep") as sleep_mock,
             patch.object(auto_runner, "datetime") as mock_datetime,
@@ -71,6 +131,107 @@ class RunPhaseWatchTests(unittest.TestCase):
         self.assertEqual(run_once.call_count, 2)
         record_status.assert_called_once()
         sleep_mock.assert_called_once()
+
+    def test_buy_watch_does_not_retry_runtime_or_timeout_failures(self) -> None:
+        fixed_now = datetime(2026, 6, 25, 14, 50, 0)
+        for exit_code in (auto_runner.EXIT_RUNTIME_ERROR, 124, auto_runner.EXIT_CONFIG_ERROR):
+            with self.subTest(exit_code=exit_code):
+                with (
+                    patch.object(auto_runner, "run_phase_once", return_value=exit_code) as run_once,
+                    patch.object(auto_runner, "record_status") as record_status,
+                    patch.object(auto_runner.time, "sleep") as sleep_mock,
+                    patch.object(auto_runner, "datetime") as mock_datetime,
+                ):
+                    mock_datetime.now.return_value = fixed_now
+                    code = auto_runner.run_phase_watch(
+                        "buy",
+                        run_meta={"task_name": "BuyWatch", "trigger_slot": "14:50", "run_id": "rid"},
+                        with_email=False,
+                        max_attempts=12,
+                        interval_seconds=30,
+                    )
+
+                self.assertEqual(code, exit_code)
+                run_once.assert_called_once()
+                record_status.assert_not_called()
+                sleep_mock.assert_not_called()
+
+    def test_buy_watch_records_one_terminal_failure_when_decision_never_arrives(self) -> None:
+        fixed_now = datetime(2026, 6, 25, 14, 50, 0)
+        with (
+            patch.object(auto_runner, "run_phase_once", return_value=auto_runner.EXIT_DECISION_NOT_READY),
+            patch.object(auto_runner, "record_status") as record_status,
+            patch.object(auto_runner.time, "sleep"),
+            patch.object(auto_runner, "datetime") as mock_datetime,
+        ):
+            mock_datetime.now.return_value = fixed_now
+            code = auto_runner.run_phase_watch(
+                "buy",
+                run_meta={"task_name": "BuyWatch", "trigger_slot": "14:50", "run_id": "rid"},
+                with_email=False,
+                max_attempts=2,
+                interval_seconds=30,
+            )
+
+        self.assertEqual(code, auto_runner.EXIT_DECISION_NOT_READY)
+        terminal_calls = [
+            item for item in record_status.call_args_list
+            if item.kwargs.get("status") == "failed"
+        ]
+        self.assertEqual(len(terminal_calls), 1)
+        self.assertEqual(terminal_calls[0].kwargs["step"], "watch_terminal")
+
+    def test_late_buy_watch_without_attempt_is_terminal_not_no_action(self) -> None:
+        fixed_now = datetime(2026, 6, 25, 14, 58, 0)
+        with (
+            patch.object(auto_runner, "run_phase_once") as run_once,
+            patch.object(auto_runner, "record_status") as record_status,
+            patch.object(auto_runner, "datetime") as mock_datetime,
+        ):
+            mock_datetime.now.return_value = fixed_now
+            code = auto_runner.run_phase_watch(
+                "buy",
+                run_meta={"task_name": "BuyWatch", "trigger_slot": "14:50", "run_id": "rid"},
+                with_email=False,
+                max_attempts=12,
+                interval_seconds=30,
+            )
+
+        self.assertEqual(code, auto_runner.EXIT_DECISION_NOT_READY)
+        run_once.assert_not_called()
+        record_status.assert_called_once()
+        self.assertEqual(record_status.call_args.kwargs["status"], "failed")
+
+    def test_buy_transient_exit_codes_have_nonfatal_semantics(self) -> None:
+        self.assertEqual(
+            auto_runner.classify_step_status("buy", "v10_moni_trader.py", auto_runner.EXIT_DECISION_NOT_READY),
+            "decision_not_ready",
+        )
+        self.assertEqual(
+            auto_runner.classify_step_status("buy", "v10_moni_trader.py", auto_runner.EXIT_STALE_DECISION),
+            "stale_decision",
+        )
+        self.assertEqual(
+            auto_runner.classify_step_status("buy", "v10_moni_trader.py", auto_runner.EXIT_CONFIG_ERROR),
+            "failed",
+        )
+
+    def test_decision_phase_publishes_running_marker_before_steps(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 49, 0, tzinfo=auto_runner.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pointer_file = Path(tmpdir) / "v10_decision_latest.json"
+            with (
+                patch.object(auto_runner, "DECISION_POINTER_FILE", pointer_file),
+                patch.object(auto_runner, "market_now", return_value=market_now),
+            ):
+                marker = auto_runner.publish_decision_running_marker(
+                    {"task_name": "Decision", "trigger_slot": "14:49", "run_id": "decision-run-1"}
+                )
+            persisted = json.loads(pointer_file.read_text(encoding="utf-8"))
+
+        self.assertFalse(marker["complete"])
+        self.assertEqual(marker["artifact_id"], "2026-07-14:decision:decision-run-1")
+        self.assertEqual(persisted, marker)
 
     def test_workbuddy_refresh_phase_includes_distill_refresh(self) -> None:
         steps = auto_runner.build_steps("workbuddy-refresh", with_email=False)
@@ -181,21 +342,254 @@ class TraderWindowTimezoneTests(unittest.TestCase):
 
         self.assertEqual(qty, 200)
 
-    def test_wait_for_today_decision_ready_uses_market_date(self) -> None:
+    def test_wait_for_today_decision_ready_uses_dedicated_valid_pointer(self) -> None:
         market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
-        payload = {
-            "status": "ok",
-            "finished_at": "2026-07-14 14:49:30",
-            "trigger_slot": "14:49",
-        }
-        with (
-            patch.object(trader, "_market_now", return_value=market_now),
-            patch.object(trader, "_read_json", return_value=payload),
-        ):
-            ready, message, latest = trader.wait_for_today_decision_ready(max_wait_seconds=0, poll_seconds=0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload, pointer_file = _write_valid_decision_snapshot(root)
+            status_file = root / "latest_decision_status.json"
+            with (
+                patch.object(trader, "DATA_DIR", root),
+                patch.object(trader, "DECISION_LATEST_FILE", str(pointer_file)),
+                patch.object(trader, "LATEST_DECISION_STATUS_FILE", str(status_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                ready, message, latest = trader.wait_for_today_decision_ready(
+                    max_wait_seconds=0,
+                    poll_seconds=0,
+                )
+
         self.assertTrue(ready)
         self.assertEqual(message, "")
         self.assertEqual(latest, payload)
+
+    def test_live_decision_snapshot_validates_pointer_meta_csv_and_hash(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload, _pointer_file = _write_valid_decision_snapshot(root)
+            with patch.object(trader, "DATA_DIR", root):
+                ok, message, context, exit_code = trader.validate_live_decision_snapshot(
+                    payload,
+                    now=market_now,
+                )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(exit_code, trader.EXIT_OK)
+        self.assertEqual(context["pointer"]["artifact_id"], payload["artifact_id"])
+        self.assertEqual(len(context["rows"]), 1)
+
+    def test_live_decision_snapshot_rejects_tampered_csv(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload, _pointer_file = _write_valid_decision_snapshot(root)
+            Path(payload["scan_csv"]).write_text("tampered\n", encoding="utf-8")
+            with patch.object(trader, "DATA_DIR", root):
+                ok, message, _context, exit_code = trader.validate_live_decision_snapshot(
+                    payload,
+                    now=market_now,
+                )
+
+        self.assertFalse(ok)
+        self.assertIn("SHA-256", message)
+        self.assertEqual(exit_code, trader.EXIT_RUNTIME_ERROR)
+
+    def test_decision_pointer_change_is_detected_before_order_side_effects(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            expected, pointer_file = _write_valid_decision_snapshot(root)
+            pointer_file.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "artifact_id": "2026-07-14:decision:new-run",
+                    "producer_run_id": "new-run",
+                    "phase": "decision",
+                    "trade_date": "2026-07-14",
+                    "complete": False,
+                    "decision_cutoff_at": "2026-07-14 14:50:00",
+                }),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(trader, "DECISION_LATEST_FILE", str(pointer_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                current, _message, exit_code = trader.validate_decision_pointer_still_current(
+                    expected,
+                    now=market_now,
+                )
+
+        self.assertFalse(current)
+        self.assertEqual(exit_code, trader.EXIT_DECISION_NOT_READY)
+
+    def test_live_decision_pointer_rejects_wrong_phase_cutoff_and_profile(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        base = {
+            "schema_version": 1,
+            "artifact_id": "2026-07-14:decision:decision-run-1",
+            "producer_run_id": "decision-run-1",
+            "phase": "decision",
+            "trade_date": "2026-07-14",
+            "complete": True,
+            "decision_cutoff_at": "2026-07-14 14:50:00",
+            "strategy_profile_id": trader._ACTIVE_STRATEGY_PROFILE_ID,
+            "strategy_profile_hash": trader._ACTIVE_STRATEGY_PROFILE_HASH,
+            "scan_csv_sha256": "a" * 64,
+            "published_at": "2026-07-14 14:50:30.000000+08:00",
+        }
+        mutations = (
+            {"phase": "prewarm"},
+            {"decision_cutoff_at": "2026-07-14 14:45:00"},
+            {"strategy_profile_id": "unknown-profile"},
+            {"strategy_profile_hash": "sha256:" + ("b" * 64)},
+            {"complete": "true"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                state, _message, exit_code = trader._classify_live_decision_pointer(
+                    {**base, **mutation},
+                    now=market_now,
+                )
+                self.assertEqual(state, "invalid")
+                self.assertEqual(exit_code, trader.EXIT_RUNTIME_ERROR)
+
+    def test_decision_wait_never_falls_back_to_generic_pointer(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "v10_scan_latest.json").write_text(
+                json.dumps({"phase": "decision", "complete": True}),
+                encoding="utf-8",
+            )
+            decision_file = root / "v10_decision_latest.json"
+            status_file = root / "latest_decision_status.json"
+            with (
+                patch.object(trader, "DECISION_LATEST_FILE", str(decision_file)),
+                patch.object(trader, "LATEST_DECISION_STATUS_FILE", str(status_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                ready, message, payload = trader.wait_for_today_decision_ready(
+                    max_wait_seconds=0,
+                    poll_seconds=0,
+                )
+
+        self.assertFalse(ready)
+        self.assertIn("尚未发布", message)
+        self.assertEqual(
+            payload[trader.DECISION_READINESS_EXIT_CODE_KEY],
+            trader.EXIT_DECISION_NOT_READY,
+        )
+
+    def test_decision_wait_ignores_failed_status_from_older_same_day_producer(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        marker = {
+            "schema_version": 1,
+            "artifact_id": "2026-07-14:decision:new-run",
+            "producer_run_id": "new-run",
+            "phase": "decision",
+            "trade_date": "2026-07-14",
+            "complete": False,
+            "decision_cutoff_at": "2026-07-14 14:50:00",
+        }
+        old_status = {
+            "run_id": "old-run",
+            "status": "failed",
+            "started_at": "2026-07-14 14:49:00",
+            "finished_at": "2026-07-14 14:49:30",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pointer_file = root / "v10_decision_latest.json"
+            status_file = root / "latest_decision_status.json"
+            pointer_file.write_text(json.dumps(marker), encoding="utf-8")
+            status_file.write_text(json.dumps(old_status), encoding="utf-8")
+            with (
+                patch.object(trader, "DECISION_LATEST_FILE", str(pointer_file)),
+                patch.object(trader, "LATEST_DECISION_STATUS_FILE", str(status_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                ready, _message, payload = trader.wait_for_today_decision_ready(
+                    max_wait_seconds=0,
+                    poll_seconds=0,
+                )
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            payload[trader.DECISION_READINESS_EXIT_CODE_KEY],
+            trader.EXIT_DECISION_NOT_READY,
+        )
+
+    def test_decision_pointer_previous_day_is_retryable_stale(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        state, _message, exit_code = trader._classify_live_decision_pointer(
+            {"trade_date": "2026-07-13"},
+            now=market_now,
+        )
+        self.assertEqual(state, "stale")
+        self.assertEqual(exit_code, trader.EXIT_STALE_SCAN)
+
+    def test_shared_phase_lock_does_not_reclaim_fresh_initializing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lock_file = root / "buy_shared.lock.json"
+            lock_file.write_bytes(b"")
+            with patch.object(trader, "DATA_DIR", root):
+                result = trader.acquire_shared_phase_lock(
+                    "buy_shared",
+                    owner="second",
+                    ttl_seconds=480,
+                )
+
+            still_exists = lock_file.exists()
+
+        self.assertFalse(result["acquired"])
+        self.assertTrue(result["initializing"])
+        self.assertTrue(still_exists)
+
+    def test_shared_phase_lock_reclaims_old_malformed_file_with_snapshot_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lock_file = root / "buy_shared.lock.json"
+            lock_file.write_bytes(b"")
+            old_time = trader.time.time() - 10
+            os.utime(lock_file, (old_time, old_time))
+            with patch.object(trader, "DATA_DIR", root):
+                result = trader.acquire_shared_phase_lock(
+                    "buy_shared",
+                    owner="replacement",
+                    ttl_seconds=480,
+                )
+                released = trader.release_shared_phase_lock(
+                    "buy_shared",
+                    owner="replacement",
+                )
+
+        self.assertTrue(result["acquired"])
+        self.assertTrue(released)
+
+    def test_buy_shared_lock_prevents_parallel_decision_consumption(self) -> None:
+        with (
+            patch.object(trader, "acquire_shared_phase_lock", return_value={"acquired": False, "owner": "other"}),
+            patch.object(trader, "_do_buy_core") as core_mock,
+        ):
+            code = trader.do_buy(dry_run=False)
+
+        self.assertEqual(code, trader.EXIT_NO_ACTION)
+        core_mock.assert_not_called()
+
+    def test_buy_shared_lock_is_released_after_core(self) -> None:
+        with (
+            patch.object(trader, "acquire_shared_phase_lock", return_value={"acquired": True}),
+            patch.object(trader, "_do_buy_core", return_value=trader.EXIT_OK) as core_mock,
+            patch.object(trader, "release_shared_phase_lock") as release_mock,
+        ):
+            code = trader.do_buy(dry_run=False)
+
+        self.assertEqual(code, trader.EXIT_OK)
+        core_mock.assert_called_once_with(dry_run=False)
+        release_mock.assert_called_once()
 
     def test_trader_main_checks_runtime_write_identity_before_running(self) -> None:
         with (
@@ -253,6 +647,483 @@ class TraderWindowTimezoneTests(unittest.TestCase):
         self.assertTrue(failure_calls)
 
 
+class AccountBatchIntegrityTests(unittest.TestCase):
+    def test_three_live_positions_form_valid_account_batch(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        positions = [
+            {"code": "000001", "value": 40000.25, "profit": 300.0},
+            {"code": "000002", "value": 35000.25, "profit": -100.0},
+            {"code": "600000", "value": 32170.5, "profit": 25.5},
+        ]
+
+        result = trader._validate_and_parse_account_batch(
+            balance,
+            positions,
+            {
+                "total_assets": 1.0,
+                "avail_balance": 1.0,
+                "total_pos_value": 1.0,
+                "position_count": 1,
+                "floating_pnl": 1.0,
+            },
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(
+            result["account"],
+            {
+                "total_assets": 200000.0,
+                "avail_balance": 92829.0,
+                "total_pos_value": 107171.0,
+                "position_count": 3,
+                "floating_pnl": 225.5,
+            },
+        )
+        self.assertTrue(result["status"]["live"])
+        self.assertEqual(result["status"]["source"], "live")
+        self.assertTrue(result["status"]["integrity"])
+
+    def test_true_empty_account_does_not_inherit_previous_floating_pnl(self) -> None:
+        previous_account = {
+            "total_assets": 180000.0,
+            "avail_balance": 72829.0,
+            "total_pos_value": 107171.0,
+            "position_count": 3,
+            "floating_pnl": 2345.67,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            summary_file.write_text(json.dumps({"account": previous_account}), encoding="utf-8")
+            with patch.object(trader, "SUMMARY_FILE", str(summary_file)):
+                snapshot = trader._build_account_snapshot(
+                    balance={
+                        "total_assets": 250000.0,
+                        "avail_balance": 250000.0,
+                        "total_pos_value": 0.0,
+                    },
+                    positions=[],
+                )
+
+        self.assertEqual(snapshot["total_assets"], 250000.0)
+        self.assertEqual(snapshot["avail_balance"], 250000.0)
+        self.assertEqual(snapshot["total_pos_value"], 0.0)
+        self.assertEqual(snapshot["position_count"], 0)
+        self.assertEqual(snapshot["floating_pnl"], 0.0)
+        self.assertTrue(snapshot["live"])
+        self.assertEqual(snapshot["source"], "live")
+        self.assertTrue(snapshot["integrity"])
+
+    def test_nonzero_balance_with_empty_positions_falls_back_as_one_batch(self) -> None:
+        previous_account = {
+            "total_assets": 180000.0,
+            "avail_balance": 72829.0,
+            "total_pos_value": 107171.0,
+            "position_count": 3,
+            "floating_pnl": 2345.67,
+        }
+        positions = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            nav_file = Path(tmpdir) / "nav.csv"
+            summary_file.write_text(json.dumps({"account": previous_account}), encoding="utf-8")
+            with (
+                patch.object(trader, "SUMMARY_FILE", str(summary_file)),
+                patch.object(trader, "NAV_FILE", str(nav_file)),
+                patch.object(trader, "load_track_record", return_value=[]) as load_records_mock,
+                patch.object(trader, "refresh_model_state", return_value={}),
+                patch.object(trader, "load_backtest_targets", return_value={}),
+                patch.object(trader, "get_scan_status", return_value={}),
+                patch.object(trader, "_mx_api_flap_debug_emit"),
+            ):
+                summary = trader.write_account_artifacts(
+                    "integrity_test",
+                    balance={
+                        "total_assets": 200000.0,
+                        "avail_balance": 199999.5,
+                        "total_pos_value": 0.5,
+                    },
+                    positions=positions,
+                    pending_items=[],
+                )
+
+            nav_exists = nav_file.exists()
+
+        self.assertEqual(summary["account"], previous_account)
+        self.assertFalse(summary["account_status"]["live"])
+        self.assertEqual(summary["account_status"]["source"], "fallback_summary")
+        self.assertEqual(
+            summary["account_status"]["reason"],
+            "positions_empty_with_nonzero_total_pos_value",
+        )
+        self.assertFalse(summary["account_status"]["integrity"])
+        self.assertFalse(nav_exists)
+        load_records_mock.assert_called_once()
+        self.assertIs(load_records_mock.call_args.kwargs["positions"], positions)
+
+    def test_position_value_mismatch_falls_back_as_one_batch(self) -> None:
+        previous_account = {
+            "total_assets": 180000.0,
+            "avail_balance": 72829.0,
+            "total_pos_value": 107171.0,
+            "position_count": 3,
+            "floating_pnl": 2345.67,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            summary_file.write_text(json.dumps({"account": previous_account}), encoding="utf-8")
+            with patch.object(trader, "SUMMARY_FILE", str(summary_file)):
+                snapshot = trader._build_account_snapshot(
+                    balance={
+                        "total_assets": 200000.0,
+                        "avail_balance": 100000.0,
+                        "total_pos_value": 100000.0,
+                    },
+                    positions=[
+                        {"code": "000001", "value": 30000.0, "profit": 500.0},
+                        {"code": "000002", "value": 30000.0, "profit": 600.0},
+                    ],
+                )
+
+        for field, value in previous_account.items():
+            self.assertEqual(snapshot[field], value)
+        self.assertFalse(snapshot["live"])
+        self.assertEqual(snapshot["source"], "fallback_summary")
+        self.assertEqual(snapshot["reason"], "position_value_mismatch")
+        self.assertFalse(snapshot["integrity"])
+
+    def test_non_finite_account_values_fail_integrity_validation(self) -> None:
+        balance_result = trader._validate_and_parse_account_batch(
+            {
+                "total_assets": float("nan"),
+                "avail_balance": 100000.0,
+                "total_pos_value": 50000.0,
+            },
+            [{"code": "000001", "value": 50000.0, "profit": 1000.0}],
+            None,
+        )
+        position_result = trader._validate_and_parse_account_batch(
+            {
+                "total_assets": 150000.0,
+                "avail_balance": 100000.0,
+                "total_pos_value": 50000.0,
+            },
+            [{"code": "000001", "value": float("inf"), "profit": 1000.0}],
+            None,
+        )
+
+        self.assertFalse(balance_result["valid"])
+        self.assertEqual(balance_result["status"]["reason"], "balance_non_finite_values")
+        self.assertFalse(position_result["valid"])
+        self.assertEqual(position_result["status"]["reason"], "positions_non_finite_values")
+
+    def test_invalid_batch_without_fallback_is_explicitly_unavailable(self) -> None:
+        result = trader._validate_and_parse_account_batch(None, [], None)
+
+        self.assertEqual(
+            result["account"],
+            {
+                "total_assets": 0.0,
+                "avail_balance": 0.0,
+                "total_pos_value": 0.0,
+                "position_count": 0,
+                "floating_pnl": 0.0,
+            },
+        )
+        self.assertFalse(result["status"]["live"])
+        self.assertEqual(result["status"]["source"], "unavailable")
+        self.assertEqual(result["status"]["reason"], "balance_missing")
+        self.assertFalse(result["status"]["integrity"])
+
+    def test_collect_reconcile_context_reuses_single_positions_read(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 150000.0,
+            "total_pos_value": 50000.0,
+        }
+        positions = [{"code": "000001", "value": 50000.0, "profit": 1000.0}]
+        records = [{"code": "000001", "status": "holding"}]
+        reconcile_summary = {
+            "pending": {
+                "counts": {},
+                "active_buy_codes": [],
+                "active_sell_codes": [],
+            }
+        }
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_midday_review_debug_emit"),
+            patch.object(trader, "get_balance", return_value=balance),
+            patch.object(trader, "get_positions", return_value=positions) as get_positions_mock,
+            patch.object(trader, "load_track_record", return_value=records) as load_records_mock,
+            patch.object(trader, "get_orders", return_value=[]),
+            patch.object(trader, "refresh_pending_orders", return_value=[]) as pending_mock,
+            patch.object(trader, "sync_track_record", return_value=(records, False)) as sync_mock,
+            patch.object(
+                trader,
+                "full_reconcile_positions",
+                return_value=(records, False, reconcile_summary),
+            ) as reconcile_mock,
+            patch.object(trader, "_build_account_snapshot", return_value={"live": True}),
+        ):
+            context = trader._collect_reconcile_context()
+
+        self.assertIs(context["positions"], positions)
+        get_positions_mock.assert_called_once_with()
+        load_records_mock.assert_called_once()
+        self.assertIs(load_records_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(pending_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(sync_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(reconcile_mock.call_args.kwargs["positions"], positions)
+
+    def test_collect_reconcile_context_retries_whole_batch_and_uses_second_positions(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        positions = [
+            {"code": "000001", "value": 40000.25, "profit": 300.0},
+            {"code": "000002", "value": 35000.25, "profit": -100.0},
+            {"code": "600000", "value": 32170.5, "profit": 25.5},
+        ]
+        records = [{"code": row["code"], "status": "holding"} for row in positions]
+        reconcile_summary = {
+            "pending": {
+                "counts": {},
+                "active_buy_codes": [],
+                "active_sell_codes": [],
+            }
+        }
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_midday_review_debug_emit"),
+            patch.object(trader, "get_balance", side_effect=[balance, balance]) as get_balance_mock,
+            patch.object(trader, "get_positions", side_effect=[[], positions]) as get_positions_mock,
+            patch.object(trader, "load_track_record", return_value=records) as load_records_mock,
+            patch.object(trader, "get_orders", return_value=[]),
+            patch.object(trader, "refresh_pending_orders", return_value=[]),
+            patch.object(trader, "sync_track_record", return_value=(records, False)),
+            patch.object(
+                trader,
+                "full_reconcile_positions",
+                return_value=(records, False, reconcile_summary),
+            ),
+            patch.object(trader, "_build_account_snapshot", return_value={"live": True}),
+        ):
+            context = trader._collect_reconcile_context()
+
+        self.assertIs(context["positions"], positions)
+        self.assertEqual(get_balance_mock.call_count, 2)
+        self.assertEqual(get_positions_mock.call_count, 2)
+        load_records_mock.assert_called_once()
+        self.assertIs(load_records_mock.call_args.kwargs["positions"], positions)
+
+    def test_refresh_live_artifact_state_retries_whole_account_batch(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 150000.0,
+            "total_pos_value": 50000.0,
+        }
+        positions = [{"code": "000001", "value": 50000.0, "profit": 1000.0}]
+        records = [{"code": "000001", "status": "holding"}]
+        reconcile_summary = {"pending": {}}
+        with (
+            patch.object(trader, "get_balance", side_effect=[balance, balance]),
+            patch.object(trader, "get_positions", side_effect=[[], positions]),
+            patch.object(trader, "get_orders", return_value=[]),
+            patch.object(trader, "refresh_pending_orders", return_value=[]),
+            patch.object(trader, "sync_track_record", return_value=(records, False)) as sync_mock,
+            patch.object(
+                trader,
+                "full_reconcile_positions",
+                return_value=(records, False, reconcile_summary),
+            ) as reconcile_mock,
+        ):
+            state = trader._refresh_live_artifact_state(records)
+
+        self.assertIs(state["positions"], positions)
+        self.assertIs(sync_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(reconcile_mock.call_args.kwargs["positions"], positions)
+
+    def test_refresh_live_artifact_state_fails_closed_after_two_invalid_batches(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        records = [{"code": "000001", "status": "holding"}]
+        pending_items = [{"code": "000001", "action": "sell", "status": "submitted"}]
+        with (
+            patch.object(trader, "get_balance", side_effect=[balance, balance]) as get_balance_mock,
+            patch.object(trader, "get_positions", side_effect=[[], []]) as get_positions_mock,
+            patch.object(trader, "load_pending_orders", return_value=pending_items),
+            patch.object(trader, "get_orders") as get_orders_mock,
+            patch.object(trader, "refresh_pending_orders") as refresh_pending_mock,
+            patch.object(trader, "sync_track_record") as sync_mock,
+            patch.object(trader, "full_reconcile_positions") as reconcile_mock,
+            patch.object(trader, "save_track_record") as save_mock,
+        ):
+            state = trader._refresh_live_artifact_state(records)
+
+        self.assertFalse(state["account_batch_valid"])
+        self.assertIs(state["records"], records)
+        self.assertIs(state["pending_items"], pending_items)
+        self.assertTrue(state["reconcile_summary"]["skipped"])
+        self.assertEqual(get_balance_mock.call_count, 2)
+        self.assertEqual(get_positions_mock.call_count, 2)
+        get_orders_mock.assert_not_called()
+        refresh_pending_mock.assert_not_called()
+        sync_mock.assert_not_called()
+        reconcile_mock.assert_not_called()
+        save_mock.assert_not_called()
+
+    def test_collect_reconcile_context_fails_closed_after_two_invalid_batches(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        pending_items = [{"code": "000001", "action": "sell", "status": "submitted"}]
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_midday_review_debug_emit"),
+            patch.object(trader, "get_balance", side_effect=[balance, balance]),
+            patch.object(trader, "get_positions", side_effect=[[], []]),
+            patch.object(trader, "load_pending_orders", return_value=pending_items),
+            patch.object(trader, "load_track_record") as load_records_mock,
+            patch.object(trader, "get_orders") as get_orders_mock,
+            patch.object(trader, "refresh_pending_orders") as refresh_pending_mock,
+            patch.object(trader, "sync_track_record") as sync_mock,
+            patch.object(trader, "full_reconcile_positions") as reconcile_mock,
+            patch.object(trader, "save_track_record") as save_mock,
+            patch.object(
+                trader,
+                "_build_account_snapshot",
+                return_value={"live": False, "source": "fallback_summary"},
+            ),
+        ):
+            context = trader._collect_reconcile_context()
+
+        self.assertFalse(context["account_batch_valid"])
+        self.assertEqual(context["records"], [])
+        self.assertIs(context["pending_summary"], context["reconcile_summary"]["pending"])
+        load_records_mock.assert_not_called()
+        get_orders_mock.assert_not_called()
+        refresh_pending_mock.assert_not_called()
+        sync_mock.assert_not_called()
+        reconcile_mock.assert_not_called()
+        save_mock.assert_not_called()
+
+    def test_account_integrity_failure_summary_preserves_last_good_performance(self) -> None:
+        previous_summary = {
+            "generated_at": "2026-08-17 15:10:00",
+            "tag": "report",
+            "account": {
+                "total_assets": 200000.0,
+                "avail_balance": 92829.0,
+                "total_pos_value": 107171.0,
+                "position_count": 3,
+                "floating_pnl": 225.5,
+            },
+            "performance": {"holding_count": 3, "closed_count": 8},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            summary_file.write_text(json.dumps(previous_summary), encoding="utf-8")
+            with patch.object(trader, "SUMMARY_FILE", str(summary_file)):
+                summary = trader._write_account_integrity_failure_summary(
+                    "report",
+                    balance={
+                        "total_assets": 200000.0,
+                        "avail_balance": 92829.0,
+                        "total_pos_value": 107171.0,
+                    },
+                    positions=[],
+                    reconcile_summary={"skipped": True},
+                    pending_items=[{"code": "000001", "action": "sell", "status": "submitted"}],
+                    execution_result={"action": "sell", "status": "account_refresh_failed"},
+                )
+
+        self.assertEqual(summary["performance"], previous_summary["performance"])
+        self.assertEqual(summary["account"], previous_summary["account"])
+        self.assertFalse(summary["account_status"]["live"])
+        self.assertEqual(summary["account_status"]["source"], "fallback_summary")
+        self.assertEqual(summary["full_reconcile"], {"skipped": True})
+        self.assertEqual(summary["pending_orders"]["counts"]["submitted"], 1)
+        self.assertEqual(summary["latest_execution_result"]["status"], "account_refresh_failed")
+
+    def test_live_state_artifact_writer_uses_safe_summary_for_invalid_batch(self) -> None:
+        live_state = {
+            "balance": {"total_assets": 200000.0, "avail_balance": 92829.0, "total_pos_value": 107171.0},
+            "positions": [],
+            "pending_items": [{"code": "000001", "action": "sell", "status": "submitted"}],
+            "records": [{"code": "000001", "status": "holding"}],
+            "reconcile_summary": {"skipped": True},
+            "account_batch_valid": False,
+        }
+        execution_result = {"action": "sell", "status": "account_refresh_failed"}
+        with (
+            patch.object(trader, "_write_account_integrity_failure_summary") as failure_summary_mock,
+            patch.object(trader, "write_account_artifacts") as artifacts_mock,
+        ):
+            valid = trader._write_live_state_account_artifacts(
+                "sell",
+                live_state,
+                execution_result=execution_result,
+            )
+
+        self.assertFalse(valid)
+        failure_summary_mock.assert_called_once_with(
+            "sell",
+            balance=live_state["balance"],
+            positions=live_state["positions"],
+            reconcile_summary=live_state["reconcile_summary"],
+            pending_items=live_state["pending_items"],
+            execution_result=execution_result,
+        )
+        artifacts_mock.assert_not_called()
+
+    def test_close_node_returns_runtime_error_before_learning_on_invalid_account_batch(self) -> None:
+        context = {
+            "balance": {"total_assets": 200000.0, "avail_balance": 92829.0, "total_pos_value": 107171.0},
+            "positions": [],
+            "orders": [],
+            "records": [],
+            "reconcile_summary": {"skipped": True},
+            "account_batch_valid": False,
+            "account_batch_attempts": 2,
+        }
+        fallback_summary = {
+            "account": {"position_count": 3},
+            "account_status": {
+                "live": False,
+                "source": "fallback_summary",
+                "reason": "positions_empty_with_nonzero_total_pos_value",
+            },
+        }
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_collect_reconcile_context", return_value=context),
+            patch.object(
+                trader,
+                "_write_account_integrity_failure_summary",
+                return_value=fallback_summary,
+            ) as failure_summary_mock,
+            patch.object(trader, "write_account_artifacts") as artifacts_mock,
+            patch.object(trader, "_build_daily_evolution_bundle") as evolution_mock,
+        ):
+            code = trader.do_close_node()
+
+        self.assertEqual(code, trader.EXIT_RUNTIME_ERROR)
+        failure_summary_mock.assert_called_once()
+        artifacts_mock.assert_not_called()
+        evolution_mock.assert_not_called()
+
+
 class TradingDayControllerTests(unittest.TestCase):
     def test_should_skip_auxiliary_task_when_next_critical_slot_too_close(self) -> None:
         trade_date = datetime(2026, 7, 14).date()
@@ -287,11 +1158,163 @@ class TradingDayControllerTests(unittest.TestCase):
             patch.object(day_controller, "target_datetime", return_value=fixed_now),
             patch.object(day_controller, "market_now", return_value=fixed_now),
             patch.object(day_controller, "should_skip_auxiliary_task", return_value=(False, "")),
-            patch.object(day_controller, "run_task", side_effect=[1, 0]),
+            patch.object(day_controller, "run_task", return_value=1),
+            patch.object(day_controller, "start_async_task", return_value=None) as start_async_mock,
+            patch.object(day_controller, "collect_finished_async_tasks", return_value=([], [])),
+            patch.object(day_controller, "finish_async_tasks", return_value=[]),
         ):
             code = day_controller.main()
 
         self.assertEqual(code, 0)
+        start_async_mock.assert_called_once()
+
+    def test_main_starts_decision_async_before_running_buy_watch(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 14, 50, 0, tzinfo=day_controller.MARKET_TZ)
+        specs = [
+            task_register.TaskSpec("Decision", "14:49", "decision"),
+            task_register.TaskSpec("BuyWatch", "14:50", "buy-watch", max_attempts=12, interval_seconds=30),
+        ]
+        events = []
+
+        def fake_start(spec, **_kwargs):
+            events.append(f"start:{spec.suffix}")
+            return None
+
+        def fake_run(spec, **_kwargs):
+            events.append(f"run:{spec.suffix}")
+            return 0
+
+        with (
+            patch("sys.argv", ["github_actions_trade_day.py", "--trade-date", "2026-07-14"]),
+            patch.object(day_controller, "is_trading_day", return_value=True),
+            patch.object(day_controller, "ensure_runtime_env", return_value={}),
+            patch.object(day_controller, "iter_selected_specs", return_value=specs),
+            patch.object(day_controller, "target_datetime", return_value=fixed_now),
+            patch.object(day_controller, "market_now", return_value=fixed_now),
+            patch.object(day_controller, "start_async_task", side_effect=fake_start),
+            patch.object(day_controller, "run_task", side_effect=fake_run),
+            patch.object(day_controller, "collect_finished_async_tasks", return_value=([], [])),
+            patch.object(day_controller, "finish_async_tasks", return_value=[]),
+        ):
+            code = day_controller.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["start:Decision", "run:BuyWatch"])
+
+    def test_main_treats_no_signal_as_schedule_nonfatal(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 14, 51, 0, tzinfo=day_controller.MARKET_TZ)
+        specs = [task_register.TaskSpec("BuyWatch", "14:50", "buy-watch")]
+        with (
+            patch("sys.argv", ["github_actions_trade_day.py", "--trade-date", "2026-07-14"]),
+            patch.object(day_controller, "is_trading_day", return_value=True),
+            patch.object(day_controller, "ensure_runtime_env", return_value={}),
+            patch.object(day_controller, "iter_selected_specs", return_value=specs),
+            patch.object(day_controller, "target_datetime", return_value=fixed_now),
+            patch.object(day_controller, "market_now", return_value=fixed_now),
+            patch.object(day_controller, "run_task", return_value=10),
+            patch.object(day_controller, "collect_finished_async_tasks", return_value=([], [])),
+            patch.object(day_controller, "finish_async_tasks", return_value=[]),
+        ):
+            code = day_controller.main()
+
+        self.assertEqual(code, 0)
+
+    def test_start_async_decision_publishes_parent_marker_before_popen(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 14, 49, 0, tzinfo=day_controller.MARKET_TZ)
+        observed = {}
+
+        class FakeProcess:
+            pid = 123
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+            def start(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+
+            def fake_popen(*_args, **_kwargs):
+                pointer_file = data_dir / "v10_decision_latest.json"
+                observed["marker"] = json.loads(pointer_file.read_text(encoding="utf-8"))
+                return FakeProcess()
+
+            with (
+                patch.object(day_controller, "market_now", return_value=fixed_now),
+                patch.object(day_controller.subprocess, "Popen", side_effect=fake_popen),
+                patch.object(day_controller.threading, "Thread", FakeThread),
+            ):
+                task = day_controller.start_async_task(
+                    task_register.TaskSpec("Decision", "14:49", "decision"),
+                    env={"TLFZ_WORKBUDDY_DATA_DIR": str(data_dir)},
+                    run_prefix="day-run-1",
+                    dry_run=False,
+                )
+
+        self.assertIsNotNone(task)
+        self.assertFalse(observed["marker"]["complete"])
+        self.assertEqual(
+            observed["marker"]["artifact_id"],
+            "2026-07-14:decision:day-run-1-decision",
+        )
+
+    def test_async_watchdog_enforces_timeout_while_main_thread_is_blocked(self) -> None:
+        class FakeProcess:
+            def wait(self, timeout=None):
+                raise day_controller.subprocess.TimeoutExpired("decision", timeout)
+
+        task = day_controller.AsyncTask(
+            spec=task_register.TaskSpec("Decision", "14:49", "decision"),
+            process=FakeProcess(),
+            started_monotonic=0.0,
+            timeout_seconds=360,
+        )
+        with patch.object(day_controller, "_terminate_async_process_tree") as terminate_mock:
+            day_controller._async_task_watchdog(task)
+
+        self.assertTrue(task.timed_out)
+        terminate_mock.assert_called_once_with(task)
+
+    def test_collect_finished_async_task_reaps_zero_exit_code(self) -> None:
+        process = type("FakeProcess", (), {"poll": lambda self: 0})()
+        task = day_controller.AsyncTask(
+            spec=task_register.TaskSpec("Decision", "14:49", "decision"),
+            process=process,
+            started_monotonic=0.0,
+            timeout_seconds=360,
+        )
+        with patch.object(day_controller.time, "monotonic", return_value=1.0):
+            remaining, results = day_controller.collect_finished_async_tasks([task])
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(results, [("Decision", 0)])
+
+    def test_collect_finished_async_task_terminates_at_absolute_timeout(self) -> None:
+        process = type("FakeProcess", (), {"poll": lambda self: None})()
+        task = day_controller.AsyncTask(
+            spec=task_register.TaskSpec("Decision", "14:49", "decision"),
+            process=process,
+            started_monotonic=10.0,
+            timeout_seconds=360,
+        )
+        with (
+            patch.object(day_controller.time, "monotonic", return_value=371.0),
+            patch.object(day_controller, "_terminate_async_process_tree") as terminate_mock,
+        ):
+            remaining, results = day_controller.collect_finished_async_tasks([task])
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(results, [("Decision", 124)])
+        terminate_mock.assert_called_once_with(task)
 
 
 class ChallengerOwnershipGuardTests(unittest.TestCase):
@@ -1331,7 +2354,11 @@ class AddPositionAggressiveTests(unittest.TestCase):
         with (
             patch.object(trader, "ensure_trade_window", return_value=True),
             patch.object(trader, "load_track_record", return_value=records),
-            patch.object(trader, "get_balance", return_value={"avail_balance": 50000}),
+            patch.object(
+                trader,
+                "get_balance",
+                return_value={"total_assets": 60000, "avail_balance": 50000, "total_pos_value": 10000},
+            ),
             patch.object(trader, "get_positions", return_value=positions),
             patch.object(trader, "get_orders", return_value=[]),
             patch.object(trader, "refresh_pending_orders", return_value=[]),
@@ -3226,6 +4253,134 @@ class VerifiedMxFillLedgerTests(unittest.TestCase):
         self.assertAlmostEqual(float(record["sell_price"]), 43.38, places=2)
         self.assertAlmostEqual(float(record["pnl"]), round((43.38 - expected_entry) * 4100, 2), places=2)
         self.assertNotEqual(float(record["entry_price"]), 14.39)
+
+    def test_verified_mx_unfilled_order_is_excluded_during_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            trade_log_file = tmp / "trades.jsonl"
+            verified_fills_file = tmp / "verified_fills.json"
+            events = [
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B-CANCELLED", "quantity": 16300, "ref_price": 14.39, "logged_at": "2026-08-10 17:54:28"},
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B-FILLED", "quantity": 4100, "ref_price": 14.39, "logged_at": "2026-08-10 19:30:40"},
+                {"event_type": "trade_result", "ok": True, "action": "sell", "code": "002487", "order_id": "S1", "quantity": 4100, "ref_price": 43.38, "logged_at": "2026-08-13 10:45:38"},
+            ]
+            trade_log_file.write_text(
+                "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in events),
+                encoding="utf-8",
+            )
+            verified_fills_file.write_text(json.dumps({
+                "version": 1,
+                "fills": {
+                    "B-CANCELLED": {"order_id": "B-CANCELLED", "code": "002487", "action": "buy", "trade_price": 0, "trade_count": 0, "fill_state": "not_filled"},
+                    "B-FILLED": {"order_id": "B-FILLED", "code": "002487", "action": "buy", "trade_price": 42.1, "trade_count": 4100, "trade_date": "2026-08-10", "trade_time": "19:30:40"},
+                    "S1": {"order_id": "S1", "code": "002487", "action": "sell", "trade_price": 43.4, "trade_count": 4100, "trade_date": "2026-08-13", "trade_time": "10:45:38"},
+                },
+            }, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                patch.object(trader, "TRADE_API_LOG_FILE", str(trade_log_file)),
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", str(verified_fills_file)),
+            ):
+                closed, _open = trader._build_runtime_trade_records(decision_reference={})
+
+        self.assertEqual(len(closed), 1)
+        record = closed[0]
+        self.assertEqual(int(record["quantity"]), 4100)
+        self.assertAlmostEqual(float(record["entry_price"]), 42.1, places=4)
+        self.assertAlmostEqual(float(record["sell_price"]), 43.4, places=4)
+        self.assertAlmostEqual(float(record["pnl"]), 5330.0, places=2)
+        self.assertAlmostEqual(float(record["pnl_pct"]), 3.09, places=2)
+
+    def test_repair_closed_episode_records_unfilled_buy_and_matches_rebuild(self) -> None:
+        source_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-CANCELLED|B-FILLED",
+            "sell_order_id": "S1",
+        }
+        rebuilt_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-FILLED",
+            "sell_order_id": "S1",
+            "entry_price": 42.1,
+            "sell_price": 43.4,
+            "quantity": 4100,
+            "pnl": 5330.0,
+            "pnl_pct": 3.09,
+        }
+        buy_orders = [
+            {
+                "id": "B-CANCELLED",
+                "code": "002487",
+                "direction": 1,
+                "status": 5,
+                "trade_count": 0,
+                "actual_trade_price": 0,
+            },
+            {
+                "id": "B-FILLED",
+                "code": "002487",
+                "direction": 1,
+                "status": 4,
+                "trade_count": 4100,
+                "actual_trade_price": 42.1,
+            },
+        ]
+        sell_orders = [{
+            "id": "S1",
+            "code": "002487",
+            "direction": 2,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 43.4,
+        }]
+        writes = []
+
+        def capture_write(path, payload):
+            writes.append((path, payload))
+
+        def repair_orders(direction):
+            orders = buy_orders if direction == 1 else sell_orders
+            return orders, {"has_snapshot": True, "live_error": "", "snapshot_age_seconds": 60}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            verified_fills_file = str(tmp / "verified_fills.json")
+            with (
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", verified_fills_file),
+                patch.object(trader, "MX_FILL_REPAIR_FILE", str(tmp / "repair.json")),
+                patch.object(trader, "TRADE_EPISODE_HISTORY_FILE", str(tmp / "episodes.json")),
+                patch.object(trader, "_get_repair_orders_from_mx", side_effect=repair_orders),
+                patch.object(trader, "load_track_record", side_effect=[[source_record], [rebuilt_record]]),
+                patch.object(trader, "_read_json", return_value={"version": 1, "fills": {}}),
+                patch.object(trader, "_write_json_atomic", side_effect=capture_write),
+                patch.object(trader, "_build_trade_episode_history", return_value=[]),
+                patch.object(trader, "_summarize_trade_episode_history", return_value={}),
+                patch.object(trader, "get_balance", return_value={}),
+                patch.object(trader, "get_positions", return_value=[]),
+                patch.object(trader, "get_orders", return_value=[]),
+                patch.object(trader, "refresh_pending_orders", return_value=[]),
+                patch.object(trader, "write_account_artifacts", return_value={"generated_at": "2026-08-13 11:00:00"}),
+            ):
+                report = trader.repair_closed_episode_from_mx_orders(
+                    "002487",
+                    buy_order_ids=["B-CANCELLED", "B-FILLED"],
+                    sell_order_id="S1",
+                )
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["corrected_record"]["quantity"], 4100)
+        self.assertEqual([fill["order_id"] for fill in report["verified_buy_fills"]], ["B-FILLED"])
+        self.assertEqual(len(report["verified_unfilled_buy_orders"]), 1)
+        unfilled_buy = report["verified_unfilled_buy_orders"][0]
+        self.assertEqual(unfilled_buy["order_id"], "B-CANCELLED")
+        self.assertEqual(unfilled_buy["trade_count"], 0)
+        self.assertEqual(unfilled_buy["fill_state"], "not_filled")
+        persisted_fills = next(payload["fills"] for path, payload in writes if path == verified_fills_file)
+        self.assertEqual(persisted_fills["B-CANCELLED"]["fill_state"], "not_filled")
+        self.assertIn("B-FILLED", persisted_fills)
+        self.assertIn("S1", persisted_fills)
 
 
 if __name__ == "__main__":

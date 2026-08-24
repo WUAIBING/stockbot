@@ -15,17 +15,22 @@ import io
 import os
 import time
 import json
+import errno
+import uuid
+import ctypes
+import hashlib
 import argparse
 import urllib.request
 import warnings
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time as datetime_time, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 from pytdx.hq import TdxHq_API
 
 from package_paths import CSI1000_SKILLS_DIR, DATA_DIR
+from strategy_profile import classify_signal as classify_profile_signal, load_strategy_profile, profile_fingerprint
 
 warnings.filterwarnings("ignore")
 
@@ -37,6 +42,291 @@ if sys.platform == "win32":
 CONS_FILE = CSI1000_SKILLS_DIR / "000852cons.xls"
 OUTPUT_DIR = DATA_DIR
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+WALK_FORWARD_SNAPSHOT_FILE = OUTPUT_DIR / "v10_walk_forward_snapshots.csv"
+
+MARKET_TZ = timezone(timedelta(hours=8), name="UTC+08")
+MARKET_TIMEZONE = "UTC+08"
+SCANNER_ARTIFACT_SCHEMA_VERSION = 1
+DECISION_LOCK_STALE_SECONDS = 15 * 60
+DECISION_MAX_WAIT_SECONDS = 3 * 60
+
+
+def _market_now():
+    return datetime.now(MARKET_TZ)
+
+
+def _market_timestamp(value=None):
+    current = _market_now() if value is None else value
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=MARKET_TZ)
+    else:
+        current = current.astimezone(MARKET_TZ)
+    return current.isoformat(sep=" ", timespec="microseconds")
+
+
+def _as_market_datetime(value):
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=MARKET_TZ)
+    return parsed.astimezone(MARKET_TZ)
+
+
+def _decision_cutoff_for(trade_date):
+    return datetime.combine(trade_date, datetime_time(14, 50), tzinfo=MARKET_TZ)
+
+
+def _new_run_slot():
+    market_now = _market_now()
+    return (
+        f"{market_now:%Y-%m-%d_%H%M%S_%f}_"
+        f"{os.getpid()}_{time.time_ns()}"
+    )
+
+
+def _protocol_identity(*, trade_date, phase, producer_run_id=None, run_slot=None):
+    resolved_run_slot = str(run_slot or _new_run_slot())
+    resolved_producer_run_id = str(producer_run_id or "").strip() or resolved_run_slot
+    artifact_id = f"{trade_date}:{phase}:{resolved_producer_run_id}"
+    return resolved_run_slot, resolved_producer_run_id, artifact_id
+
+
+def _decision_protocol_context(*, run_time, producer_run_id=None):
+    run_datetime = _as_market_datetime(run_time)
+    trade_date = run_datetime.date().isoformat()
+    run_slot, resolved_producer_run_id, artifact_id = _protocol_identity(
+        trade_date=trade_date,
+        phase="decision",
+        producer_run_id=producer_run_id,
+    )
+    return {
+        "trade_date": trade_date,
+        "decision_cutoff_at": _decision_cutoff_for(run_datetime.date()),
+        "run_slot": run_slot,
+        "producer_run_id": resolved_producer_run_id,
+        "artifact_id": artifact_id,
+        "started_at": _market_timestamp(),
+    }
+
+
+def _decision_lock_path():
+    return OUTPUT_DIR / "v10_decision.lock"
+
+
+def _windows_pid_is_alive(pid):
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    handle = kernel32.OpenProcess(
+        process_query_limited_information,
+        False,
+        pid,
+    )
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_is_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        return _windows_pid_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno != errno.ESRCH
+    return True
+
+
+def _lock_snapshot(path):
+    try:
+        stat = path.stat()
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size, raw)
+
+
+def _reclaim_abandoned_decision_lock(path, *, stale_after_seconds=DECISION_LOCK_STALE_SECONDS):
+    snapshot = _lock_snapshot(path)
+    if snapshot is None:
+        return True
+    _inode, modified_ns, _size, raw = snapshot
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = {}
+
+    now_epoch = time.time()
+    modified_age = max(0.0, now_epoch - (modified_ns / 1_000_000_000))
+    try:
+        created_epoch = float(payload.get("created_at_epoch", 0.0))
+    except (TypeError, ValueError):
+        created_epoch = 0.0
+    created_age = max(0.0, now_epoch - created_epoch) if created_epoch > 0 else 0.0
+    stale = modified_age > stale_after_seconds or created_age > stale_after_seconds
+    pid = payload.get("pid")
+    owner_dead = pid is not None and not _pid_is_alive(pid)
+    if not stale and not owner_dead:
+        return False
+
+    if _lock_snapshot(path) != snapshot:
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _acquire_decision_lock(*, stale_after_seconds=DECISION_LOCK_STALE_SECONDS):
+    path = _decision_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    owner_token = f"{os.getpid()}-{time.time_ns()}-{uuid.uuid4().hex}"
+    payload = {
+        "pid": os.getpid(),
+        "owner_token": owner_token,
+        "created_at": _market_timestamp(),
+        "created_at_epoch": time.time(),
+        "market_timezone": MARKET_TIMEZONE,
+    }
+    for _attempt in range(3):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            if _reclaim_abandoned_decision_lock(
+                path,
+                stale_after_seconds=stale_after_seconds,
+            ):
+                continue
+            raise RuntimeError(f"decision producer lock is already held: {path}")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+                json.dump(payload, lock_file, ensure_ascii=False)
+                lock_file.flush()
+                os.fsync(lock_file.fileno())
+        except Exception:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return {
+            "path": path,
+            "owner_token": owner_token,
+            "pid": os.getpid(),
+        }
+    raise RuntimeError(f"unable to acquire decision producer lock: {path}")
+
+
+def _release_decision_lock(lock):
+    if not lock:
+        return False
+    path = Path(lock["path"])
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError, OSError):
+        return False
+    try:
+        payload_pid = int(payload.get("pid", -1))
+        owner_pid = int(lock.get("pid", -2))
+    except (TypeError, ValueError):
+        return False
+    if (
+        payload.get("owner_token") != lock.get("owner_token")
+        or payload_pid != owner_pid
+    ):
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _publish_decision_running_marker(context):
+    published_at = _market_timestamp()
+    marker = {
+        "schema_version": SCANNER_ARTIFACT_SCHEMA_VERSION,
+        "artifact_id": context["artifact_id"],
+        "producer_run_id": context["producer_run_id"],
+        "phase": "decision",
+        "trade_date": context["trade_date"],
+        "complete": False,
+        "decision_cutoff_at": context["decision_cutoff_at"].strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": context["started_at"],
+        "published_at": published_at,
+        "market_timezone": MARKET_TIMEZONE,
+    }
+    write_json_atomic(OUTPUT_DIR / "v10_decision_latest.json", marker)
+    return marker
+
+
+def _wait_for_decision_fetch_window(trade_date, *, max_wait_seconds=DECISION_MAX_WAIT_SECONDS):
+    if isinstance(trade_date, str):
+        trade_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    now = _market_now()
+    if trade_date < now.date():
+        return 0.0
+    if trade_date > now.date():
+        raise RuntimeError(f"decision trade date {trade_date} is in the future")
+
+    fetch_not_before = datetime.combine(
+        trade_date,
+        datetime_time(14, 50, 2),
+        tzinfo=MARKET_TZ,
+    )
+    remaining = (fetch_not_before - now).total_seconds()
+    if remaining <= 0:
+        return 0.0
+    if remaining > max_wait_seconds:
+        raise RuntimeError(
+            f"decision cutoff wait {remaining:.3f}s exceeds "
+            f"maximum {max_wait_seconds}s"
+        )
+
+    waited = 0.0
+    deadline = time.monotonic() + max_wait_seconds
+    while remaining > 0:
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise RuntimeError("decision cutoff wait exceeded its deadline")
+        sleep_for = min(remaining, budget)
+        time.sleep(sleep_for)
+        waited += sleep_for
+        now = _market_now()
+        remaining = (fetch_not_before - now).total_seconds()
+    return waited
 
 # #region debug-point A:main-strategy-chain-helper
 _DEBUG_ENV_FILE = Path(__file__).resolve().parent / ".dbg" / "main-strategy-chain.env"
@@ -94,6 +384,8 @@ def _positive_int_env(name, default):
 
 
 DECISION_MAX_CANDIDATES = _positive_int_env("TLFZ_DECISION_MAX_CANDIDATES", 120)
+DECISION_DAILY_COUNT = 80
+QUOTE_BATCH_SIZE = 80
 
 SCAN_CONFIG = {
     # 成交额阈值（元）：低于此值的不扫，流动性不足
@@ -114,10 +406,32 @@ SCAN_CONFIG = {
 def write_json_atomic(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_csv_atomic(df, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def normalize_code(value):
@@ -193,7 +507,7 @@ def fetch_weekly_bars(api, market, code, count=100):
     except Exception:
         return None
 
-def fetch_5min_bars_today(api, market, code):
+def fetch_5min_bars_today(api, market, code, *, cutoff_at=None):
     """Get today's 5-min bars only"""
     try:
         bars = api.get_security_bars(0, market, code, 0, 50)  # last 50 bars
@@ -204,10 +518,22 @@ def fetch_5min_bars_today(api, market, code):
             return None
         df["datetime"] = pd.to_datetime(df["datetime"])
         df = df.sort_values("datetime").reset_index(drop=True)
-        # Filter to today only
-        today = df.iloc[-1]["datetime"].date()
-        df = df[df["datetime"].dt.date == today]
-        return df
+        # A decision cutoff owns the trading date. Never infer that date from a
+        # provider response, which may already contain bars from another day.
+        if cutoff_at is not None:
+            cutoff_timestamp = pd.Timestamp(cutoff_at)
+            if cutoff_timestamp.tzinfo is not None:
+                cutoff_timestamp = (
+                    cutoff_timestamp.tz_convert(MARKET_TZ).tz_localize(None)
+                )
+            target_date = cutoff_timestamp.date()
+        else:
+            cutoff_timestamp = None
+            target_date = df.iloc[-1]["datetime"].date()
+        df = df[df["datetime"].dt.date == target_date]
+        if cutoff_timestamp is not None:
+            df = df[df["datetime"] <= cutoff_timestamp]
+        return df.reset_index(drop=True)
     except Exception:
         return None
 
@@ -265,88 +591,31 @@ def compute_5min_signal(min5_df):
     return feats
 
 
+_SCANNER_STRATEGY_PROFILE = load_strategy_profile()
+_SCANNER_STRATEGY_PROFILE_ID = str(_SCANNER_STRATEGY_PROFILE["profile_id"])
+_SCANNER_STRATEGY_PROFILE_HASH = profile_fingerprint(_SCANNER_STRATEGY_PROFILE)
+
+
 def classify_signal(bz_dir, bz_rt, weekly_align, weekly_slope, ma20_off,
                     vol_expand, rsi, is_green, amt_ratio):
-    """
-    Multi-tier + multi-mode signal classification.
-    Returns (tier, mode, position, description)
-    """
-    bz = bz_dir if not np.isnan(bz_dir) else 0.0
-    bz_rt = bz_rt if not np.isnan(bz_rt) else bz
-
-    bz_kill = bz < -0.3
-    bz_mild = -0.3 <= bz < 0
-    ma20_pull = -5.0 <= ma20_off <= 2.0
-    ma20_near = -3.0 <= ma20_off <= 3.0
-    weekly_strong = weekly_align and weekly_slope > 5.0
-
-    # ── TIER 1: V9 full pass ──
-    if bz_kill and weekly_align and ma20_pull:
-        return (1, "V9_full", 1.0, f"bz={bz:+.2f}%+weekly+MA20")
-
-    # ── TIER 2: Two strong conditions ──
-    # bz_kill + weekly + nearMA20 (V9-like but wider MA20 band)
-    if bz_kill and weekly_align and ma20_near:
-        return (2, "kill+weekly+nearMA20", 0.6, f"bz={bz:+.2f}%+weekly+MA20_near")
-    # bz_kill + MA20 pull (no weekly)
-    if bz_kill and ma20_pull:
-        return (2, "kill+MA20_pull", 0.5, f"bz={bz:+.2f}%+MA20")
-
-    # ── MODE 2: Trend-Riding (no bz_kill needed) ──
-    if weekly_strong and ma20_pull and vol_expand:
-        return (2, "trend_ride+vol", 0.6, f"slope={weekly_slope:.1f}%+MA20+vol_expand")
-    if weekly_strong and ma20_pull and is_green:
-        return (2, "trend_ride+green", 0.5, f"slope={weekly_slope:.1f}%+MA20+green")
-    # bz_mild + weekly + MA20 pull
-    # Require the 14:50 snapshot to stop deteriorating; otherwise this mode tends
-    # to be a weak fallback that steals priority from stronger trend-riding setups.
-    if bz_mild and weekly_align and weekly_slope > 2.0 and ma20_pull and bz_rt >= -0.12:
-        return (2, "near_kill+weekly+MA20", 0.5, f"bz_mild={bz:+.2f}%+weekly+MA20+stabilizing")
-
-    # ── MODE 3: Volume-Breakout (cap MA20 offset to +15%) ──
-    if vol_expand and is_green and weekly_align and rsi < 70 and ma20_off <= 15.0:
-        return (2, "vol_breakout", 0.5, f"vol*{amt_ratio:.1f}+green+weekly")
-
-    # ── MODE 4: 大肉预判 pre_breakout (T-1 低位缩量企稳，埋伏次日爆发) ──
-    # 数据实证(2026-08-10 大肉 30 只 T-1 回溯)：大肉启动前多为缩量企稳
-    # (量比 0.8~3，而非旧逻辑假设的放量 1.3~2.5)、周线斜率刚转正或微负
-    # (slope > -3)、贴近 MA20(-8~+12)。旧逻辑把"放量"当大肉前置条件是反的，
-    # 导致 29/30 大肉 no_signal。此模式只放宽大肉维度，不抢中肉模式：
-    # 需尾盘未走弱(bz_rt >= -0.2)守卫，避免弱尾盘误选。
-    #
-    # 2026-08-12 微调 pre_breakout+ 强档：8/11 扫描 25 只命中今日实测
-    # (腾讯实时)全池 avg+0.19% 胜率16/25 过于宽泛；而"缩量贴均线"子集
-    # ma20∈[-1,+4] 且 amt<1.2 且 slope∈[-3,5] 命中 7 只全胜 avg+0.99%，
-    # 且剔除了今日大跌票(武汉天源-2.79/老百姓-2.64/火炬-1.96/承德露露-1.46/
-    # 百亚-1.40，其共同点均为 ma20 偏离>4.4 或 slope>5 或 amt>1.2)。slope 下界
-    # 敏感性扫描：-2.0 漏掉最强票(中恒集团+2.20)，-3.0 不引入亏损，取 -3.0。
-    # 强档升 position 至 0.6 优先持仓；基础档保留原条件但 position 降 0.4。
-    if (
-        -1.0 <= ma20_off <= 4.0
-        and amt_ratio < 1.2
-        and -3.0 <= weekly_slope <= 5.0
-        and rsi < 70
-        and bz_rt >= -0.2
-    ):
-        return (2, "pre_breakout+", 0.6, f"缩量贴MA20 slope={weekly_slope:.1f}%")
-    if (
-        weekly_slope > -3.0
-        and -8.0 <= ma20_off <= 12.0
-        and 0.8 <= amt_ratio <= 3.0
-        and rsi < 70
-        and bz_rt >= -0.2
-    ):
-        return (2, "pre_breakout", 0.4, f"slope={weekly_slope:.1f}%+MA20+缩量企稳")
-
-    # ── TIER 3: One strong condition ──
-    # kill_only: only if weekly_slope > 0 (avoid downtrend falling knives)
-    if bz_kill and weekly_slope > 0:
-        return (3, "kill_only", 0.3, f"bz={bz:+.2f}%")
-    if weekly_strong and ma20_near:
-        return (3, "trend_only", 0.3, f"slope={weekly_slope:.1f}%+MA20_near")
-    # Remove vol_green — EV too low (1.44%)
-
-    return (0, "no_signal", 0.0, "")
+    """Classify a 14:50 snapshot with the versioned live strategy profile."""
+    decision = classify_profile_signal({
+        "bz_dir": bz_dir,
+        "bz_rt": bz_rt,
+        "weekly_align": weekly_align,
+        "weekly_slope": weekly_slope,
+        "ma20_off": ma20_off,
+        "vol_expand": vol_expand,
+        "rsi": rsi,
+        "is_green": is_green,
+        "amt_ratio": amt_ratio,
+    }, _SCANNER_STRATEGY_PROFILE)
+    return (
+        decision["tier"],
+        decision["mode"],
+        decision["position"],
+        decision["signal_desc"],
+    )
 
 
 def _to_bool(value):
@@ -362,25 +631,93 @@ def _to_float(value, default=0.0):
         return default
 
 
+def _quote_code(quote):
+    if not isinstance(quote, dict):
+        return ""
+    value = quote.get("code")
+    if value is None:
+        return ""
+    try:
+        if bool(pd.isna(value)):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return normalize_code(value) if str(value).strip() else ""
+
+
+def _quote_records(api, raw_quotes):
+    if raw_quotes is None:
+        return []
+    if isinstance(raw_quotes, list):
+        return raw_quotes
+    if isinstance(raw_quotes, pd.DataFrame):
+        quote_df = raw_quotes
+    else:
+        response_to_df = getattr(raw_quotes, "to_df", None)
+        if callable(response_to_df):
+            quote_df = response_to_df()
+        else:
+            api_to_df = getattr(api, "to_df", None)
+            if not callable(api_to_df):
+                raise TypeError("quote response is neither a list nor convertible with to_df")
+            quote_df = api_to_df(raw_quotes)
+    if quote_df is None:
+        return []
+    if isinstance(quote_df, list):
+        return quote_df
+    if isinstance(quote_df, pd.DataFrame):
+        return quote_df.to_dict(orient="records")
+    raise TypeError("to_df did not return a DataFrame or list")
+
+
 def _collect_amount_snapshot(api, stocks):
     amt_list = []
-    for _, row in stocks.iterrows():
-        bars = api.get_security_bars(9, row["market"], row["code"], 0, 3)
-        if not bars:
-            continue
+    stock_rows = stocks.to_dict(orient="records")
+    for offset in range(0, len(stock_rows), QUOTE_BATCH_SIZE):
+        batch = stock_rows[offset:offset + QUOTE_BATCH_SIZE]
+        batch_number = offset // QUOTE_BATCH_SIZE + 1
         try:
-            df = api.to_df(bars)
-        except Exception:
+            securities = [
+                (int(_to_float(row["market"], 1)), normalize_code(row["code"]))
+                for row in batch
+            ]
+            quotes = _quote_records(api, api.get_security_quotes(securities))
+            coded_quotes = [(_quote_code(quote), quote) for quote in quotes]
+            quotes_have_codes = any(code for code, _quote in coded_quotes)
+            if quotes_have_codes:
+                quotes_by_code = {
+                    code: quote
+                    for code, quote in coded_quotes
+                    if code
+                }
+                row_quotes = (
+                    (row, quotes_by_code.get(normalize_code(row["code"])))
+                    for row in batch
+                )
+            elif len(quotes) == len(batch):
+                row_quotes = zip(batch, quotes)
+            else:
+                print(
+                    f"[WARN] quote batch {batch_number} skipped: "
+                    f"uncoded response count {len(quotes)} != request count {len(batch)}"
+                )
+                continue
+
+            batch_snapshot = []
+            for row, quote in row_quotes:
+                if not isinstance(quote, dict):
+                    continue
+                batch_snapshot.append({
+                    "code": normalize_code(row["code"]),
+                    "name": row["name"],
+                    "market": row["market"],
+                    "latest_amt": _to_float(quote.get("amount"), 0.0),
+                    "last_close": _to_float(quote.get("price"), 0.0),
+                })
+        except Exception as exc:
+            print(f"[WARN] quote batch {batch_number} skipped: {exc}")
             continue
-        if df is None or df.empty:
-            continue
-        amt_list.append({
-            "code": normalize_code(row["code"]),
-            "name": row["name"],
-            "market": row["market"],
-            "latest_amt": _to_float(df.iloc[-1].get("amount"), 0.0),
-            "last_close": _to_float(df.iloc[-1].get("close"), 0.0),
-        })
+        amt_list.extend(batch_snapshot)
     return amt_list
 
 
@@ -457,8 +794,8 @@ def _resolve_weekly_features(api, market, code, cached_row=None):
     }
 
 
-def _build_signal_row(api, *, code, name, market, latest_snapshot=None, cached_row=None, include_5min):
-    daily = fetch_daily_bars(api, market, code, count=250)
+def _build_signal_row(api, *, code, name, market, latest_snapshot=None, cached_row=None, include_5min, intraday_cutoff=None, daily_count=250):
+    daily = fetch_daily_bars(api, market, code, count=daily_count)
     daily_fields = _compute_daily_snapshot(daily)
     if daily_fields is None:
         return None
@@ -490,15 +827,42 @@ def _build_signal_row(api, *, code, name, market, latest_snapshot=None, cached_r
         "rsi14": daily_fields["rsi14"],
         "is_green": daily_fields["is_green"],
         "vol_expand": daily_fields["vol_expand"],
+        "strategy_profile_id": _SCANNER_STRATEGY_PROFILE_ID,
+        "strategy_profile_hash": _SCANNER_STRATEGY_PROFILE_HASH,
     }
     if not include_5min:
         return row
 
-    min5 = fetch_5min_bars_today(api, market, code)
+    min5 = fetch_5min_bars_today(api, market, code, cutoff_at=intraday_cutoff)
     m5feats = compute_5min_signal(min5)
     bz_dir = m5feats.get("bz_direction", np.nan)
     bz_rt = m5feats.get("bz_rt_direction", np.nan)
     bz_vol_r = m5feats.get("bz_vol_ratio", np.nan)
+    source_bar_end_at = (
+        min5["datetime"].max().strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(min5, pd.DataFrame) and not min5.empty else ""
+    )
+    decision_cutoff_text = (
+        pd.Timestamp(intraday_cutoff).strftime("%Y-%m-%d %H:%M:%S")
+        if intraday_cutoff is not None else ""
+    )
+    decision_cutoff_ready = (
+        not decision_cutoff_text or source_bar_end_at == decision_cutoff_text
+    )
+
+    row["bz_direction"] = bz_dir
+    row["bz_rt_direction"] = bz_rt
+    row["bz_vol_ratio"] = bz_vol_r
+    row["source_bar_end_at"] = source_bar_end_at
+    row["decision_cutoff_at"] = decision_cutoff_text
+    row["decision_cutoff_ready"] = bool(decision_cutoff_ready)
+    if not decision_cutoff_ready:
+        row["tier"] = 0
+        row["mode"] = "cutoff_not_ready"
+        row["position"] = 0.0
+        row["signal_desc"] = "decision cutoff bar not ready"
+        return row
+
     tier, mode, position, desc = classify_signal(
         bz_dir,
         bz_rt,
@@ -514,52 +878,193 @@ def _build_signal_row(api, *, code, name, market, latest_snapshot=None, cached_r
     row["mode"] = mode
     row["position"] = position
     row["signal_desc"] = desc
-    row["bz_direction"] = bz_dir
-    row["bz_rt_direction"] = bz_rt
-    row["bz_vol_ratio"] = bz_vol_r
     return row
 
 
-def _write_outputs(*, df, run_time, total_amt_yi, market_regime, amount_threshold, scanned_count):
-    df_sig = df[df["tier"] > 0].copy()
+def _append_walk_forward_snapshot(df, *, decision_cutoff_at):
+    """Append only rows sourced from the exact 14:50 decision bar."""
+    if df.empty:
+        return
+    cutoff_text = pd.Timestamp(decision_cutoff_at).strftime("%Y-%m-%d %H:%M:%S")
+    if "source_bar_end_at" not in df:
+        return
+    df = df[df["source_bar_end_at"].astype(str) == cutoff_text].copy()
+    if df.empty:
+        return
+    aliases = {
+        "bz_direction": "bz_dir",
+        "bz_rt_direction": "bz_rt",
+        "close_vs_ma20_pct": "ma20_off",
+        "rsi14": "rsi",
+    }
+    snapshot = df.copy()
+    for source, target in aliases.items():
+        snapshot[target] = snapshot[source] if source in snapshot else np.nan
+    snapshot["signal_date"] = cutoff_text[:10]
+    snapshot["as_of"] = cutoff_text
+    snapshot["observed_at"] = _market_now().strftime("%Y-%m-%d %H:%M:%S")
+    snapshot["snapshot_id"] = f"{cutoff_text}|{_SCANNER_STRATEGY_PROFILE_HASH}"
+    snapshot["forward_return_pct"] = ""
+    snapshot["label_available_date"] = ""
+    snapshot["walk_forward_eligible"] = 1
+    try:
+        if WALK_FORWARD_SNAPSHOT_FILE.exists():
+            existing = pd.read_csv(WALK_FORWARD_SNAPSHOT_FILE, dtype=str)
+            snapshot = pd.concat([existing, snapshot], ignore_index=True, sort=False)
+            snapshot = snapshot.drop_duplicates(subset=["snapshot_id", "code"], keep="first")
+        _write_csv_atomic(snapshot, WALK_FORWARD_SNAPSHOT_FILE)
+    except OSError as exc:
+        print(f"[WARN] unable to persist walk-forward snapshot: {exc}")
 
-    run_slot = datetime.now().strftime("%Y-%m-%d_%H%M")
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _enforce_decision_cutoff_readiness(df, *, phase, decision_cutoff_text):
+    df = df.copy()
+    if phase != "decision" or not decision_cutoff_text:
+        if "decision_cutoff_ready" in df.columns:
+            not_ready_count = int(
+                (~df["decision_cutoff_ready"].map(_to_bool)).sum()
+            )
+        else:
+            not_ready_count = 0
+        return df, not_ready_count
+
+    if "source_bar_end_at" in df.columns:
+        cutoff_ready = (
+            df["source_bar_end_at"].fillna("").astype(str)
+            == decision_cutoff_text
+        )
+    else:
+        cutoff_ready = pd.Series(False, index=df.index, dtype=bool)
+    df["decision_cutoff_at"] = decision_cutoff_text
+    df["decision_cutoff_ready"] = cutoff_ready.astype(bool)
+    if bool((~cutoff_ready).any()):
+        df.loc[~cutoff_ready, "tier"] = 0
+        df.loc[~cutoff_ready, "mode"] = "cutoff_not_ready"
+        df.loc[~cutoff_ready, "position"] = 0.0
+        df.loc[~cutoff_ready, "signal_desc"] = "decision cutoff bar not ready"
+    return df, int((~cutoff_ready).sum())
+
+
+def _write_outputs(
+    *,
+    df,
+    run_time,
+    total_amt_yi,
+    market_regime,
+    amount_threshold,
+    scanned_count,
+    phase="legacy",
+    decision_cutoff_at=None,
+    producer_run_id=None,
+    run_slot=None,
+    started_at=None,
+):
+    if "tier" not in df.columns:
+        df = df.copy()
+        df["tier"] = pd.Series(dtype="int64")
+
+    decision_cutoff_text = (
+        pd.Timestamp(decision_cutoff_at).strftime("%Y-%m-%d %H:%M:%S")
+        if decision_cutoff_at is not None else ""
+    )
+    trade_date = decision_cutoff_text[:10] or str(run_time)[:10]
+    df, cutoff_not_ready_count = _enforce_decision_cutoff_readiness(
+        df,
+        phase=phase,
+        decision_cutoff_text=decision_cutoff_text,
+    )
+    df_sig = df[df["tier"] > 0].copy()
+    run_slot, producer_run_id, artifact_id = _protocol_identity(
+        trade_date=trade_date,
+        phase=phase,
+        producer_run_id=producer_run_id,
+        run_slot=run_slot,
+    )
+
     latest_scan_csv = OUTPUT_DIR / "v10_scan_full.csv"
     snapshot_scan_csv = OUTPUT_DIR / f"v10_scan_full.{run_slot}.csv"
     latest_scan_meta = OUTPUT_DIR / "v10_scan_meta.json"
     snapshot_scan_meta = OUTPUT_DIR / f"v10_scan_meta.{run_slot}.json"
     latest_scan_pointer = OUTPUT_DIR / "v10_scan_latest.json"
+    latest_prewarm_pointer = OUTPUT_DIR / "v10_prewarm_latest.json"
+    latest_decision_pointer = OUTPUT_DIR / "v10_decision_latest.json"
 
-    df.to_csv(latest_scan_csv, index=False, encoding="utf-8-sig")
-    df.to_csv(snapshot_scan_csv, index=False, encoding="utf-8-sig")
-
-    scan_meta = {
-        'run_time': run_time,
-        'run_slot': run_slot,
-        'total_csi1000_amt_yi': round(total_amt_yi, 0),
-        'market_regime': market_regime,
-        'amount_threshold_yi': round(amount_threshold / 1e8, 1),
-        'stocks_scanned': scanned_count,
-        'stocks_with_signal': len(df_sig),
-        'signals_by_tier': {f'T{t}': len(df_sig[df_sig['tier'] == t]) for t in [1, 2, 3]},
-        'latest_scan_csv': str(latest_scan_csv),
-        'snapshot_scan_csv': str(snapshot_scan_csv),
-        'latest_scan_meta': str(latest_scan_meta),
-        'snapshot_scan_meta': str(snapshot_scan_meta),
+    _write_csv_atomic(df, latest_scan_csv)
+    _write_csv_atomic(df, snapshot_scan_csv)
+    scan_csv_sha256 = _sha256_file(snapshot_scan_csv)
+    published_at = _market_timestamp()
+    started_at = str(started_at or published_at)
+    signals_by_tier = {
+        f"T{tier}": len(df_sig[df_sig["tier"] == tier])
+        for tier in [1, 2, 3]
     }
-    write_json_atomic(latest_scan_meta, scan_meta)
+    protocol_fields = {
+        "schema_version": SCANNER_ARTIFACT_SCHEMA_VERSION,
+        "artifact_id": artifact_id,
+        "producer_run_id": producer_run_id,
+        "started_at": started_at,
+        "published_at": published_at,
+        "market_timezone": MARKET_TIMEZONE,
+        "scan_csv_sha256": scan_csv_sha256,
+        "cutoff_not_ready_count": cutoff_not_ready_count,
+        "run_time": str(run_time),
+        "run_slot": run_slot,
+        "phase": phase,
+        "trade_date": trade_date,
+        "decision_cutoff_at": decision_cutoff_text,
+        "complete": True,
+        "requested_count": int(scanned_count),
+        "refreshed_count": len(df),
+        "strategy_profile_id": _SCANNER_STRATEGY_PROFILE_ID,
+        "strategy_profile_hash": _SCANNER_STRATEGY_PROFILE_HASH,
+        "stocks_with_signal": len(df_sig),
+        "signals_by_tier": signals_by_tier,
+    }
+    path_fields = {
+        "scan_csv": str(snapshot_scan_csv),
+        "scan_meta": str(snapshot_scan_meta),
+        "latest_scan_csv": str(latest_scan_csv),
+        "latest_scan_meta": str(latest_scan_meta),
+        "snapshot_scan_csv": str(snapshot_scan_csv),
+        "snapshot_scan_meta": str(snapshot_scan_meta),
+    }
+    scan_meta = {
+        **protocol_fields,
+        **path_fields,
+        "total_csi1000_amt_yi": round(total_amt_yi, 0),
+        "market_regime": market_regime,
+        "amount_threshold_yi": round(amount_threshold / 1e8, 1),
+        "stocks_scanned": int(scanned_count),
+    }
     write_json_atomic(snapshot_scan_meta, scan_meta)
-    write_json_atomic(
-        latest_scan_pointer,
-        {
-            'run_time': run_time,
-            'run_slot': run_slot,
-            'scan_csv': str(snapshot_scan_csv),
-            'scan_meta': str(snapshot_scan_meta),
-            'signals_by_tier': scan_meta['signals_by_tier'],
-            'stocks_with_signal': scan_meta['stocks_with_signal'],
-        },
-    )
+    write_json_atomic(latest_scan_meta, scan_meta)
+
+    pointer_payload = {
+        **protocol_fields,
+        **path_fields,
+    }
+    write_json_atomic(latest_scan_pointer, pointer_payload)
+    if phase == "prewarm":
+        write_json_atomic(latest_prewarm_pointer, pointer_payload)
+    if phase == "decision":
+        # Publish the executable decision before optional research persistence.
+        # This final atomic replace transitions the dedicated marker from
+        # running/complete=false to the completed immutable artifact pointer.
+        write_json_atomic(latest_decision_pointer, pointer_payload)
+
+    if phase == "decision" and decision_cutoff_at is not None:
+        try:
+            _append_walk_forward_snapshot(df, decision_cutoff_at=decision_cutoff_at)
+        except Exception as exc:
+            print(f"[WARN] unable to persist walk-forward snapshot: {exc}")
 
     print("=" * 70)
     print("SCAN RESULTS")
@@ -634,11 +1139,111 @@ def _write_outputs(*, df, run_time, total_amt_yi, market_regime, amount_threshol
     print("=" * 70)
 
 
-def _run_decision_fast(api, *, run_time):
-    latest_scan_csv = OUTPUT_DIR / "v10_scan_full.csv"
-    if not latest_scan_csv.exists():
-        raise RuntimeError(f"missing prewarm scan file: {latest_scan_csv}")
-    df = pd.read_csv(latest_scan_csv, encoding="utf-8-sig")
+def _read_json_object(path):
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_output_snapshot_path(raw_path, *, prefix, forbidden_name):
+    text = str(raw_path or "").strip()
+    if not text:
+        raise RuntimeError("prewarm pointer is missing an artifact path")
+    try:
+        path = Path(text).resolve()
+        path.relative_to(OUTPUT_DIR.resolve())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"prewarm artifact is outside OUTPUT_DIR: {text}") from exc
+    if path.name == forbidden_name or not path.name.startswith(prefix):
+        raise RuntimeError(f"prewarm artifact is not an immutable snapshot: {path.name}")
+    return path
+
+
+def _load_valid_prewarm_dataframe(expected_trade_date):
+    pointer_path = OUTPUT_DIR / "v10_prewarm_latest.json"
+    pointer = _read_json_object(pointer_path)
+    if not pointer:
+        raise RuntimeError(f"missing dedicated prewarm pointer: {pointer_path}")
+    expected_trade_date = str(expected_trade_date)
+    producer_run_id = str(pointer.get("producer_run_id", "")).strip()
+    if pointer.get("complete") is not True:
+        raise RuntimeError("prewarm pointer is incomplete")
+    if str(pointer.get("phase", "")).strip() != "prewarm":
+        raise RuntimeError("prewarm pointer phase mismatch")
+    if str(pointer.get("trade_date", "")).strip() != expected_trade_date:
+        raise RuntimeError("prewarm pointer trade_date mismatch")
+    if str(pointer.get("artifact_id", "")).strip() != f"{expected_trade_date}:prewarm:{producer_run_id}":
+        raise RuntimeError("prewarm artifact identity mismatch")
+    if str(pointer.get("strategy_profile_id", "")).strip() != _SCANNER_STRATEGY_PROFILE_ID:
+        raise RuntimeError("prewarm strategy profile id mismatch")
+    if str(pointer.get("strategy_profile_hash", "")).strip() != _SCANNER_STRATEGY_PROFILE_HASH:
+        raise RuntimeError("prewarm strategy profile hash mismatch")
+    try:
+        published_at = _as_market_datetime(pointer.get("published_at"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("prewarm published_at is invalid") from exc
+    if published_at.date().isoformat() != expected_trade_date:
+        raise RuntimeError("prewarm published_at trade_date mismatch")
+
+    csv_path = _resolve_output_snapshot_path(
+        pointer.get("scan_csv"),
+        prefix="v10_scan_full.",
+        forbidden_name="v10_scan_full.csv",
+    )
+    meta_path = _resolve_output_snapshot_path(
+        pointer.get("scan_meta"),
+        prefix="v10_scan_meta.",
+        forbidden_name="v10_scan_meta.json",
+    )
+    if not csv_path.is_file() or not meta_path.is_file():
+        raise RuntimeError("prewarm immutable snapshot is missing")
+    meta = _read_json_object(meta_path)
+    comparable_fields = (
+        "schema_version", "artifact_id", "producer_run_id", "run_time", "run_slot",
+        "phase", "trade_date", "complete", "published_at", "market_timezone",
+        "requested_count", "refreshed_count", "strategy_profile_id",
+        "strategy_profile_hash", "scan_csv_sha256",
+    )
+    mismatched = [field for field in comparable_fields if meta.get(field) != pointer.get(field)]
+    if mismatched:
+        raise RuntimeError(f"prewarm pointer/meta mismatch: {','.join(mismatched)}")
+    actual_hash = _sha256_file(csv_path)
+    if actual_hash != str(pointer.get("scan_csv_sha256", "")).strip().lower():
+        raise RuntimeError("prewarm CSV SHA-256 mismatch")
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    if len(df) != int(pointer.get("refreshed_count", -1)):
+        raise RuntimeError("prewarm CSV row count mismatch")
+    if not df.empty:
+        if "strategy_profile_id" not in df or "strategy_profile_hash" not in df:
+            raise RuntimeError("prewarm CSV is missing strategy profile provenance")
+        if not df["strategy_profile_id"].astype(str).eq(_SCANNER_STRATEGY_PROFILE_ID).all():
+            raise RuntimeError("prewarm CSV strategy profile id mismatch")
+        if not df["strategy_profile_hash"].astype(str).eq(_SCANNER_STRATEGY_PROFILE_HASH).all():
+            raise RuntimeError("prewarm CSV strategy profile hash mismatch")
+    return df
+
+
+def _run_decision_fast(api, *, run_time, producer_run_id=None):
+    decision_lock = _acquire_decision_lock()
+    try:
+        context = _decision_protocol_context(
+            run_time=run_time,
+            producer_run_id=producer_run_id,
+        )
+        _publish_decision_running_marker(context)
+        return _run_decision_fast_impl(
+            api,
+            run_time=run_time,
+            context=context,
+        )
+    finally:
+        _release_decision_lock(decision_lock)
+
+
+def _run_decision_fast_impl(api, *, run_time, context):
+    df = _load_valid_prewarm_dataframe(context["trade_date"])
     if "code" in df.columns:
         df["code"] = df["code"].map(normalize_code)
     if "market" not in df.columns:
@@ -694,6 +1299,8 @@ def _run_decision_fast(api, *, run_time):
         )
     else:
         print(f"  -> 决策阶段混合刷新 {total_candidates}只 (实时候选{len(filtered)} + 预热缓存补集{total_candidates - len(filtered)})")
+    decision_cutoff_at = context["decision_cutoff_at"]
+    _wait_for_decision_fetch_window(context["trade_date"])
     refreshed_rows = []
     total = len(candidate_specs)
     for idx, spec in enumerate(candidate_specs):
@@ -706,6 +1313,8 @@ def _run_decision_fast(api, *, run_time):
             latest_snapshot=spec["latest_snapshot"],
             cached_row=spec["cached_row"],
             include_5min=True,
+            intraday_cutoff=decision_cutoff_at,
+            daily_count=DECISION_DAILY_COUNT,
         )
         if row is None:
             continue
@@ -738,10 +1347,15 @@ def _run_decision_fast(api, *, run_time):
         market_regime=market_regime,
         amount_threshold=amount_threshold,
         scanned_count=len(candidate_specs),
+        phase="decision",
+        decision_cutoff_at=decision_cutoff_at,
+        producer_run_id=context["producer_run_id"],
+        run_slot=context["run_slot"],
+        started_at=context["started_at"],
     )
 
 
-def _run_prewarm_fast(api, *, run_time):
+def _run_prewarm_fast(api, *, run_time, producer_run_id=None):
     stocks = get_stock_list()
     print(f"CSI1000: {len(stocks)} stocks, pytdx connected\n")
     print("Phase 1: Dynamic amount filter (市场冷热自适应)...")
@@ -779,21 +1393,30 @@ def _run_prewarm_fast(api, *, run_time):
         market_regime=market_regime,
         amount_threshold=amount_threshold,
         scanned_count=len(amt_df),
+        phase="prewarm",
+        producer_run_id=producer_run_id,
     )
 
 
-def main():
+def _build_arg_parser():
     parser = argparse.ArgumentParser(description="V10 scanner")
     parser.add_argument("--decision-fast", action="store_true", help="reuse latest scan and refresh 5-min tail only")
     parser.add_argument("--prewarm-fast", action="store_true", help="prewarm only daily/weekly base features and defer 5-min classification to decision")
-    args = parser.parse_args()
+    parser.add_argument("--task-name", default="", help="scheduler task name")
+    parser.add_argument("--trigger-slot", default="", help="scheduler trigger slot")
+    parser.add_argument("--run-id", default="", help="producer run identifier")
+    return parser
+
+
+def main(argv=None):
+    args = _build_arg_parser().parse_args(argv)
     # #region debug-point A:scanner-main-start
     _main_strategy_debug_emit(
         "A",
         "scanner_v10.py:main",
         "[DEBUG] scanner main started",
         {
-            "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": _market_now().strftime("%Y-%m-%d %H:%M:%S"),
             "decision_fast": bool(args.decision_fast),
             "prewarm_fast": bool(args.prewarm_fast),
         },
@@ -803,59 +1426,36 @@ def main():
     print("V10 Scanner: Multi-Tier + Multi-Mode Real-Time Scanner")
     print("Philosophy: 大肉小肉都是肉 — every day is a trading day")
     print("=" * 70)
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_time = _market_now().strftime("%Y-%m-%d %H:%M:%S")
+    decision_cutoff_at = _decision_cutoff_for(_as_market_datetime(run_time).date())
     print(f"Run time: {run_time}\n")
     api = connect_tdx()
     try:
         if args.decision_fast:
             print("Decision fast mode: reuse latest prewarm scan and refresh 5-min tail only...")
-            _run_decision_fast(api, run_time=run_time)
+            _run_decision_fast(
+                api,
+                run_time=run_time,
+                producer_run_id=args.run_id,
+            )
             return
         if args.prewarm_fast:
             print("Prewarm fast mode: cache daily/weekly base features and defer 5-min refresh to decision...")
-            _run_prewarm_fast(api, run_time=run_time)
+            _run_prewarm_fast(
+                api,
+                run_time=run_time,
+                producer_run_id=args.run_id,
+            )
             return
 
         stocks = get_stock_list()
         print(f"CSI1000: {len(stocks)} stocks, pytdx connected\n")
         print("Phase 1: Dynamic amount filter (市场冷热自适应)...")
-        amt_list = []
-        for _, row in stocks.iterrows():
-            bars = api.get_security_bars(9, row["market"], row["code"], 0, 3)
-            if bars:
-                try:
-                    df = api.to_df(bars)
-                    if df is not None and not df.empty:
-                        amt_list.append({
-                            "code": row["code"], "name": row["name"],
-                            "market": row["market"],
-                            "latest_amt": df.iloc[-1]["amount"],
-                            "last_close": df.iloc[-1]["close"],
-                        })
-                except Exception:
-                    pass
-
-        total_amt_yuan = sum(r['latest_amt'] for r in amt_list)
-        total_amt_yi = total_amt_yuan / 1e8
-        if total_amt_yi > SCAN_CONFIG['hot_market_total_yi']:
-            market_regime = '活跃市'
-            amount_threshold = SCAN_CONFIG['hot_market_amount_yuan']
-        elif total_amt_yi < SCAN_CONFIG['cold_market_total_yi']:
-            market_regime = '清淡市'
-            amount_threshold = SCAN_CONFIG['cold_market_amount_yuan']
-        else:
-            market_regime = '正常市'
-            amount_threshold = SCAN_CONFIG['min_amount_yuan']
+        amt_list = _collect_amount_snapshot(api, stocks)
+        filtered, total_amt_yi, market_regime, amount_threshold = _select_amount_candidates(amt_list)
 
         print(f"  中证1000总成交额: {total_amt_yi:.0f}亿 | 市场状态: {market_regime}")
         print(f"  个股成交额阈值: {amount_threshold/1e8:.1f}亿")
-        filtered = [r for r in amt_list if r['latest_amt'] >= amount_threshold]
-        filtered.sort(key=lambda x: x['latest_amt'], reverse=True)
-        if len(filtered) > SCAN_CONFIG['max_stocks']:
-            filtered = filtered[:SCAN_CONFIG['max_stocks']]
-        elif len(filtered) < SCAN_CONFIG['min_stocks']:
-            all_sorted = sorted(amt_list, key=lambda x: x['latest_amt'], reverse=True)
-            filtered = all_sorted[:SCAN_CONFIG['min_stocks']]
 
         amt_df = pd.DataFrame(filtered)
         # #region debug-point B:scanner-phase1-done
@@ -906,7 +1506,7 @@ def main():
             wfeats = compute_weekly_features(weekly)
             weekly_align = wfeats.get("weekly_align", False)
             weekly_slope = wfeats.get("weekly_slope", 0.0)
-            min5 = fetch_5min_bars_today(api, market, code)
+            min5 = fetch_5min_bars_today(api, market, code, cutoff_at=decision_cutoff_at)
             m5feats = compute_5min_signal(min5)
             bz_dir = m5feats.get("bz_direction", np.nan)
             bz_rt = m5feats.get("bz_rt_direction", np.nan)
@@ -935,6 +1535,8 @@ def main():
                 "rsi14": rsi,
                 "is_green": is_green,
                 "vol_expand": vol_exp,
+                "strategy_profile_id": _SCANNER_STRATEGY_PROFILE_ID,
+                "strategy_profile_hash": _SCANNER_STRATEGY_PROFILE_HASH,
             })
             if (i + 1) % 50 == 0:
                 print(f"  Processed {i+1}/{len(amt_df)}")
@@ -972,6 +1574,7 @@ def main():
             market_regime=market_regime,
             amount_threshold=amount_threshold,
             scanned_count=len(amt_df),
+            producer_run_id=args.run_id,
         )
     finally:
         api.disconnect()

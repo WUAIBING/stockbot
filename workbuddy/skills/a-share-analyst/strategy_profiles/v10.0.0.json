@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "profile_id": "v10.0.0",
+  "base_strategy": "scanner_v10",
+  "decision_cutoff": "14:50",
+  "holding_sessions": 5,
+  "candidate_limit": 5,
+  "ranking": ["tier_asc", "weekly_slope_desc", "code_asc"],
+  "rules": {
+    "v9_full": {"tier": 1, "mode": "V9_full", "position": 1.0, "bz_lt": -0.3, "weekly_align": true, "ma20_min": -5.0, "ma20_max": 2.0},
+    "kill_weekly_near": {"tier": 2, "mode": "kill+weekly+nearMA20", "position": 0.6, "bz_lt": -0.3, "weekly_align": true, "ma20_min": -3.0, "ma20_max": 3.0},
+    "kill_ma20": {"tier": 2, "mode": "kill+MA20_pull", "position": 0.5, "bz_lt": -0.3, "ma20_min": -5.0, "ma20_max": 2.0},
+    "trend_ride_vol": {"tier": 2, "mode": "trend_ride+vol", "position": 0.6, "weekly_align": true, "weekly_slope_gt": 5.0, "ma20_min": -5.0, "ma20_max": 2.0, "vol_expand": true},
+    "trend_ride_green": {"tier": 2, "mode": "trend_ride+green", "position": 0.5, "weekly_align": true, "weekly_slope_gt": 5.0, "ma20_min": -5.0, "ma20_max": 2.0, "is_green": true},
+    "near_kill": {"tier": 2, "mode": "near_kill+weekly+MA20", "position": 0.5, "bz_min": -0.3, "bz_lt": 0.0, "weekly_align": true, "weekly_slope_gt": 2.0, "ma20_min": -5.0, "ma20_max": 2.0, "bz_rt_min": -0.12},
+    "vol_breakout": {"tier": 2, "mode": "vol_breakout", "position": 0.5, "vol_expand": true, "is_green": true, "weekly_align": true, "rsi_lt": 70.0, "ma20_max": 15.0},
+    "pre_breakout_plus": {"tier": 2, "mode": "pre_breakout+", "position": 0.6, "ma20_min": -1.0, "ma20_max": 4.0, "amt_ratio_lt": 1.2, "weekly_slope_min": -3.0, "weekly_slope_max": 5.0, "rsi_lt": 70.0, "bz_rt_min": -0.2},
+    "pre_breakout": {"tier": 2, "mode": "pre_breakout", "position": 0.4, "weekly_slope_gt": -3.0, "ma20_min": -8.0, "ma20_max": 12.0, "amt_ratio_min": 0.8, "amt_ratio_max": 3.0, "rsi_lt": 70.0, "bz_rt_min": -0.2},
+    "kill_only": {"tier": 3, "mode": "kill_only", "position": 0.3, "bz_lt": -0.3, "weekly_slope_gt": 0.0},
+    "trend_only": {"tier": 3, "mode": "trend_only", "position": 0.3, "weekly_align": true, "weekly_slope_gt": 5.0, "ma20_min": -3.0, "ma20_max": 3.0}
+  }
+}

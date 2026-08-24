@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from package_paths import DATA_DIR, assert_runtime_write_identity
@@ -38,6 +38,8 @@ STATUS_DIR = DATA_DIR / 'automation_status'
 STATUS_LATEST = STATUS_DIR / 'latest_phase_status.json'
 STATUS_HISTORY = STATUS_DIR / 'phase_history.csv'
 STATUS_HISTORY_DETAILED = STATUS_DIR / 'phase_history_detailed.csv'
+STATUS_WRITE_LOCK = STATUS_DIR / '.status_write.lock'
+STATUS_FALLBACK_DIR = STATUS_DIR / 'status_fallback_events'
 PREWARM_TIMING_SIGNAL = STATUS_DIR / 'prewarm_timing_signal.json'
 OPENING_NODE_FILE = DATA_DIR / 'v10_opening_node_latest.json'
 CLOSE_NODE_FILE = DATA_DIR / 'v10_close_node_latest.json'
@@ -49,11 +51,17 @@ WORKBUDDY_LOCAL_REVIEW_FILE = DATA_DIR / 'workbuddy_local_review_latest.json'
 WORKBUDDY_LEARNING_ADVICE_FILE = DATA_DIR / 'workbuddy_learning_advice_latest.json'
 ACCOUNT_SUMMARY_FILE = DATA_DIR / 'v10_account_summary_latest.json'
 BUY_DIAGNOSTIC_FILE = DATA_DIR / 'v10_buy_diagnostic_latest.json'
+DECISION_POINTER_FILE = DATA_DIR / 'v10_decision_latest.json'
 DISTILL_DAILY_REVIEW_SCRIPT = BUILD_WORKBUDDY_DISTILL_DAILY_REVIEW_SCRIPT
 DISTILL_DAILY_REVIEW_FILE = WORKBUDDY_DISTILL_DAILY_REVIEW_FILE
-WATCH_RETRYABLE_CODES = {2, 3, 4, 124}
+MARKET_TZ = timezone(timedelta(hours=8), name='UTC+08')
+BUY_WATCH_RETRYABLE_CODES = {4, 5}
 STEP_TIMEOUT_DEFAULT = 600
+EXIT_CONFIG_ERROR = 1
 EXIT_WINDOW_SKIPPED = 2
+EXIT_RUNTIME_ERROR = 3
+EXIT_STALE_DECISION = 4
+EXIT_DECISION_NOT_READY = 5
 EXIT_NO_SIGNAL = 10
 EXIT_NO_ACTION = 11
 LEGACY_HISTORY_FIELDS = [
@@ -144,6 +152,7 @@ OBSERVE_ONLY_OPTIONAL_STEPS = {
 }
 RUN_META_ARG_STEPS = {
     'data_freshness_probe.py',
+    'scanner_v10.py',
     'workbuddy_local_challenger.py',
     'workbuddy_local_review.py',
     'workbuddy_learning_bridge.py',
@@ -154,10 +163,16 @@ RUN_META_ARG_STEPS = {
 
 def write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + '.tmp')
-    with tmp_path.open('w', encoding='utf-8') as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f'.{path.name}.{os.getpid()}.{time.time_ns()}.tmp')
+    try:
+        with tmp_path.open('w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def read_json(path: Path) -> dict:
@@ -169,6 +184,33 @@ def read_json(path: Path) -> dict:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+
+def market_now() -> datetime:
+    return datetime.now(MARKET_TZ)
+
+
+def publish_decision_running_marker(run_meta: dict[str, str]) -> dict:
+    now = market_now()
+    trade_date = now.date().isoformat()
+    producer_run_id = str(run_meta.get('run_id', '')).strip()
+    if not producer_run_id:
+        raise RuntimeValidationError('decision producer run_id is required')
+    payload = {
+        'schema_version': 1,
+        'artifact_id': f'{trade_date}:decision:{producer_run_id}',
+        'producer_run_id': producer_run_id,
+        'phase': 'decision',
+        'trade_date': trade_date,
+        'complete': False,
+        'state': 'running',
+        'decision_cutoff_at': f'{trade_date} 14:50:00',
+        'started_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'published_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'market_timezone': 'UTC+08',
+    }
+    write_json_atomic(DECISION_POINTER_FILE, payload)
+    return payload
 
 
 def normalize_step_name(step_path: str) -> str:
@@ -588,7 +630,7 @@ def build_run_id(*, phase: str, task_name: str, trigger_slot: str) -> str:
     slot_part = sanitize_token(trigger_slot.replace(':', '') if trigger_slot else datetime.now().strftime('%H%M%S'))
     task_part = sanitize_token(task_name or 'manual-task')
     phase_part = sanitize_token(phase)
-    return f'{date_part}-{slot_part}-{task_part}-{phase_part}'
+    return f'{date_part}-{slot_part}-{task_part}-{phase_part}-{os.getpid()}-{time.time_ns()}'
 
 
 def canonical_phase_name(phase: str) -> str:
@@ -684,6 +726,55 @@ def append_history(path: Path, fieldnames: list[str], row: dict) -> None:
         writer.writerow(row)
 
 
+def _status_lock_snapshot():
+    try:
+        stat = STATUS_WRITE_LOCK.stat()
+    except FileNotFoundError:
+        return None
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+def _acquire_status_write_lock(*, timeout_seconds=6.0, stale_seconds=5.0):
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+    while True:
+        try:
+            fd = os.open(str(STATUS_WRITE_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                age_seconds = max(0.0, time.time() - STATUS_WRITE_LOCK.stat().st_mtime)
+            except OSError:
+                age_seconds = 0.0
+            if age_seconds > stale_seconds:
+                snapshot = _status_lock_snapshot()
+                if snapshot is None:
+                    continue
+                if _status_lock_snapshot() != snapshot:
+                    continue
+                try:
+                    STATUS_WRITE_LOCK.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return None
+                continue
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+            continue
+        os.close(fd)
+        return STATUS_WRITE_LOCK
+
+
+def _release_status_write_lock(lock_path) -> None:
+    if lock_path is None:
+        return
+    try:
+        Path(lock_path).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def record_status(
     *,
     run_meta: dict[str, str],
@@ -722,10 +813,23 @@ def record_status(
         'root': str(ROOT),
         'data_dir': str(DATA_DIR),
     }
-    write_json_atomic(STATUS_LATEST, payload)
-    write_json_atomic(latest_phase_path(phase), payload)
-    append_history(STATUS_HISTORY, LEGACY_HISTORY_FIELDS, {key: payload.get(key, '') for key in LEGACY_HISTORY_FIELDS})
-    append_history(STATUS_HISTORY_DETAILED, DETAILED_HISTORY_FIELDS, {key: payload.get(key, '') for key in DETAILED_HISTORY_FIELDS})
+    lock_path = _acquire_status_write_lock()
+    payload['generated_at'] = format_timestamp(datetime.now())
+    if lock_path is None:
+        fallback_path = STATUS_FALLBACK_DIR / (
+            f'{sanitize_token(payload["run_id"])}.{sanitize_token(phase)}.'
+            f'{sanitize_token(step)}.{attempt}.{os.getpid()}.{time.time_ns()}.json'
+        )
+        write_json_atomic(fallback_path, payload)
+        print(f'[WARN] status write lock unavailable; wrote fallback event: {fallback_path}')
+        return
+    try:
+        write_json_atomic(STATUS_LATEST, payload)
+        write_json_atomic(latest_phase_path(phase), payload)
+        append_history(STATUS_HISTORY, LEGACY_HISTORY_FIELDS, {key: payload.get(key, '') for key in LEGACY_HISTORY_FIELDS})
+        append_history(STATUS_HISTORY_DETAILED, DETAILED_HISTORY_FIELDS, {key: payload.get(key, '') for key in DETAILED_HISTORY_FIELDS})
+    finally:
+        _release_status_write_lock(lock_path)
 
 
 def get_step_timeout(phase: str, step_name: str) -> int:
@@ -738,6 +842,8 @@ def classify_step_status(phase: str, step_name: str, exit_code: int) -> str:
     semantic_map = {
         'v10_moni_trader.py': {
             EXIT_WINDOW_SKIPPED: 'skipped',
+            EXIT_STALE_DECISION: 'stale_decision' if phase == 'buy' else 'failed',
+            EXIT_DECISION_NOT_READY: 'decision_not_ready' if phase == 'buy' else 'failed',
             EXIT_NO_SIGNAL: 'no_signal',
             EXIT_NO_ACTION: 'no_action',
         },
@@ -753,7 +859,7 @@ def classify_step_status(phase: str, step_name: str, exit_code: int) -> str:
 
 
 def is_nonfatal_step_status(phase: str, step_name: str, status: str) -> bool:
-    if status in {'ok', 'no_action', 'no_signal', 'skipped'}:
+    if status in {'ok', 'no_action', 'no_signal', 'skipped', 'decision_not_ready', 'stale_decision'}:
         return True
     return status == 'warning' and is_soft_fail_step(phase, step_name)
 
@@ -764,6 +870,8 @@ def phase_completion_detail(status: str) -> str:
         'no_action': 'phase finished with no action',
         'no_signal': 'phase finished with no signal',
         'skipped': 'phase finished with window skipped',
+        'decision_not_ready': 'phase waiting for dedicated decision artifact',
+        'stale_decision': 'phase waiting for current decision artifact',
     }
     return detail_map.get(status, 'phase finished')
 
@@ -825,6 +933,8 @@ def run_step(phase: str, args: list[str]) -> tuple[int, str, datetime, datetime]
             'no_action': f'step finished with no action: {args[0]}',
             'no_signal': f'step finished with no signal: {args[0]}',
             'skipped': f'step finished with window skipped: {args[0]}',
+            'decision_not_ready': f'dedicated decision artifact not ready: {args[0]}',
+            'stale_decision': f'current decision artifact not ready: {args[0]}',
         }
         return result.returncode, semantic_detail_map.get(semantic_status, f'step failed: {args[0]}'), started_at, finished_at
     except subprocess.TimeoutExpired:
@@ -1029,8 +1139,11 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
         print(f"[STOP] {deadline_detail}")
         return 2
     try:
-        preflight_reports = preflight_phase(phase, expected_trade_date=datetime.now().strftime('%Y-%m-%d'))
-    except RuntimeValidationError as exc:
+        if phase == 'decision':
+            publish_decision_running_marker(run_meta)
+        expected_trade_date = market_now().strftime('%Y-%m-%d')
+        preflight_reports = preflight_phase(phase, expected_trade_date=expected_trade_date)
+    except (RuntimeValidationError, OSError) as exc:
         preflight_finished_at = datetime.now()
         record_status(
             run_meta=run_meta,
@@ -1120,7 +1233,7 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
                     'duration_seconds': seconds_between(step_started_at, step_finished_at) or 0,
                 })
             if code != 0:
-                if step_status in {'no_action', 'no_signal', 'skipped'}:
+                if step_status in {'no_action', 'no_signal', 'skipped', 'decision_not_ready', 'stale_decision'}:
                     phase_status = step_status
                     phase_exit_code = code
                     print(f"[INFO] semantic non-fatal step: {step_name} -> {step_detail} ({step_status})")
@@ -1241,14 +1354,11 @@ def run_phase_watch(
     max_attempts: int,
     interval_seconds: int,
 ) -> int:
-    deadline = datetime.now().replace(hour=14, minute=57, second=0, microsecond=0)
-    last_code = 11
-    retryable_codes = set(WATCH_RETRYABLE_CODES)
-    # buy-watch exists specifically to wait for scanner/decision artifacts to become ready.
-    if phase == 'buy':
-        retryable_codes.add(1)
+    deadline = market_now().replace(hour=14, minute=57, second=0, microsecond=0)
+    last_code = EXIT_DECISION_NOT_READY if phase == 'buy' else EXIT_NO_ACTION
+    retryable_codes = set(BUY_WATCH_RETRYABLE_CODES if phase == 'buy' else ())
     for attempt in range(1, max_attempts + 1):
-        now = datetime.now()
+        now = market_now()
         if now > deadline:
             detail = f'watch deadline reached at {deadline:%H:%M:%S}'
             record_status(
@@ -1256,7 +1366,7 @@ def run_phase_watch(
                 phase=phase,
                 step='phase',
                 attempt=attempt,
-                status='deadline',
+                status='failed',
                 exit_code=last_code,
                 detail=detail,
                 started_at=now,
@@ -1268,11 +1378,27 @@ def run_phase_watch(
         last_code = code
         if code == 0:
             return 0
-        if code not in retryable_codes or attempt == max_attempts:
+        if code not in retryable_codes:
             return code
-        sleep_seconds = min(interval_seconds, max(1, int((deadline - datetime.now()).total_seconds())))
+        if attempt == max_attempts:
+            terminal_at = market_now()
+            detail = f'buy watch exhausted {max_attempts} attempts; final exit code {code}'
+            record_status(
+                run_meta=run_meta,
+                phase=phase,
+                step='watch_terminal',
+                attempt=attempt,
+                status='failed',
+                exit_code=code,
+                detail=detail,
+                started_at=terminal_at,
+                finished_at=terminal_at,
+            )
+            print(f'[STOP] {detail}')
+            return code
+        sleep_seconds = min(interval_seconds, max(1, int((deadline - market_now()).total_seconds())))
         detail = f'retry in {sleep_seconds}s after exit code {code}'
-        retry_at = datetime.now()
+        retry_at = market_now()
         record_status(
             run_meta=run_meta,
             phase=phase,

@@ -25,6 +25,7 @@ import os
 import sys
 import csv
 import json
+import math
 import hashlib
 import argparse
 import subprocess
@@ -47,6 +48,7 @@ from pytdx.hq import TdxHq_API
 from market_resolver import build_today_exclusion_map, exclusion_reason_text
 from mx_api_env import ensure_mx_runtime_env
 from package_paths import DATA_DIR, assert_runtime_write_identity
+from strategy_profile import load_strategy_profile, profile_fingerprint
 from trading_calendar import previous_trading_day
 from evolving_model import (
     model_summary as get_evolving_model_summary,
@@ -262,6 +264,9 @@ def _mx_api_flap_debug_emit(hypothesis_id: str, msg: str, data: dict, *, locatio
 
 _MX_RUNTIME_ENV = ensure_mx_runtime_env()
 DEFAULT_MX_API_URL = 'https://mkapi2.dfcfs.com/finskillshub'
+_ACTIVE_STRATEGY_PROFILE = load_strategy_profile()
+_ACTIVE_STRATEGY_PROFILE_ID = str(_ACTIVE_STRATEGY_PROFILE['profile_id'])
+_ACTIVE_STRATEGY_PROFILE_HASH = profile_fingerprint(_ACTIVE_STRATEGY_PROFILE)
 
 
 def resolve_mx_api_url(runtime_env=None, environ=None):
@@ -282,6 +287,7 @@ MX_API_URL = resolve_mx_api_url(_MX_RUNTIME_ENV)
 SCAN_CSV = str(DATA_DIR / 'v10_scan_full.csv')
 SCAN_META_FILE = str(DATA_DIR / 'v10_scan_meta.json')
 SCAN_LATEST_FILE = str(DATA_DIR / 'v10_scan_latest.json')
+DECISION_LATEST_FILE = str(DATA_DIR / 'v10_decision_latest.json')
 TRACK_FILE = str(DATA_DIR / 'v10_track_record.csv')
 POSITION_STATE_FILE = str(DATA_DIR / 'v10_position_state.json')
 NAV_FILE = str(DATA_DIR / 'v10_nav_history.csv')
@@ -293,6 +299,7 @@ ORDERS_CACHE_FILE = str(DATA_DIR / 'v10_orders_cache.json')
 CLOSE_NODE_FILE = str(DATA_DIR / 'v10_close_node_latest.json')
 LEARNING_GATE_FILE = str(DATA_DIR / 'v10_learning_gate_status.json')
 READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS = 600
+MX_REPAIR_ORDER_CACHE_MAX_AGE_SECONDS = 86400
 DAILY_EVOLUTION_BUNDLE_FILE = str(DATA_DIR / 'v10_daily_evolution_bundle_latest.json')
 ENGINEERING_REVIEW_FILE = str(DATA_DIR / 'v10_engineering_review_latest.json')
 ENGINEERING_MANUAL_INCIDENTS_FILE = str(DATA_DIR / 'v10_engineering_manual_incidents_latest.json')
@@ -318,6 +325,8 @@ SMART_SELL_RATE_LIMIT_COOLDOWN_SECONDS = 35 * 60
 SCAN_FRESHNESS_MINUTES = 20
 DECISION_READY_MAX_WAIT_SECONDS = 90
 DECISION_READY_POLL_SECONDS = 3
+DECISION_READINESS_EXIT_CODE_KEY = '__decision_readiness_exit_code'
+BUY_SHARED_LOCK_TTL_SECONDS = 480
 TRADE_MIN_INTERVAL_SECONDS = 2.0
 TRADE_BUY_MIN_INTERVAL_SECONDS = 2.5
 TRADE_SELL_MIN_INTERVAL_SECONDS = 3.5
@@ -456,6 +465,7 @@ EXIT_CONFIG_ERROR = 1
 EXIT_WINDOW_SKIPPED = 2
 EXIT_RUNTIME_ERROR = 3
 EXIT_STALE_SCAN = 4
+EXIT_DECISION_NOT_READY = 5
 EXIT_NO_SIGNAL = 10
 EXIT_NO_ACTION = 11
 _LAST_POSITIONS_FETCH_STATUS = {
@@ -1167,38 +1177,62 @@ def _mark_smart_sell_rate_limit(code, quantity, *, cooldown_seconds=SMART_SELL_R
     _save_smart_sell_retry_state(payload)
 
 
+def _phase_lock_snapshot(lock_path):
+    try:
+        stat = Path(lock_path).stat()
+        raw = Path(lock_path).read_bytes()
+    except FileNotFoundError:
+        return None
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size, raw)
+
+
+def _phase_lock_payload(snapshot):
+    if snapshot is None:
+        return {}
+    try:
+        payload = json.loads(snapshot[3].decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def acquire_shared_phase_lock(lock_name, *, owner='', ttl_seconds=300):
     lock_path = Path(DATA_DIR) / f'{str(lock_name or "").strip() or "phase"}.lock.json'
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     owner = str(owner or lock_name).strip() or str(lock_name or 'phase').strip() or 'phase'
     ttl_seconds = max(_fnum(ttl_seconds, 0.0), 1.0)
-    now = datetime.now()
-    payload = {
-        'lock_name': str(lock_name or '').strip(),
-        'owner': owner,
-        'pid': os.getpid(),
-        'acquired_at': now.strftime('%Y-%m-%d %H:%M:%S'),
-        'expires_at': (now + timedelta(seconds=ttl_seconds)).strftime('%Y-%m-%d %H:%M:%S'),
-    }
     while True:
+        now = datetime.now()
+        payload = {
+            'lock_name': str(lock_name or '').strip(),
+            'owner': owner,
+            'pid': os.getpid(),
+            'acquired_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+            'expires_at': (now + timedelta(seconds=ttl_seconds)).strftime('%Y-%m-%d %H:%M:%S'),
+        }
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            existing = _read_json(str(lock_path))
-            existing = existing if isinstance(existing, dict) else {}
+            snapshot = _phase_lock_snapshot(lock_path)
+            if snapshot is None:
+                continue
+            existing = _phase_lock_payload(snapshot)
             existing_acquired = _parse_dt(existing.get('acquired_at'))
             existing_expires = _parse_dt(existing.get('expires_at'))
-            stale = not existing
+            lock_age_seconds = max(0.0, time.time() - (snapshot[1] / 1_000_000_000))
+            stale = not existing and lock_age_seconds > 5.0
             if existing_expires and existing_expires <= now:
                 stale = True
             elif existing_acquired and (now - existing_acquired).total_seconds() > ttl_seconds:
                 stale = True
             if stale:
+                if _phase_lock_snapshot(lock_path) != snapshot:
+                    continue
                 try:
                     lock_path.unlink()
                 except FileNotFoundError:
                     pass
-                except Exception:
+                except OSError:
                     return {
                         'acquired': False,
                         'lock_file': str(lock_path),
@@ -1214,6 +1248,7 @@ def acquire_shared_phase_lock(lock_name, *, owner='', ttl_seconds=300):
                 'acquired_at': str(existing.get('acquired_at', '')).strip(),
                 'expires_at': str(existing.get('expires_at', '')).strip(),
                 'stale': False,
+                'initializing': not bool(existing),
             }
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1233,8 +1268,8 @@ def acquire_shared_phase_lock(lock_name, *, owner='', ttl_seconds=300):
 
 def release_shared_phase_lock(lock_name, *, owner=''):
     lock_path = Path(DATA_DIR) / f'{str(lock_name or "").strip() or "phase"}.lock.json'
-    existing = _read_json(str(lock_path))
-    existing = existing if isinstance(existing, dict) else {}
+    snapshot = _phase_lock_snapshot(lock_path)
+    existing = _phase_lock_payload(snapshot)
     if not existing:
         return False
     existing_owner = str(existing.get('owner', '')).strip()
@@ -1243,6 +1278,8 @@ def release_shared_phase_lock(lock_name, *, owner=''):
     if owner and owner != existing_owner:
         return False
     if existing_pid and existing_pid != os.getpid():
+        return False
+    if _phase_lock_snapshot(lock_path) != snapshot:
         return False
     try:
         lock_path.unlink()
@@ -1272,7 +1309,14 @@ def _parse_dt(text, fmt='%Y-%m-%d %H:%M:%S'):
     try:
         return datetime.strptime(value, fmt)
     except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
         return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(MARKET_TZ).replace(tzinfo=None)
+    return parsed
 
 
 def _is_time_in_window(text, start_hm, end_hm):
@@ -1525,6 +1569,191 @@ def get_scan_status(*, max_age_minutes=SCAN_FRESHNESS_MINUTES):
     }
 
 
+def _decision_payload_with_exit_code(payload, exit_code):
+    enriched = dict(payload) if isinstance(payload, dict) else {}
+    enriched[DECISION_READINESS_EXIT_CODE_KEY] = _inum(exit_code, EXIT_DECISION_NOT_READY)
+    return enriched
+
+
+def _market_naive(now=None):
+    value = now or _market_now()
+    if value.tzinfo is not None:
+        value = value.astimezone(MARKET_TZ).replace(tzinfo=None)
+    return value
+
+
+def _classify_live_decision_pointer(payload, *, now=None):
+    now = now or _market_now()
+    today = now.date().isoformat()
+    if not isinstance(payload, dict) or not payload:
+        return 'not_ready', f'decision pointer 尚未发布: {DECISION_LATEST_FILE}', EXIT_DECISION_NOT_READY
+
+    trade_date = str(payload.get('trade_date', '')).strip()
+    if trade_date != today:
+        return 'stale', f'decision pointer 不是当日: {trade_date or "missing"}', EXIT_STALE_SCAN
+    if str(payload.get('phase', '')).strip() != 'decision':
+        return 'invalid', 'decision pointer phase 不是 decision', EXIT_RUNTIME_ERROR
+    if payload.get('complete') is False:
+        producer_run_id = str(payload.get('producer_run_id', '')).strip()
+        return 'not_ready', f'decision 正在生成: {producer_run_id or "unknown"}', EXIT_DECISION_NOT_READY
+    if payload.get('complete') is not True:
+        return 'invalid', 'decision pointer complete 必须是 JSON true', EXIT_RUNTIME_ERROR
+
+    expected_cutoff = f'{today} 14:50:00'
+    if str(payload.get('decision_cutoff_at', '')).strip() != expected_cutoff:
+        return 'invalid', f'decision cutoff 不匹配: expected={expected_cutoff}', EXIT_RUNTIME_ERROR
+    if _inum(payload.get('schema_version', 0), 0) != 1:
+        return 'invalid', 'decision pointer schema_version 不受支持', EXIT_RUNTIME_ERROR
+
+    producer_run_id = str(payload.get('producer_run_id', '')).strip()
+    artifact_id = str(payload.get('artifact_id', '')).strip()
+    if not producer_run_id or artifact_id != f'{today}:decision:{producer_run_id}':
+        return 'invalid', 'decision artifact_id/producer_run_id 不一致', EXIT_RUNTIME_ERROR
+    if str(payload.get('strategy_profile_id', '')).strip() != _ACTIVE_STRATEGY_PROFILE_ID:
+        return 'invalid', 'decision pointer strategy_profile_id 不是当前活动版本', EXIT_RUNTIME_ERROR
+    if str(payload.get('strategy_profile_hash', '')).strip() != _ACTIVE_STRATEGY_PROFILE_HASH:
+        return 'invalid', 'decision pointer strategy_profile_hash 不是当前活动版本', EXIT_RUNTIME_ERROR
+    if not str(payload.get('scan_csv_sha256', '')).strip():
+        return 'invalid', 'decision pointer 缺少 scan_csv_sha256', EXIT_RUNTIME_ERROR
+    if not _parse_dt(payload.get('published_at')):
+        return 'invalid', 'decision pointer 缺少有效 published_at', EXIT_RUNTIME_ERROR
+    return 'ready', '', EXIT_OK
+
+
+def _resolve_decision_artifact_path(raw_path, *, expected_prefix, forbidden_name):
+    text = str(raw_path or '').strip()
+    if not text:
+        return None, 'decision artifact 路径缺失'
+    try:
+        path = Path(text).resolve()
+        path.relative_to(Path(DATA_DIR).resolve())
+    except (OSError, ValueError):
+        return None, f'decision artifact 不在 DATA_DIR: {text}'
+    if path.name == forbidden_name or not path.name.startswith(expected_prefix):
+        return None, f'decision artifact 不是不可变快照: {path.name}'
+    return path, ''
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_live_decision_context(pointer):
+    latest = dict(pointer) if isinstance(pointer, dict) else {}
+    csv_path, csv_error = _resolve_decision_artifact_path(
+        latest.get('scan_csv'),
+        expected_prefix='v10_scan_full.',
+        forbidden_name=Path(SCAN_CSV).name,
+    )
+    meta_path, meta_error = _resolve_decision_artifact_path(
+        latest.get('scan_meta'),
+        expected_prefix='v10_scan_meta.',
+        forbidden_name=Path(SCAN_META_FILE).name,
+    )
+    meta = _read_json(str(meta_path)) if meta_path is not None else {}
+    published_at = _parse_dt(latest.get('published_at'))
+    return {
+        'pointer': latest,
+        'csv_path': str(csv_path) if csv_path is not None else '',
+        'meta_path': str(meta_path) if meta_path is not None else '',
+        'path_error': csv_error or meta_error,
+        'meta': meta,
+        'run_time': published_at,
+    }
+
+
+def validate_live_decision_snapshot(pointer, *, max_age_minutes=SCAN_FRESHNESS_MINUTES, now=None):
+    now = now or _market_now()
+    state, message, exit_code = _classify_live_decision_pointer(pointer, now=now)
+    if state != 'ready':
+        return False, message, load_live_decision_context(pointer), exit_code
+
+    ctx = load_live_decision_context(pointer)
+    if ctx['path_error']:
+        return False, ctx['path_error'], ctx, EXIT_RUNTIME_ERROR
+    csv_path = ctx['csv_path']
+    meta_path = ctx['meta_path']
+    if not os.path.isfile(csv_path) or not os.path.isfile(meta_path):
+        return False, 'decision pointer 指向的快照文件不存在', ctx, EXIT_RUNTIME_ERROR
+
+    latest = ctx['pointer']
+    meta = ctx['meta'] if isinstance(ctx['meta'], dict) else {}
+    comparable_fields = (
+        'schema_version', 'artifact_id', 'producer_run_id', 'phase', 'trade_date',
+        'decision_cutoff_at', 'complete', 'run_slot', 'run_time', 'started_at',
+        'published_at', 'market_timezone', 'requested_count', 'refreshed_count',
+        'strategy_profile_id', 'strategy_profile_hash', 'scan_csv_sha256',
+        'cutoff_not_ready_count', 'stocks_with_signal', 'signals_by_tier',
+    )
+    mismatched_fields = [field for field in comparable_fields if meta.get(field) != latest.get(field)]
+    if mismatched_fields:
+        return False, f'decision pointer/meta 字段不一致: {",".join(mismatched_fields)}', ctx, EXIT_RUNTIME_ERROR
+    if str(meta.get('snapshot_scan_csv', '')).strip() != csv_path:
+        return False, 'decision meta snapshot_scan_csv 与 pointer 不一致', ctx, EXIT_RUNTIME_ERROR
+    if str(meta.get('snapshot_scan_meta', '')).strip() != meta_path:
+        return False, 'decision meta snapshot_scan_meta 与 pointer 不一致', ctx, EXIT_RUNTIME_ERROR
+
+    expected_hash = str(latest.get('scan_csv_sha256', '')).strip().lower()
+    try:
+        actual_hash = _sha256_file(csv_path)
+    except OSError as exc:
+        return False, f'decision CSV 无法读取: {type(exc).__name__}', ctx, EXIT_RUNTIME_ERROR
+    if actual_hash != expected_hash:
+        return False, 'decision CSV SHA-256 校验失败', ctx, EXIT_RUNTIME_ERROR
+
+    rows = _read_csv_rows(csv_path)
+    refreshed_count = _inum(latest.get('refreshed_count', -1), -1)
+    if refreshed_count < 0 or len(rows) != refreshed_count:
+        return False, f'decision CSV 行数不匹配: rows={len(rows)} expected={refreshed_count}', ctx, EXIT_RUNTIME_ERROR
+    expected_cutoff = str(latest.get('decision_cutoff_at', '')).strip()
+    profile_id = str(latest.get('strategy_profile_id', '')).strip()
+    profile_hash = str(latest.get('strategy_profile_hash', '')).strip()
+    invalid_signal_codes = []
+    for row in rows:
+        if str(row.get('strategy_profile_id', '')).strip() != profile_id:
+            return False, 'decision CSV strategy_profile_id 不一致', ctx, EXIT_RUNTIME_ERROR
+        if str(row.get('strategy_profile_hash', '')).strip() != profile_hash:
+            return False, 'decision CSV strategy_profile_hash 不一致', ctx, EXIT_RUNTIME_ERROR
+        if _inum(row.get('tier', 0), 0) <= 0:
+            continue
+        cutoff_ready = str(row.get('decision_cutoff_ready', '')).strip().lower() in {'1', 'true', 'yes'}
+        if not cutoff_ready or str(row.get('source_bar_end_at', '')).strip() != expected_cutoff:
+            invalid_signal_codes.append(str(row.get('code', '')).zfill(6))
+    if invalid_signal_codes:
+        return False, f'decision 含非 14:50 可交易信号: {",".join(invalid_signal_codes[:10])}', ctx, EXIT_RUNTIME_ERROR
+
+    published_at = _parse_dt(latest.get('published_at'))
+    if published_at is None:
+        return False, 'decision published_at 无效', ctx, EXIT_RUNTIME_ERROR
+    age_minutes = (_market_naive(now) - published_at).total_seconds() / 60.0
+    if age_minutes < -1.0:
+        return False, 'decision published_at 位于未来', ctx, EXIT_RUNTIME_ERROR
+    if age_minutes > max_age_minutes:
+        return False, f'decision 已过期 {age_minutes:.1f} 分钟', ctx, EXIT_STALE_SCAN
+    ctx['age_minutes'] = age_minutes
+    ctx['rows'] = rows
+    return True, '', ctx, EXIT_OK
+
+
+def validate_decision_pointer_still_current(expected_pointer, *, now=None):
+    current = _read_json(DECISION_LATEST_FILE) or {}
+    state, message, exit_code = _classify_live_decision_pointer(current, now=now or _market_now())
+    if state != 'ready':
+        return False, message, exit_code
+    identity_fields = (
+        'artifact_id', 'producer_run_id', 'published_at', 'scan_csv', 'scan_meta',
+        'scan_csv_sha256', 'strategy_profile_id', 'strategy_profile_hash',
+    )
+    changed = [field for field in identity_fields if current.get(field) != expected_pointer.get(field)]
+    if changed:
+        return False, f'decision pointer 在下单前已切换: {",".join(changed)}', EXIT_DECISION_NOT_READY
+    return True, '', EXIT_OK
+
+
 def _build_scan_snapshot_manifest(*, max_files=240):
     manifest = {}
     scan_dir = Path(DATA_DIR)
@@ -1561,25 +1790,39 @@ def _load_scan_snapshot_rows(*, trade_date='', scan_manifest=None):
 
 
 def wait_for_today_decision_ready(*, max_wait_seconds=DECISION_READY_MAX_WAIT_SECONDS, poll_seconds=DECISION_READY_POLL_SECONDS):
-    now = _market_now()
-    deadline = time.time() + max(0, max_wait_seconds)
+    deadline = time.monotonic() + max(0, max_wait_seconds)
     while True:
-        payload = _read_json(LATEST_DECISION_STATUS_FILE) or {}
-        status = str(payload.get('status', '')).strip().lower()
-        started_at = _parse_dt(payload.get('started_at'))
-        finished_at = _parse_dt(payload.get('finished_at'))
-        trigger_slot = str(payload.get('trigger_slot', '')).strip()
-        if finished_at and finished_at.date() == now.date() and status == 'ok':
+        now = _market_now()
+        payload = _read_json(DECISION_LATEST_FILE) or {}
+        state, message, exit_code = _classify_live_decision_pointer(payload, now=now)
+        if state == 'ready':
             return True, '', payload
-        if started_at and started_at.date() == now.date() and not finished_at:
-            if time.time() < deadline:
-                print(f" 等待当日 decision 完成: slot={trigger_slot or '-'} status={status or 'running'}")
-                time.sleep(max(1, poll_seconds))
-                continue
-            return False, f"decision 阶段等待超时: {LATEST_DECISION_STATUS_FILE}", payload
-        if finished_at and finished_at.date() == now.date() and status and status != 'ok':
-            return False, f"decision 阶段未成功完成: status={status}", payload
-        return True, '', payload
+        if state == 'invalid':
+            return False, message, _decision_payload_with_exit_code(payload, exit_code)
+
+        phase_status = _read_json(LATEST_DECISION_STATUS_FILE) or {}
+        status = str(phase_status.get('status', '')).strip().lower()
+        status_run_id = str(phase_status.get('run_id', '')).strip()
+        pointer_run_id = str(payload.get('producer_run_id', '')).strip()
+        status_date = _parse_dt(phase_status.get('finished_at')) or _parse_dt(phase_status.get('started_at'))
+        if (
+            status_date
+            and status_date.date() == now.date()
+            and status in {'failed', 'deadline'}
+            and status_run_id
+            and status_run_id == pointer_run_id
+        ):
+            detail = str(phase_status.get('detail', '')).strip()
+            failure_message = f'decision runner 已终止: status={status}'
+            if detail:
+                failure_message += f' detail={detail}'
+            return False, failure_message, _decision_payload_with_exit_code(payload, EXIT_CONFIG_ERROR)
+
+        if time.monotonic() >= deadline:
+            return False, message, _decision_payload_with_exit_code(payload, exit_code)
+        producer_run_id = str(payload.get('producer_run_id', '')).strip()
+        print(f" 等待专用 decision 快照: state={state} producer={producer_run_id or '-'}")
+        time.sleep(max(1, poll_seconds))
 
 
 def _log_trade_api(action, code, quantity, ref_price, result, extra=None):
@@ -1760,8 +2003,22 @@ def refresh_pending_orders(*, orders=None, positions=None):
 
 
 def _refresh_live_artifact_state(records):
-    balance = get_balance()
-    positions = get_positions() or []
+    account_batch = _collect_consistent_account_batch()
+    balance = account_batch['balance']
+    positions = account_batch['positions']
+    if not account_batch['valid']:
+        pending_items = load_pending_orders()
+        return {
+            'balance': balance,
+            'positions': positions,
+            'orders': [],
+            'pending_items': pending_items,
+            'records': records,
+            'reconcile_summary': _build_account_reconcile_skip(account_batch, pending_items),
+            'account_batch_valid': False,
+            'account_batch': account_batch['account_batch'],
+        }
+
     orders = get_orders() or []
     pending_items = refresh_pending_orders(orders=orders, positions=positions)
     records, changed = sync_track_record(
@@ -1785,6 +2042,8 @@ def _refresh_live_artifact_state(records):
         'pending_items': pending_items,
         'records': records,
         'reconcile_summary': reconcile_summary,
+        'account_batch_valid': True,
+        'account_batch': account_batch['account_batch'],
     }
 
 
@@ -2605,6 +2864,34 @@ def _get_filled_orders_from_mx(direction):
     data = result.get('data', {}) if isinstance(result.get('data', {}), dict) else {}
     orders = data.get('orders', []) or []
     return [_normalize_order(order) for order in orders if isinstance(order, dict)], ''
+
+
+def _get_repair_orders_from_mx(direction):
+    """合并 MX 实时已成列表与受时限约束的 MX 原始订单快照。"""
+    live_orders, live_error = _get_filled_orders_from_mx(direction)
+    cached_orders, cache_age_seconds = _read_live_endpoint_cache(
+        ORDERS_CACHE_FILE,
+        max_age_seconds=MX_REPAIR_ORDER_CACHE_MAX_AGE_SECONDS,
+    )
+    cached_orders = _rehydrate_cached_orders(cached_orders) if isinstance(cached_orders, list) else []
+    by_id = {}
+    for source, orders in (('mx_live_filled', live_orders), ('mx_orders_snapshot', cached_orders)):
+        for order in orders:
+            if _inum(order.get('direction', 0), 0) != _inum(direction, 0):
+                continue
+            order_id = str(order.get('id', '')).strip()
+            if not order_id:
+                continue
+            merged = dict(order)
+            merged['_mx_source'] = source
+            by_id.setdefault(order_id, merged)
+    if not by_id and live_error and not cached_orders:
+        return [], {'live_error': live_error, 'snapshot_age_seconds': cache_age_seconds}
+    return list(by_id.values()), {
+        'live_error': live_error,
+        'snapshot_age_seconds': cache_age_seconds,
+        'has_snapshot': bool(cached_orders),
+    }
 
 
 def _load_mx_verified_fills():
@@ -5245,6 +5532,223 @@ def _build_capital_allocation_feedback(records, *, trade_date=None, decision_ref
     }
 
 
+ACCOUNT_POSITION_VALUE_ABS_TOLERANCE = 1.0
+ACCOUNT_POSITION_VALUE_REL_TOLERANCE = 0.01
+
+
+def _validate_and_parse_account_batch(balance, positions, previous_account=None):
+    """Validate one balance/positions batch and resolve its atomic account view."""
+    position_rows = list(positions) if isinstance(positions, (list, tuple)) else []
+    fallback_account = previous_account if isinstance(previous_account, dict) else {}
+    balance_row = balance if isinstance(balance, dict) else {}
+    balance_total_pos_value = _fnum(balance_row.get('total_pos_value', 0.0), 0.0)
+    positions_total_value = sum(
+        _fnum(pos.get('value', 0.0), 0.0)
+        for pos in position_rows
+        if isinstance(pos, dict)
+    )
+    value_tolerance = max(
+        ACCOUNT_POSITION_VALUE_ABS_TOLERANCE,
+        abs(balance_total_pos_value) * ACCOUNT_POSITION_VALUE_REL_TOLERANCE,
+        abs(positions_total_value) * ACCOUNT_POSITION_VALUE_REL_TOLERANCE,
+    )
+
+    balance_numeric_values = {
+        field: _fnum(balance_row.get(field, 0.0), 0.0)
+        for field in ('total_assets', 'avail_balance', 'total_pos_value')
+        if field in balance_row
+    }
+    non_finite_position_fields = [
+        f"{str(pos.get('code', '')).zfill(6)}.{field}"
+        for pos in position_rows
+        if isinstance(pos, dict)
+        for field in ('value', 'profit')
+        if not math.isfinite(_fnum(pos.get(field, 0.0), 0.0))
+    ]
+
+    integrity_reason = ''
+    integrity_detail = ''
+    if not balance_row:
+        integrity_reason = 'balance_missing'
+        integrity_detail = 'balance is unavailable for this account batch'
+    else:
+        missing_fields = [
+            field
+            for field in ('total_assets', 'avail_balance', 'total_pos_value')
+            if field not in balance_row
+        ]
+        if missing_fields:
+            integrity_reason = 'balance_missing_fields'
+            integrity_detail = f"balance missing required fields: {','.join(missing_fields)}"
+        elif any(not math.isfinite(value) for value in balance_numeric_values.values()):
+            integrity_reason = 'balance_non_finite_values'
+            integrity_detail = 'balance contains NaN or Infinity in required numeric fields'
+        elif non_finite_position_fields:
+            integrity_reason = 'positions_non_finite_values'
+            integrity_detail = (
+                'positions contain NaN or Infinity: '
+                + ','.join(non_finite_position_fields[:10])
+            )
+        elif not position_rows and balance_total_pos_value > 0:
+            integrity_reason = 'positions_empty_with_nonzero_total_pos_value'
+            integrity_detail = (
+                f'balance.total_pos_value={balance_total_pos_value:.2f} '
+                'while positions is empty'
+            )
+        elif position_rows and abs(positions_total_value - balance_total_pos_value) > value_tolerance:
+            integrity_reason = 'position_value_mismatch'
+            integrity_detail = (
+                f'positions.value total={positions_total_value:.2f} differs from '
+                f'balance.total_pos_value={balance_total_pos_value:.2f} '
+                f'beyond tolerance={value_tolerance:.2f}'
+            )
+
+    valid = not integrity_reason
+    fallback_available = bool(fallback_account)
+    if valid:
+        account_source = balance_row
+        account = {
+            'total_assets': round(_fnum(account_source.get('total_assets', 0.0), 0.0), 2),
+            'avail_balance': round(_fnum(account_source.get('avail_balance', 0.0), 0.0), 2),
+            'total_pos_value': round(balance_total_pos_value, 2),
+            'position_count': len(position_rows),
+            'floating_pnl': round(
+                sum(
+                    _fnum(pos.get('profit', 0.0), 0.0)
+                    for pos in position_rows
+                    if isinstance(pos, dict)
+                ),
+                2,
+            ) if position_rows else 0.0,
+        }
+        status = {
+            'live': True,
+            'source': 'live',
+            'reason': 'account_batch_valid',
+            'integrity': True,
+            'detail': '',
+            'message': 'live',
+        }
+    else:
+        account_source = fallback_account if fallback_available else {}
+        account = {
+            'total_assets': round(_fnum(account_source.get('total_assets', 0.0), 0.0), 2),
+            'avail_balance': round(_fnum(account_source.get('avail_balance', 0.0), 0.0), 2),
+            'total_pos_value': round(_fnum(account_source.get('total_pos_value', 0.0), 0.0), 2),
+            'position_count': _inum(account_source.get('position_count', 0), 0),
+            'floating_pnl': round(_fnum(account_source.get('floating_pnl', 0.0), 0.0), 2),
+        }
+        source = 'fallback_summary' if fallback_available else 'unavailable'
+        status = {
+            'live': False,
+            'source': source,
+            'reason': integrity_reason,
+            'integrity': False,
+            'detail': integrity_detail,
+            'message': (
+                f'account_batch_integrity_failed_using_last_snapshot:{integrity_reason}'
+                if fallback_available else
+                f'account_batch_integrity_failed_unavailable:{integrity_reason}'
+            ),
+        }
+    return {
+        'valid': valid,
+        'account': account,
+        'status': status,
+    }
+
+
+def _collect_consistent_account_batch(max_attempts=2):
+    """Read and validate a complete balance/positions batch, retrying once by default."""
+    attempt_limit = max(1, _inum(max_attempts, 2))
+    latest = None
+    for attempt in range(1, attempt_limit + 1):
+        balance = get_balance()
+        positions = get_positions()
+        positions = positions if isinstance(positions, (list, tuple)) else []
+        parsed = _validate_and_parse_account_batch(balance, positions, previous_account=None)
+        latest = {
+            'balance': balance,
+            'positions': positions,
+            'account_batch': parsed,
+            'valid': parsed['valid'],
+            'attempts': attempt,
+        }
+        if parsed['valid']:
+            return latest
+        reason = parsed['status']['reason']
+        if attempt < attempt_limit:
+            print(
+                f'[WARN] account batch integrity failed ({reason}); '
+                'retrying complete balance/positions read'
+            )
+
+    return latest
+
+
+def _build_account_reconcile_skip(account_batch, pending_items):
+    parsed = account_batch.get('account_batch', {}) if isinstance(account_batch, dict) else {}
+    status = parsed.get('status', {}) if isinstance(parsed, dict) else {}
+    return {
+        'skipped': True,
+        'reason': 'account_batch_integrity_failed',
+        'attempts': _inum((account_batch or {}).get('attempts', 0), 0),
+        'account_status': dict(status) if isinstance(status, dict) else {},
+        'pending': summarize_pending_orders(pending_items),
+    }
+
+
+def _write_account_integrity_failure_summary(
+    tag,
+    *,
+    balance,
+    positions,
+    reconcile_summary=None,
+    pending_items=None,
+    execution_result=None,
+):
+    previous_summary = _read_json(SUMMARY_FILE) if os.path.exists(SUMMARY_FILE) else {}
+    summary = dict(previous_summary) if isinstance(previous_summary, dict) else {}
+    fallback_account = summary.get('account', {}) if isinstance(summary.get('account'), dict) else {}
+    parsed = _validate_and_parse_account_batch(balance, positions, fallback_account)
+    summary.update({
+        'generated_at': _now_str(),
+        'tag': tag,
+        'account': dict(parsed['account']),
+        'account_status': dict(parsed['status']),
+    })
+    if reconcile_summary is not None:
+        summary['full_reconcile'] = reconcile_summary
+    if pending_items is not None:
+        summary['pending_orders'] = summarize_pending_orders(pending_items)
+    if execution_result is not None:
+        summary['latest_execution_result'] = execution_result
+    _write_json_atomic(SUMMARY_FILE, summary)
+    return summary
+
+
+def _write_live_state_account_artifacts(tag, live_state, *, execution_result=None):
+    if live_state.get('account_batch_valid') is False:
+        _write_account_integrity_failure_summary(
+            tag,
+            balance=live_state.get('balance'),
+            positions=live_state.get('positions'),
+            reconcile_summary=live_state.get('reconcile_summary'),
+            pending_items=live_state.get('pending_items'),
+            execution_result=execution_result,
+        )
+        return False
+    write_account_artifacts(
+        tag,
+        balance=live_state.get('balance'),
+        positions=live_state.get('positions'),
+        records=live_state.get('records'),
+        pending_items=live_state.get('pending_items'),
+        execution_result=execution_result,
+    )
+    return True
+
+
 def _write_csv_row(path, fieldnames, row):
     csv_path = Path(path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5259,7 +5763,7 @@ def _write_csv_row(path, fieldnames, row):
 def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, records=None, execution_result=None, pending_items=None):
     balance = balance if balance is not None else get_balance()
     positions = positions if positions is not None else get_positions()
-    records = records if records is not None else load_track_record()
+    records = records if records is not None else load_track_record(positions=positions)
     pending_summary = summarize_pending_orders(
         pending_items if pending_items is not None else refresh_pending_orders(positions=positions)
     )
@@ -5268,7 +5772,10 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
     now = datetime.now()
     previous_summary = _read_json(SUMMARY_FILE) if os.path.exists(SUMMARY_FILE) else {}
     fallback_account = previous_summary.get('account', {}) if isinstance(previous_summary, dict) else {}
-    account_live = bool(balance) or bool(positions)
+    account_batch = _validate_and_parse_account_batch(balance, positions, fallback_account)
+    account = account_batch['account']
+    account_status = account_batch['status']
+    account_live = account_status['live']
     # #region debug-point E:summary-fallback
     _mx_api_flap_debug_emit(
         'E',
@@ -5281,29 +5788,21 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
             'fallback_position_count': _inum(fallback_account.get('position_count', 0), 0),
             'pending_active_buy_count': len((pending_summary or {}).get('active_buy_codes', []) or []),
             'pending_active_sell_count': len((pending_summary or {}).get('active_sell_codes', []) or []),
+            'account_source': account_status['source'],
+            'integrity_reason': account_status['reason'],
         },
         location='v10_moni_trader.py:write_account_artifacts',
     )
     # #endregion
-    if not account_live and fallback_account:
-        balance = {
-            'total_assets': _fnum(fallback_account.get('total_assets', 0.0), 0.0),
-            'avail_balance': _fnum(fallback_account.get('avail_balance', 0.0), 0.0),
-            'total_pos_value': _fnum(fallback_account.get('total_pos_value', 0.0), 0.0),
-        }
-    floating_pnl = round(
-        sum(_fnum(pos.get('profit', 0.0), 0.0) for pos in positions)
-        if positions else _fnum(fallback_account.get('floating_pnl', 0.0), 0.0),
-        2,
-    )
+    floating_pnl = account['floating_pnl']
     nav_row = {
         'date': now.strftime('%Y-%m-%d'),
         'time': now.strftime('%H:%M:%S'),
         'tag': tag,
-        'total_assets': round(_fnum((balance or {}).get('total_assets', 0.0), 0.0), 2),
-        'avail_balance': round(_fnum((balance or {}).get('avail_balance', 0.0), 0.0), 2),
-        'total_pos_value': round(_fnum((balance or {}).get('total_pos_value', 0.0), 0.0), 2),
-        'position_count': len(positions),
+        'total_assets': account['total_assets'],
+        'avail_balance': account['avail_balance'],
+        'total_pos_value': account['total_pos_value'],
+        'position_count': account['position_count'],
         'holding_records': stats['holding_count'],
         'closed_records': stats['closed_count'],
         'realized_pnl': stats['realized_pnl'],
@@ -5357,13 +5856,7 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
         'generated_at': _now_str(),
         'tag': tag,
         'data_dir': str(DATA_DIR),
-        'account': {
-            'total_assets': nav_row['total_assets'],
-            'avail_balance': nav_row['avail_balance'],
-            'total_pos_value': nav_row['total_pos_value'],
-            'floating_pnl': floating_pnl,
-            'position_count': len(positions),
-        },
+        'account': dict(account),
         'performance': {
             'holding_count': stats['holding_count'],
             'closed_count': stats['closed_count'],
@@ -5377,10 +5870,7 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
         'mode_summary_top10': mode_summary[:10],
         'learning_notes': learning_notes or ["样本不足，继续积累成交并观察模式表现。"],
         'scan_status': scan_status,
-        'account_status': {
-            'live': account_live,
-            'message': 'live' if account_live else 'account_api_unavailable_using_last_snapshot',
-        },
+        'account_status': dict(account_status),
         'pending_orders': pending_summary,
         'sample_filter': {
             'native_record_count': stats['native_record_count'],
@@ -5545,23 +6035,11 @@ def build_midday_review(*, balance=None, positions=None, orders=None, records=No
 def _build_account_snapshot(balance=None, positions=None):
     previous_summary = _read_json(SUMMARY_FILE) if os.path.exists(SUMMARY_FILE) else {}
     fallback_account = previous_summary.get('account', {}) if isinstance(previous_summary, dict) else {}
-    account_live = bool(balance) or bool(positions)
-    snapshot = {
-        'total_assets': round(_fnum((balance or {}).get('total_assets', 0.0), 0.0), 2),
-        'avail_balance': round(_fnum((balance or {}).get('avail_balance', 0.0), 0.0), 2),
-        'total_pos_value': round(_fnum((balance or {}).get('total_pos_value', 0.0), 0.0), 2),
-        'position_count': len(positions or []),
+    account_batch = _validate_and_parse_account_batch(balance, positions, fallback_account)
+    return {
+        **account_batch['account'],
+        **account_batch['status'],
     }
-    if not account_live and fallback_account:
-        snapshot = {
-            'total_assets': round(_fnum(fallback_account.get('total_assets', 0.0), 0.0), 2),
-            'avail_balance': round(_fnum(fallback_account.get('avail_balance', 0.0), 0.0), 2),
-            'total_pos_value': round(_fnum(fallback_account.get('total_pos_value', 0.0), 0.0), 2),
-            'position_count': len(positions or []),
-        }
-    snapshot['live'] = account_live
-    snapshot['source'] = 'live' if account_live else ('fallback_summary' if fallback_account else 'unavailable')
-    return snapshot
 
 
 def _extract_aggressive_add_summary(summary):
@@ -5612,17 +6090,26 @@ def _collect_reconcile_context():
         {},
     )
     # #endregion
-    balance = get_balance()
-    positions = get_positions()
-    records = load_track_record()
-    orders = get_orders()
-    pending_items = refresh_pending_orders(orders=orders, positions=positions)
-    records, changed = sync_track_record(records, positions=positions, orders=orders, pending_items=pending_items)
-    records, full_changed, reconcile_summary = full_reconcile_positions(records, positions=positions, orders=orders, pending_items=pending_items)
-    changed = changed or full_changed
-    if changed:
-        save_track_record(records)
-    pending_summary = reconcile_summary.get('pending') or summarize_pending_orders(pending_items)
+    account_batch = _collect_consistent_account_batch()
+    balance = account_batch['balance']
+    positions = account_batch['positions']
+    if account_batch['valid']:
+        records = load_track_record(positions=positions)
+        orders = get_orders()
+        pending_items = refresh_pending_orders(orders=orders, positions=positions)
+        records, changed = sync_track_record(records, positions=positions, orders=orders, pending_items=pending_items)
+        records, full_changed, reconcile_summary = full_reconcile_positions(records, positions=positions, orders=orders, pending_items=pending_items)
+        changed = changed or full_changed
+        if changed:
+            save_track_record(records)
+        pending_summary = reconcile_summary.get('pending') or summarize_pending_orders(pending_items)
+    else:
+        records = []
+        orders = []
+        pending_items = load_pending_orders()
+        changed = False
+        reconcile_summary = _build_account_reconcile_skip(account_batch, pending_items)
+        pending_summary = reconcile_summary['pending']
     # #region debug-point C:close-node-context-done
     _main_strategy_chain_emit(
         'C',
@@ -5666,6 +6153,9 @@ def _collect_reconcile_context():
         'reconcile_summary': reconcile_summary,
         'pending_summary': pending_summary,
         'account_snapshot': _build_account_snapshot(balance=balance, positions=positions),
+        'account_batch_valid': bool(account_batch['valid']),
+        'account_batch': account_batch['account_batch'],
+        'account_batch_attempts': account_batch['attempts'],
     }
 
 
@@ -5895,9 +6385,14 @@ def _build_trade_fill_index():
             continue
         seen.add(dedup_key)
         verified = verified_fills.get(order_id, {})
-        verified_matches = (
+        verified_identity_matches = (
             str(verified.get('code', '')).zfill(6) == code
             and str(verified.get('action', '')).strip() == action
+        )
+        if verified_identity_matches and str(verified.get('fill_state', '')).strip() == 'not_filled':
+            continue
+        verified_matches = (
+            verified_identity_matches
             and _fnum(verified.get('trade_price', 0.0), 0.0) > 0
             and _inum(verified.get('trade_count', 0), 0) > 0
         )
@@ -8557,6 +9052,26 @@ def _build_big_meat_add_profile(api, code, *, record=None, profit_pct=0.0, decis
 
 
 def do_buy(dry_run=False):
+    """Run one live buy process at a time so one decision artifact is consumed serially."""
+    if dry_run:
+        return _do_buy_core(dry_run=True)
+    lock_owner = f'v10-buy-{os.getpid()}'
+    lock_state = acquire_shared_phase_lock(
+        'buy_shared',
+        owner=lock_owner,
+        ttl_seconds=BUY_SHARED_LOCK_TTL_SECONDS,
+    )
+    if not lock_state.get('acquired'):
+        holder = str(lock_state.get('owner', '')).strip() or 'unknown'
+        print(f' buy 共享锁占用中，当前由 {holder} 执行，本轮不重复消费 decision。')
+        return EXIT_NO_ACTION
+    try:
+        return _do_buy_core(dry_run=False)
+    finally:
+        release_shared_phase_lock('buy_shared', owner=lock_owner)
+
+
+def _do_buy_core(dry_run=False):
     """按V10信号分批建仓（围绕大肉候选概率组织 T2/T3）
 
     仓位管理原则：
@@ -8580,8 +9095,13 @@ def do_buy(dry_run=False):
     #endregion
     if not ensure_trade_window('buy', dry_run=dry_run):
         return EXIT_WINDOW_SKIPPED
+    decision_pointer = {}
     if not dry_run:
-        ready, decision_message, _ = wait_for_today_decision_ready()
+        ready, decision_message, decision_pointer = wait_for_today_decision_ready()
+        decision_exit_code = _inum(
+            (decision_pointer or {}).get(DECISION_READINESS_EXIT_CODE_KEY, EXIT_DECISION_NOT_READY),
+            EXIT_DECISION_NOT_READY,
+        )
         #region debug-point C:buywatch-1450-fail-decision
         _debug_emit_event(
             'A',
@@ -8590,36 +9110,42 @@ def do_buy(dry_run=False):
             {
                 'ready': bool(ready),
                 'decision_message': str(decision_message or ''),
+                'decision_exit_code': decision_exit_code,
+                'artifact_id': str((decision_pointer or {}).get('artifact_id', '')),
             },
         )
         #endregion
         if not ready:
             print(f"[ERROR] 买入前 decision 未就绪: {decision_message}")
-            return EXIT_CONFIG_ERROR
-    scan_ctx = load_scan_context()
+            return decision_exit_code
+    scan_ctx = load_scan_context() if dry_run else {}
     if not dry_run:
-        ok, message, ctx = validate_scan_freshness()
+        ok, message, ctx, validation_exit_code = validate_live_decision_snapshot(decision_pointer)
         #region debug-point D:buywatch-1450-fail-scan
         _debug_emit_event(
             'A',
             'v10_moni_trader.py:do_buy',
-            '[DEBUG] scan freshness checked',
+            '[DEBUG] dedicated decision snapshot checked',
             {
                 'ok': bool(ok),
                 'message': str(message or ''),
                 'csv_path': str((ctx or {}).get('csv_path', '')),
                 'age_minutes': (ctx or {}).get('age_minutes', None),
+                'artifact_id': str(((ctx or {}).get('pointer') or {}).get('artifact_id', '')),
             },
         )
         #endregion
         if not ok:
-            print(f"[ERROR] 买入前扫描校验失败: {message}")
-            return EXIT_STALE_SCAN
+            print(f"[ERROR] 买入前专用 decision 校验失败: {message}")
+            return validation_exit_code
+        if not ensure_trade_window('buy', dry_run=False):
+            return EXIT_WINDOW_SKIPPED
         scan_ctx = ctx
         print(
-            f" 使用扫描快照: {ctx['csv_path']} "
-            f"(时间 {ctx['run_time'].strftime('%Y-%m-%d %H:%M:%S')}, "
-            f"{ctx.get('age_minutes', 0):.1f} 分钟前)"
+            f" 使用专用 decision 快照: {ctx['csv_path']} "
+            f"(发布 {ctx['run_time'].strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"{ctx.get('age_minutes', 0):.1f} 分钟前, "
+            f"artifact={ctx['pointer']['artifact_id']})"
         )
     signals = load_scan_signals(scan_ctx['csv_path'])
     ranking = rank_signals(signals, scan_context=scan_ctx)
@@ -9031,6 +9557,14 @@ def do_buy(dry_run=False):
         selected_codes = {item['code'] for item in buy_list}
         record_model_decisions(run_slot, ranking['all_ranked'], selected_codes=selected_codes, scan_context=scan_ctx)
 
+    if not dry_run:
+        pointer_current, pointer_message, pointer_exit_code = validate_decision_pointer_still_current(
+            decision_pointer
+        )
+        if not pointer_current:
+            print(f'[ERROR] decision 在下单前发生变化: {pointer_message}')
+            return pointer_exit_code
+
     # 执行买入
     success_count = 0
     success_codes = []
@@ -9139,7 +9673,18 @@ def do_buy(dry_run=False):
         positions = live_state['positions']
         records = live_state['records']
         pending_items = live_state['pending_items']
-        write_account_artifacts('buy', balance=balance, positions=positions, records=records, pending_items=pending_items)
+        artifact_account_valid = _write_live_state_account_artifacts(
+            'buy',
+            live_state,
+            execution_result={
+                'action': 'buy',
+                'status': 'account_refresh_failed' if live_state.get('account_batch_valid') is False else 'ok',
+                'success_count': success_count,
+            },
+        )
+        if not artifact_account_valid:
+            print('[ERROR] buy completed but account refresh failed integrity checks')
+            return EXIT_RUNTIME_ERROR
         if success_count <= 0:
             return EXIT_RUNTIME_ERROR
     if dry_run:
@@ -9770,6 +10315,7 @@ def _do_sell_core(smart=False, dry_run=False):
         except Exception:
             pass
 
+    artifact_account_valid = True
     if not dry_run:
         if smart:
             _debug_report_smart_sell(
@@ -9784,6 +10330,7 @@ def _do_sell_core(smart=False, dry_run=False):
         artifact_refresh_started_at = time.perf_counter()
         #endregion
         live_state = _refresh_live_artifact_state(records)
+        artifact_account_valid = live_state.get('account_batch_valid') is not False
         if smart:
             #region debug-point smart-sell-refresh-artifacts-done
             _debug_report_smart_sell(
@@ -9798,12 +10345,18 @@ def _do_sell_core(smart=False, dry_run=False):
         #region debug-point smart-sell-write-artifacts-start
         write_artifacts_started_at = time.perf_counter()
         #endregion
-        write_account_artifacts(
+        artifact_account_valid = _write_live_state_account_artifacts(
             'smart_sell' if smart else 'sell',
-            balance=final_balance,
-            positions=final_positions,
-            records=records,
-            pending_items=final_pending_items,
+            live_state,
+            execution_result={
+                'action': 'smart_sell' if smart else 'sell',
+                'status': 'account_refresh_failed' if not artifact_account_valid else 'ok',
+                'sold_count': sold_count,
+                'confirmed_count': confirmed_count,
+                'hold_count': hold_count,
+                'skipped_count': skipped_count,
+                'trade_failed_count': trade_failed_count,
+            },
         )
         if smart:
             _debug_report_smart_sell(
@@ -9843,6 +10396,9 @@ def _do_sell_core(smart=False, dry_run=False):
     _print_stats(records)
     if dry_run:
         return EXIT_OK
+    if not artifact_account_valid:
+        print('[ERROR] sell completed but account refresh failed integrity checks')
+        return EXIT_RUNTIME_ERROR
     if trade_failed_count > 0:
         return EXIT_RUNTIME_ERROR
     if sold_count > 0:
@@ -10700,33 +11256,35 @@ def do_add_position(dry_run=False):
     if not dry_run:
         live_state = _refresh_live_artifact_state(records)
         records = live_state['records']
-        write_account_artifacts(
+        add_execution_result = {
+            'action': 'add_position',
+            'planned_count': len(add_list),
+            'planned_amount': round(total_add, 2),
+            'first_pass_success_count': first_pass_success_count,
+            'tail_retry_queued_count': len(retry_tail_queue),
+            'tail_retry_success_count': tail_retry_success_count,
+            'final_success_count': success_count,
+            'failed_count': len(failed_add_items),
+            'failed_codes': [str(item.get('code', '')).zfill(6) for item in failed_add_items],
+            'failed_names': [str(item.get('name', '')).strip() for item in failed_add_items],
+            'capital_bias_count': len(capital_bias_items),
+            'capital_bias_codes': [item['code'] for item in capital_bias_items],
+            'capital_bias_items': capital_bias_items,
+            'aggressive_add_count': len(aggressive_add_items),
+            'aggressive_add_codes': [item['code'] for item in aggressive_add_items],
+            'aggressive_add_items': aggressive_add_items,
+            'status': (
+                'account_refresh_failed'
+                if live_state.get('account_batch_valid') is False else
+                ('partial_failed' if failed_add_items else 'ok')
+            ),
+        }
+        _write_live_state_account_artifacts(
             'add_position',
-            records=records,
-            balance=live_state['balance'],
-            positions=live_state['positions'],
-            pending_items=live_state['pending_items'],
-            execution_result={
-                'action': 'add_position',
-                'planned_count': len(add_list),
-                'planned_amount': round(total_add, 2),
-                'first_pass_success_count': first_pass_success_count,
-                'tail_retry_queued_count': len(retry_tail_queue),
-                'tail_retry_success_count': tail_retry_success_count,
-                'final_success_count': success_count,
-                'failed_count': len(failed_add_items),
-                'failed_codes': [str(item.get('code', '')).zfill(6) for item in failed_add_items],
-                'failed_names': [str(item.get('name', '')).strip() for item in failed_add_items],
-                'capital_bias_count': len(capital_bias_items),
-                'capital_bias_codes': [item['code'] for item in capital_bias_items],
-                'capital_bias_items': capital_bias_items,
-                'aggressive_add_count': len(aggressive_add_items),
-                'aggressive_add_codes': [item['code'] for item in aggressive_add_items],
-                'aggressive_add_items': aggressive_add_items,
-                'status': 'partial_failed' if failed_add_items else 'ok',
-            },
+            live_state,
+            execution_result=add_execution_result,
         )
-        if success_count <= 0 or failed_add_items:
+        if live_state.get('account_batch_valid') is False or success_count <= 0 or failed_add_items:
             # #region debug-point D:add-position-exit-runtime-error
             _dbg_emit(
                 'D',
@@ -10783,6 +11341,27 @@ def do_close_node():
             records_count=len(context.get('records') or []),
             orders_count=len(context.get('orders') or []),
         )
+        if context.get('account_batch_valid') is False:
+            stage = 'account_batch_invalid'
+            summary = _write_account_integrity_failure_summary(
+                'report',
+                balance=context['balance'],
+                positions=context['positions'],
+                reconcile_summary=context['reconcile_summary'],
+            )
+            account_status = summary.get('account_status', {})
+            failure_payload = {
+                'status': 'runtime_error',
+                'reason': 'account_batch_integrity_failed',
+                'attempts': context.get('account_batch_attempts', 0),
+                'account_status': account_status,
+            }
+            _emit_stage(
+                'account_batch_invalid',
+                reason=str((account_status or {}).get('reason', '')).strip(),
+            )
+            print(json.dumps(failure_payload, ensure_ascii=False, indent=2))
+            return EXIT_RUNTIME_ERROR
         stage = 'write_account_artifacts'
         _emit_stage('write_account_artifacts:start')
         summary = write_account_artifacts(
@@ -10929,7 +11508,7 @@ def do_midday_review():
 
 
 def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
-    """用 MX 已成委托校正一笔已平仓 episode，不触发任何交易接口。"""
+    """用 MX 已成订单与近期原始快照校正一笔已平仓 episode，不触发交易接口。"""
     code = str(code or '').zfill(6)
     buy_ids = [str(order_id).strip() for order_id in (buy_order_ids or []) if str(order_id).strip()]
     sell_id = str(sell_order_id or '').strip()
@@ -10960,31 +11539,47 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
     if len(source_matches) != 1:
         return fail(f'未找到唯一的本地已平仓记录（匹配数={len(source_matches)}）')
 
-    buy_orders, buy_error = _get_filled_orders_from_mx(1)
-    if buy_error:
-        return fail(buy_error)
-    sell_orders, sell_error = _get_filled_orders_from_mx(2)
-    if sell_error:
-        return fail(sell_error)
+    buy_orders, buy_provenance = _get_repair_orders_from_mx(1)
+    sell_orders, sell_provenance = _get_repair_orders_from_mx(2)
+    if not buy_orders or not sell_orders:
+        return fail('MX 订单查询及其受时限原始快照均未返回所需订单；未写入任何校正')
     buy_by_id = {str(order.get('id', '')).strip(): order for order in buy_orders}
     sell_by_id = {str(order.get('id', '')).strip(): order for order in sell_orders}
     matched_buys = [buy_by_id.get(order_id) for order_id in buy_ids]
     matched_sell = sell_by_id.get(sell_id)
     if any(order is None for order in matched_buys) or matched_sell is None:
-        return fail('MX 已成订单历史未返回全部指定订单；未写入任何校正')
+        return fail('MX 实时列表及受时限原始快照未返回全部指定订单；未写入任何校正')
 
-    for expected_direction, orders_to_validate in ((1, matched_buys), (2, [matched_sell])):
-        for order in orders_to_validate:
-            if (
-                str(order.get('code', '')).zfill(6) != code
-                or _inum(order.get('direction', 0), 0) != expected_direction
-                or _inum(order.get('status', 0), 0) != 4
-                or _inum(order.get('trade_count', 0), 0) <= 0
-                or _fnum(order.get('actual_trade_price', 0.0), 0.0) <= 0
-            ):
-                return fail(f'MX 订单 {order.get("id", "")} 未通过成交字段校验；未写入任何校正')
+    for order in matched_buys:
+        if str(order.get('code', '')).zfill(6) != code or _inum(order.get('direction', 0), 0) != 1:
+            return fail(f'MX 买入订单 {order.get("id", "")} 未通过代码或方向校验；未写入任何校正')
+    if (
+        str(matched_sell.get('code', '')).zfill(6) != code
+        or _inum(matched_sell.get('direction', 0), 0) != 2
+        or _inum(matched_sell.get('status', 0), 0) != 4
+        or _inum(matched_sell.get('trade_count', 0), 0) <= 0
+        or _fnum(matched_sell.get('actual_trade_price', 0.0), 0.0) <= 0
+    ):
+        return fail(f'MX 卖出订单 {matched_sell.get("id", "")} 未通过成交字段校验；未写入任何校正')
 
-    buy_count = sum(_inum(order.get('trade_count', 0), 0) for order in matched_buys)
+    filled_buys = [
+        order for order in matched_buys
+        if _inum(order.get('status', 0), 0) == 4
+        and _inum(order.get('trade_count', 0), 0) > 0
+        and _fnum(order.get('actual_trade_price', 0.0), 0.0) > 0
+    ]
+    unfilled_buys = [order for order in matched_buys if order not in filled_buys]
+    if not filled_buys:
+        return fail('指定 MX 买入订单均未成交；未写入任何校正')
+    for order in unfilled_buys:
+        if _inum(order.get('trade_count', 0), 0) != 0:
+            return fail(f'MX 买入订单 {order.get("id", "")} 为非完整成交状态；未写入任何校正')
+
+    filled_buy_ids = {
+        str(order.get('id', '')).strip() for order in filled_buys
+        if str(order.get('id', '')).strip()
+    }
+    buy_count = sum(_inum(order.get('trade_count', 0), 0) for order in filled_buys)
     sell_count = _inum(matched_sell.get('trade_count', 0), 0)
     if buy_count != sell_count:
         return fail(f'买卖成交数量不一致：买入 {buy_count}，卖出 {sell_count}；未写入任何校正')
@@ -10992,9 +11587,12 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
     existing_payload = _read_json(MX_VERIFIED_FILLS_FILE)
     fills = existing_payload.get('fills', {}) if isinstance(existing_payload, dict) else {}
     fills = dict(fills) if isinstance(fills, dict) else {}
-    verified_buys = [_verified_fill_from_order(order, action='buy') for order in matched_buys]
+    verified_buys = [_verified_fill_from_order(order, action='buy') for order in filled_buys]
+    verified_unfilled_buys = [_verified_fill_from_order(order, action='buy') for order in unfilled_buys]
+    for fill in verified_unfilled_buys:
+        fill['fill_state'] = 'not_filled'
     verified_sell = _verified_fill_from_order(matched_sell, action='sell')
-    for fill in [*verified_buys, verified_sell]:
+    for fill in [*verified_buys, *verified_unfilled_buys, verified_sell]:
         fills[fill['order_id']] = fill
     _write_json_atomic(MX_VERIFIED_FILLS_FILE, {
         'version': 1,
@@ -11007,7 +11605,7 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
         record for record in records
         if str(record.get('status', '')).strip() == 'closed'
         and str(record.get('code', '')).zfill(6) == code
-        and set(_split_order_ids(record.get('buy_order_ids', ''))) == set(buy_ids)
+        and set(_split_order_ids(record.get('buy_order_ids', ''))) == filled_buy_ids
         and str(record.get('sell_order_id', '')).strip() == sell_id
     ]
     if len(repaired_matches) != 1:
@@ -11045,8 +11643,10 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
     )
     report.update({
         'ok': True,
-        'source': 'mx_mockTrading_orders_status_4',
+        'source': 'mx_mockTrading_orders_status_4_plus_recent_raw_snapshot',
+        'order_query_provenance': {'buy': buy_provenance, 'sell': sell_provenance},
         'verified_buy_fills': verified_buys,
+        'verified_unfilled_buy_orders': verified_unfilled_buys,
         'verified_sell_fill': verified_sell,
         'corrected_record': {
             'entry_price': _fnum(repaired.get('entry_price', 0.0), 0.0),
@@ -11073,7 +11673,7 @@ def main():
     parser.add_argument('--status', action='store_true', help='查看持仓和战绩')
     parser.add_argument('--close-node', action='store_true', help='收盘节点：全天复核复盘与学习放行')
     parser.add_argument('--report', action='store_true', help='生成账户摘要、NAV历史和学习循环报告')
-    parser.add_argument('--repair-closed-episode', metavar='CODE', help='仅用 MX 已成订单校正指定已平仓记录')
+    parser.add_argument('--repair-closed-episode', metavar='CODE', help='用 MX 已成订单及近期快照校正指定已平仓记录')
     parser.add_argument('--repair-buy-order-id', action='append', default=[], help='校正记录的 MX 买入订单 ID（可重复传入）')
     parser.add_argument('--repair-sell-order-id', default='', help='校正记录的 MX 卖出订单 ID')
     parser.add_argument('--dry-run', action='store_true', help='模拟运行，不实际下单')

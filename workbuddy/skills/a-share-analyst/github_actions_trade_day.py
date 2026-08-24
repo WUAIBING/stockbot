@@ -9,9 +9,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import signal
 import subprocess
+import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 
@@ -31,6 +35,19 @@ AUXILIARY_PHASE_TIMEOUTS = {
     "workbuddy-status": 45,
 }
 AUXILIARY_NEXT_CRITICAL_GUARD_SECONDS = 60
+ASYNC_PHASE_TIMEOUTS = {
+    'decision': 360,
+}
+SCHEDULE_NON_FATAL_EXIT_CODES = {2, 10, 11}
+
+
+@dataclass
+class AsyncTask:
+    spec: TaskSpec
+    process: object
+    started_monotonic: float
+    timeout_seconds: int
+    timed_out: bool = False
 
 
 def market_now() -> datetime:
@@ -145,6 +162,182 @@ def run_task(spec: TaskSpec, *, env: dict[str, str], run_prefix: str, dry_run: b
         return 124
 
 
+def is_async_spec(spec: TaskSpec) -> bool:
+    return spec.phase in ASYNC_PHASE_TIMEOUTS
+
+
+def is_schedule_nonfatal_exit(exit_code: int) -> bool:
+    return int(exit_code) in SCHEDULE_NON_FATAL_EXIT_CODES
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f'.{path.name}.{os.getpid()}.{time.time_ns()}.tmp')
+    try:
+        with tmp_path.open('w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _publish_controller_decision_marker(*, env: dict[str, str], producer_run_id: str) -> dict:
+    now = market_now()
+    trade_date = now.date().isoformat()
+    data_dir = Path(
+        env.get('TLFZ_WORKBUDDY_DATA_DIR')
+        or (ROOT.parent.parent / 'a-share-analyst')
+    )
+    pointer_path = data_dir / 'v10_decision_latest.json'
+    timestamp = now.isoformat(sep=' ', timespec='microseconds')
+    payload = {
+        'schema_version': 1,
+        'artifact_id': f'{trade_date}:decision:{producer_run_id}',
+        'producer_run_id': producer_run_id,
+        'phase': 'decision',
+        'trade_date': trade_date,
+        'complete': False,
+        'state': 'starting',
+        'decision_cutoff_at': f'{trade_date} 14:50:00',
+        'started_at': timestamp,
+        'published_at': timestamp,
+        'market_timezone': 'UTC+08',
+    }
+    _write_json_atomic(pointer_path, payload)
+    return payload
+
+
+def start_async_task(spec: TaskSpec, *, env: dict[str, str], run_prefix: str, dry_run: bool):
+    producer_run_id = f'{run_prefix}-{spec.suffix.lower()}'
+    args = build_task_args(spec)
+    args.extend(['--run-id', producer_run_id])
+    command_text = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in args)
+    print(f'[START-ASYNC] {spec.suffix} -> {command_text}')
+    if dry_run:
+        return None
+    if spec.phase == 'decision':
+        _publish_controller_decision_marker(env=env, producer_run_id=producer_run_id)
+    popen_kwargs = {
+        'cwd': ROOT,
+        'env': env,
+    }
+    if os.name == 'nt':
+        popen_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+    else:
+        popen_kwargs['start_new_session'] = True
+    process = subprocess.Popen(args, **popen_kwargs)
+    task = AsyncTask(
+        spec=spec,
+        process=process,
+        started_monotonic=time.monotonic(),
+        timeout_seconds=ASYNC_PHASE_TIMEOUTS[spec.phase],
+    )
+    threading.Thread(
+        target=_async_task_watchdog,
+        args=(task,),
+        name=f'watchdog-{spec.suffix}',
+        daemon=True,
+    ).start()
+    return task
+
+
+def _async_task_watchdog(task: AsyncTask) -> None:
+    try:
+        task.process.wait(timeout=task.timeout_seconds)
+    except subprocess.TimeoutExpired:
+        task.timed_out = True
+        print(f'[TIMEOUT-ASYNC] {task.spec.suffix} exceeded {task.timeout_seconds}s')
+        _terminate_async_process_tree(task)
+
+
+def _terminate_async_process_tree(task: AsyncTask) -> None:
+    process = task.process
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == 'nt':
+            subprocess.run(
+                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                capture_output=True,
+                timeout=5,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name != 'nt':
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    elif process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def collect_finished_async_tasks(tasks: list[AsyncTask]) -> tuple[list[AsyncTask], list[tuple[str, int]]]:
+    remaining_tasks = []
+    completed_results = []
+    now_monotonic = time.monotonic()
+    for task in tasks:
+        return_code = task.process.poll()
+        elapsed = now_monotonic - task.started_monotonic
+        if return_code is None and elapsed >= task.timeout_seconds:
+            task.timed_out = True
+            print(f'[TIMEOUT-ASYNC] {task.spec.suffix} exceeded {task.timeout_seconds}s')
+            _terminate_async_process_tree(task)
+            return_code = 124
+        elif task.timed_out:
+            return_code = 124
+        if return_code is None:
+            remaining_tasks.append(task)
+            continue
+        print(f'[DONE-ASYNC] {task.spec.suffix} exit_code={return_code}')
+        completed_results.append((task.spec.suffix, int(return_code)))
+    return remaining_tasks, completed_results
+
+
+def finish_async_tasks(tasks: list[AsyncTask]) -> list[tuple[str, int]]:
+    results = []
+    for task in tasks:
+        remaining_seconds = max(0.0, task.timeout_seconds - (time.monotonic() - task.started_monotonic))
+        try:
+            return_code = task.process.wait(timeout=remaining_seconds)
+        except subprocess.TimeoutExpired:
+            task.timed_out = True
+            print(f'[TIMEOUT-ASYNC] {task.spec.suffix} exceeded {task.timeout_seconds}s')
+            _terminate_async_process_tree(task)
+            return_code = 124
+        if task.timed_out:
+            return_code = 124
+        print(f'[DONE-ASYNC] {task.spec.suffix} exit_code={return_code}')
+        results.append((task.spec.suffix, int(return_code)))
+    return results
+
+
+def _ordered_failures(failures: dict[str, int], specs: list[TaskSpec]) -> list[tuple[str, int]]:
+    ordered = [(spec.suffix, failures[spec.suffix]) for spec in specs if spec.suffix in failures]
+    known = {suffix for suffix, _code in ordered}
+    ordered.extend(sorted((suffix, code) for suffix, code in failures.items() if suffix not in known))
+    return ordered
+
+
 def iter_selected_specs(start_from_slot: str) -> list[TaskSpec]:
     specs = sorted(TASK_SPECS, key=slot_key)
     if not start_from_slot:
@@ -167,18 +360,26 @@ def main() -> int:
         return 0
 
     env = ensure_runtime_env()
-    run_prefix = f"gha-day-{trade_date.isoformat()}-{os.environ.get('GITHUB_RUN_ID', 'local')}"
+    run_prefix = (
+        f"gha-day-{trade_date.isoformat()}-{os.environ.get('GITHUB_RUN_ID', 'local')}-"
+        f"{os.getpid()}-{time.time_ns()}"
+    )
     selected_specs = iter_selected_specs(args.start_from_slot)
     if not selected_specs:
         print("[SKIP] no tasks selected after start-from-slot filtering.")
         return 0
 
     print(f"[PLAN] trade_date={trade_date.isoformat()} start_from_slot={args.start_from_slot or 'ALL'} task_count={len(selected_specs)}")
-    critical_failures: list[tuple[str, int]] = []
-    auxiliary_failures: list[tuple[str, int]] = []
+    critical_failures: dict[str, int] = {}
+    auxiliary_failures: dict[str, int] = {}
     overdue_skips: list[str] = []
     auxiliary_skips: list[str] = []
+    running_async_tasks: list[AsyncTask] = []
     for index, spec in enumerate(selected_specs):
+        running_async_tasks, async_results = collect_finished_async_tasks(running_async_tasks)
+        for suffix, exit_code in async_results:
+            if exit_code != 0 and not is_schedule_nonfatal_exit(exit_code):
+                critical_failures[suffix] = exit_code
         target_at = target_datetime(spec, trade_date)
         now = market_now()
         lag_seconds = int((now - target_at).total_seconds())
@@ -189,6 +390,10 @@ def main() -> int:
             continue
         if now < target_at:
             wait_until(target_at, dry_run=args.dry_run)
+        running_async_tasks, async_results = collect_finished_async_tasks(running_async_tasks)
+        for suffix, exit_code in async_results:
+            if exit_code != 0 and not is_schedule_nonfatal_exit(exit_code):
+                critical_failures[suffix] = exit_code
         now = market_now()
         if is_auxiliary_spec(spec):
             should_skip, reason = should_skip_auxiliary_task(
@@ -202,27 +407,46 @@ def main() -> int:
                 print(f"[SKIP] {reason}")
                 auxiliary_skips.append(f"{spec.suffix}@{spec.time_hhmm}")
                 continue
+        if is_async_spec(spec):
+            async_task = start_async_task(
+                spec,
+                env=env,
+                run_prefix=run_prefix,
+                dry_run=args.dry_run,
+            )
+            if async_task is not None:
+                running_async_tasks.append(async_task)
+            continue
         exit_code = run_task(spec, env=env, run_prefix=run_prefix, dry_run=args.dry_run)
-        if exit_code != 0:
-            target_list = auxiliary_failures if is_auxiliary_spec(spec) else critical_failures
-            target_list.append((spec.suffix, exit_code))
+        if exit_code != 0 and not is_schedule_nonfatal_exit(exit_code):
+            target_map = auxiliary_failures if is_auxiliary_spec(spec) else critical_failures
+            target_map[spec.suffix] = exit_code
+        elif exit_code != 0:
+            print(f'[INFO] schedule semantic non-fatal: {spec.suffix} exit_code={exit_code}')
+
+    for suffix, exit_code in finish_async_tasks(running_async_tasks):
+        if exit_code != 0 and not is_schedule_nonfatal_exit(exit_code):
+            critical_failures[suffix] = exit_code
 
     if overdue_skips and not args.dry_run:
         summary = ", ".join(overdue_skips)
         print(f"[FAIL] missed scheduled slots because the workflow started too late -> {summary}")
         return 86
     if critical_failures:
-        summary = ", ".join(f"{suffix}:{code}" for suffix, code in critical_failures)
+        ordered_critical = _ordered_failures(critical_failures, selected_specs)
+        summary = ", ".join(f"{suffix}:{code}" for suffix, code in ordered_critical)
         print(f"[FAIL] one or more scheduled tasks failed -> {summary}")
         if auxiliary_failures:
-            aux_summary = ", ".join(f"{suffix}:{code}" for suffix, code in auxiliary_failures)
+            ordered_auxiliary = _ordered_failures(auxiliary_failures, selected_specs)
+            aux_summary = ", ".join(f"{suffix}:{code}" for suffix, code in ordered_auxiliary)
             print(f"[WARN] auxiliary challenger/workbuddy tasks also failed -> {aux_summary}")
         if auxiliary_skips:
             skip_summary = ", ".join(auxiliary_skips)
             print(f"[WARN] auxiliary challenger/workbuddy tasks skipped -> {skip_summary}")
-        return critical_failures[-1][1]
+        return ordered_critical[-1][1]
     if auxiliary_failures:
-        summary = ", ".join(f"{suffix}:{code}" for suffix, code in auxiliary_failures)
+        ordered_auxiliary = _ordered_failures(auxiliary_failures, selected_specs)
+        summary = ", ".join(f"{suffix}:{code}" for suffix, code in ordered_auxiliary)
         print(f"[WARN] auxiliary challenger/workbuddy tasks failed but mainline stayed healthy -> {summary}")
     if auxiliary_skips:
         summary = ", ".join(auxiliary_skips)

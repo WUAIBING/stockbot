@@ -22,3 +22,11 @@ __pycache__/
 /workbuddy/skills/a-share-analyst/*.log
 /workbuddy/skills/a-share-analyst/*dryrun*.txt
 /workbuddy/skills/a-share-analyst/tmp_*.json
+
+# Hand-edit backups created directly on the DO droplet
+*.bak_*
+
+# Sync provenance markers written by sync_repo_to_do.sh
+/.stockbot-sync-source-sha
+/.stockbot-sync-source-branch
+/.stockbot-sync-source-remote
