@@ -4382,6 +4382,120 @@ class VerifiedMxFillLedgerTests(unittest.TestCase):
         self.assertIn("B-FILLED", persisted_fills)
         self.assertIn("S1", persisted_fills)
 
+    def test_repair_closed_episode_tolerates_buy_order_absent_from_mx(self) -> None:
+        """A cancelled order never appears in MX filled-order history at all.
+
+        The 2026-08-14 repair of 002487 aborted here: the gate treated "not
+        returned by MX" as a hard failure, so the record could never be fixed.
+        Absent orders must be handled like returned-but-unfilled ones.
+        """
+        source_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-CANCELLED|B-FILLED",
+            "sell_order_id": "S1",
+        }
+        rebuilt_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-FILLED",
+            "sell_order_id": "S1",
+            "entry_price": 42.1,
+            "sell_price": 43.4,
+            "quantity": 4100,
+            "pnl": 5330.0,
+            "pnl_pct": 3.09,
+        }
+        # B-CANCELLED is deliberately absent from what MX returns.
+        buy_orders = [{
+            "id": "B-FILLED",
+            "code": "002487",
+            "direction": 1,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 42.1,
+        }]
+        sell_orders = [{
+            "id": "S1",
+            "code": "002487",
+            "direction": 2,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 43.4,
+        }]
+
+        def repair_orders(direction):
+            orders = buy_orders if direction == 1 else sell_orders
+            return orders, {"has_snapshot": True, "live_error": "", "snapshot_age_seconds": 60}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            with (
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", str(tmp / "verified_fills.json")),
+                patch.object(trader, "MX_FILL_REPAIR_FILE", str(tmp / "repair.json")),
+                patch.object(trader, "TRADE_EPISODE_HISTORY_FILE", str(tmp / "episodes.json")),
+                patch.object(trader, "_get_repair_orders_from_mx", side_effect=repair_orders),
+                patch.object(trader, "load_track_record", side_effect=[[source_record], [rebuilt_record]]),
+                patch.object(trader, "_read_json", return_value={"version": 1, "fills": {}}),
+                patch.object(trader, "_write_json_atomic"),
+                patch.object(trader, "_build_trade_episode_history", return_value=[]),
+                patch.object(trader, "_summarize_trade_episode_history", return_value={}),
+                patch.object(trader, "get_balance", return_value={}),
+                patch.object(trader, "get_positions", return_value=[]),
+                patch.object(trader, "get_orders", return_value=[]),
+                patch.object(trader, "refresh_pending_orders", return_value=[]),
+                patch.object(trader, "write_account_artifacts", return_value={"generated_at": "2026-08-13 11:00:00"}),
+            ):
+                report = trader.repair_closed_episode_from_mx_orders(
+                    "002487",
+                    buy_order_ids=["B-CANCELLED", "B-FILLED"],
+                    sell_order_id="S1",
+                )
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["missing_buy_order_ids"], ["B-CANCELLED"])
+        self.assertEqual([fill["order_id"] for fill in report["verified_buy_fills"]], ["B-FILLED"])
+        self.assertEqual(report["corrected_record"]["quantity"], 4100)
+
+    def test_repair_closed_episode_fails_when_no_buy_order_returned(self) -> None:
+        """Tolerating absent orders must not extend to every buy going missing."""
+        source_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-CANCELLED",
+            "sell_order_id": "S1",
+        }
+        sell_orders = [{
+            "id": "S1",
+            "code": "002487",
+            "direction": 2,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 43.4,
+        }]
+
+        def repair_orders(direction):
+            orders = [{"id": "OTHER", "code": "000001", "direction": 1}] if direction == 1 else sell_orders
+            return orders, {"has_snapshot": True, "live_error": "", "snapshot_age_seconds": 60}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            with (
+                patch.object(trader, "MX_FILL_REPAIR_FILE", str(tmp / "repair.json")),
+                patch.object(trader, "_get_repair_orders_from_mx", side_effect=repair_orders),
+                patch.object(trader, "load_track_record", return_value=[source_record]),
+                patch.object(trader, "_write_json_atomic"),
+            ):
+                report = trader.repair_closed_episode_from_mx_orders(
+                    "002487",
+                    buy_order_ids=["B-CANCELLED"],
+                    sell_order_id="S1",
+                )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("未返回任何指定买入订单", report["error"])
+
+
 
 if __name__ == "__main__":
     unittest.main()

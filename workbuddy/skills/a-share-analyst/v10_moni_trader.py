@@ -12473,10 +12473,24 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
         return fail('MX 订单查询及其受时限原始快照均未返回所需订单；未写入任何校正')
     buy_by_id = {str(order.get('id', '')).strip(): order for order in buy_orders}
     sell_by_id = {str(order.get('id', '')).strip(): order for order in sell_orders}
-    matched_buys = [buy_by_id.get(order_id) for order_id in buy_ids]
     matched_sell = sell_by_id.get(sell_id)
-    if any(order is None for order in matched_buys) or matched_sell is None:
-        return fail('MX 实时列表及受时限原始快照未返回全部指定订单；未写入任何校正')
+    # 撤单不会出现在 MX 的"已成订单"历史里。旧逻辑把"未返回"当成硬失败，
+    # 于是 002487 这种"下单 -> 撤单 -> 重新下单"的记录永远无法校正
+    # （2026-08-14 的修复尝试即因此中止）。未返回的订单一律按未成交处理：
+    # 它对成交数量与成本没有任何贡献，下游本来就只用 filled_buys 重建记录。
+    matched_buys = []
+    missing_buy_ids = []
+    for order_id in buy_ids:
+        order = buy_by_id.get(order_id)
+        if order is None:
+            missing_buy_ids.append(order_id)
+            continue
+        matched_buys.append(order)
+    report['missing_buy_order_ids'] = list(missing_buy_ids)
+    if matched_sell is None:
+        return fail('MX 实时列表及受时限原始快照未返回卖出订单；未写入任何校正')
+    if not matched_buys:
+        return fail('MX 实时列表及受时限原始快照未返回任何指定买入订单；未写入任何校正')
 
     for order in matched_buys:
         if str(order.get('code', '')).zfill(6) != code or _inum(order.get('direction', 0), 0) != 1:
