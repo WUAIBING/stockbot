@@ -236,6 +236,13 @@ class BacktestEngine:
 
     @staticmethod
     def compute_weekly_features(wdf: pd.DataFrame | None) -> dict[str, Any]:
+        """Weekly features as they stood at the END of the series.
+
+        Snapshot only. Do not broadcast this across a daily history - every
+        row would carry the newest week's state, which is look-ahead bias and
+        leaves the weekly conditions constant per stock. Use
+        compute_weekly_feature_frame for per-day values.
+        """
         if wdf is None or len(wdf) < 20:
             return {"weekly_align": False, "weekly_slope": 0.0, "weekly_close_vs_wma20": 0.0, "weekly_ma10_slope": 0.0}
         w = wdf.copy()
@@ -261,6 +268,46 @@ class BacktestEngine:
             "weekly_close_vs_wma20": close_vs_wma20,
             "weekly_ma10_slope": w10_slope,
         }
+
+    @staticmethod
+    def compute_weekly_feature_frame(wdf: pd.DataFrame | None) -> pd.DataFrame:
+        """Weekly features for every week, not just the last one.
+
+        compute_weekly_features returns a single end-of-history snapshot. When
+        that snapshot is written onto a three-year daily history, a 2023 row ends
+        up carrying 2026 weekly state: look-ahead bias, and the weekly conditions
+        never vary, so any rule gating on weekly_align either always or never
+        matches. Seven of the eleven v10 rules gate on weekly_align.
+
+        Returns one row per completed week with the same feature names.
+        """
+        cols = ["week_end", "weekly_align", "weekly_slope",
+                "weekly_close_vs_wma20", "weekly_ma10_slope"]
+        if wdf is None or len(wdf) < 20:
+            return pd.DataFrame(columns=cols)
+
+        w = wdf.copy().sort_values("datetime").reset_index(drop=True)
+        for win in (5, 10, 20):
+            w[f"wma{win}"] = w["close"].rolling(win).mean()
+
+        w["weekly_align"] = (w["wma5"] > w["wma10"]) & (w["wma10"] > w["wma20"])
+        prev20 = w["wma20"].shift(4)
+        w["weekly_slope"] = ((w["wma20"] - prev20)
+                             / prev20.abs().clip(lower=0.01) * 100).fillna(0.0)
+        prev10 = w["wma10"].shift(2)
+        w["weekly_ma10_slope"] = ((w["wma10"] - prev10)
+                                  / prev10.abs().clip(lower=0.01) * 100).fillna(0.0)
+        w["weekly_close_vs_wma20"] = ((w["close"] - w["wma20"])
+                                      / w["wma20"].where(w["wma20"] > 0) * 100).fillna(0.0)
+
+        out = pd.DataFrame({
+            "week_end": pd.to_datetime(w["datetime"]),
+            "weekly_align": w["weekly_align"].fillna(False).astype(bool),
+            "weekly_slope": w["weekly_slope"].astype(float),
+            "weekly_close_vs_wma20": w["weekly_close_vs_wma20"].astype(float),
+            "weekly_ma10_slope": w["weekly_ma10_slope"].astype(float),
+        })
+        return out.dropna(subset=["week_end"]).reset_index(drop=True)
 
     def compute_daily_features(self, daily_df: pd.DataFrame, wfeats: dict[str, Any]) -> pd.DataFrame:
         cfg = self.config
@@ -309,11 +356,66 @@ class BacktestEngine:
         d["vol_shrink"] = d["amt_ratio"] < cfg.amt_ratio_low
         d["ret_5d"] = (d["close"].shift(-5) / d["close"] - 1) * 100
 
-        d["weekly_align"] = wfeats.get("weekly_align", False)
-        d["weekly_slope"] = wfeats.get("weekly_slope", 0.0)
-        d["weekly_close_vs_wma20"] = wfeats.get("weekly_close_vs_wma20", 0.0)
-        d["weekly_ma10_slope"] = wfeats.get("weekly_ma10_slope", 0.0)
+        wframe = wfeats.get("_frame") if isinstance(wfeats, dict) else None
+        if isinstance(wframe, pd.DataFrame) and not wframe.empty:
+            # as-of join on the last COMPLETED week strictly before each day,
+            # so a day never sees weekly state from its own unfinished week
+            left = d.assign(_dt=pd.to_datetime(d["datetime"])).sort_values("_dt")
+            right = wframe.sort_values("week_end")
+            merged = pd.merge_asof(
+                left, right, left_on="_dt", right_on="week_end",
+                direction="backward", allow_exact_matches=False,
+            )
+            merged = merged.sort_index()
+            d["weekly_align"] = merged["weekly_align"].fillna(False).astype(bool).values
+            d["weekly_slope"] = merged["weekly_slope"].fillna(0.0).astype(float).values
+            d["weekly_close_vs_wma20"] = merged["weekly_close_vs_wma20"].fillna(0.0).astype(float).values
+            d["weekly_ma10_slope"] = merged["weekly_ma10_slope"].fillna(0.0).astype(float).values
+        else:
+            d["weekly_align"] = wfeats.get("weekly_align", False)
+            d["weekly_slope"] = wfeats.get("weekly_slope", 0.0)
+            d["weekly_close_vs_wma20"] = wfeats.get("weekly_close_vs_wma20", 0.0)
+            d["weekly_ma10_slope"] = wfeats.get("weekly_ma10_slope", 0.0)
         return d
+
+    @staticmethod
+    def compute_intraday_buy_zone(day_bars: pd.DataFrame | None) -> dict[str, Any]:
+        """Buy-zone direction from one session's 5-minute bars.
+
+        Ported from scanner_v10.compute_5min_features so the backtest sees the
+        same bz_direction / bz_rt_direction the live scanner does. Seven of the
+        eleven v10 rules gate on these, and without them those rules cannot be
+        evaluated at all.
+        """
+        feats: dict[str, Any] = {"bz_direction": 0.0, "bz_rt_direction": 0.0, "bz_vol_ratio": 1.0}
+        if day_bars is None or len(day_bars) == 0:
+            return feats
+        d = day_bars
+        if "hour" not in d.columns or "minute" not in d.columns:
+            dt = pd.to_datetime(d["datetime"])
+            d = d.assign(hour=dt.dt.hour, minute=dt.dt.minute)
+
+        bz_full = d[(d["hour"] == 14) & (d["minute"] >= 30)]
+        bz_rt = d[(d["hour"] == 14) & (d["minute"] >= 30) & (d["minute"] <= 50)]
+
+        if len(bz_full) >= 3:
+            bz_open = float(bz_full.iloc[0]["open"])
+            bz_close = float(bz_full.iloc[-1]["close"])
+            feats["bz_direction"] = (bz_close - bz_open) / bz_open * 100 if bz_open > 0 else 0.0
+        if len(bz_rt) >= 2:
+            rt_open = float(bz_rt.iloc[0]["open"])
+            rt_close = float(bz_rt.iloc[-1]["close"])
+            feats["bz_rt_direction"] = (rt_close - rt_open) / rt_open * 100 if rt_open > 0 else 0.0
+        else:
+            # live scanner falls back to the full-window direction
+            feats["bz_rt_direction"] = feats["bz_direction"]
+
+        total_vol = float(d["vol"].sum()) if "vol" in d.columns else 0.0
+        if len(bz_full) > 0 and total_vol > 0:
+            avg_per_bar = total_vol / len(d)
+            bz_vol = float(bz_full["vol"].sum())
+            feats["bz_vol_ratio"] = (bz_vol / len(bz_full)) / avg_per_bar if avg_per_bar > 0 else 1.0
+        return feats
 
     def process_stock(self, code: str, name: str, market: int) -> list[dict[str, Any]]:
         """Process one stock: fetch bars, compute features, return signal records."""
@@ -325,6 +427,7 @@ class BacktestEngine:
         min5 = self.fetch_5min_bars(market, code)
 
         wfeats = self.compute_weekly_features(weekly)
+        wfeats["_frame"] = self.compute_weekly_feature_frame(weekly)
         d = self.compute_daily_features(daily, wfeats)
 
         min5_by_date: dict[Any, pd.DataFrame] = {}
@@ -365,6 +468,8 @@ class BacktestEngine:
                 "weekly_slope": float(row["weekly_slope"]),
                 "weekly_close_vs_wma20": float(row["weekly_close_vs_wma20"]),
             }
+            bar_date = pd.Timestamp(row["datetime"]).date()
+            rec.update(self.compute_intraday_buy_zone(min5_by_date.get(bar_date)))
             records.append(rec)
         return records
 

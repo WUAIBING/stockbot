@@ -161,5 +161,140 @@ class EngineLifecycleTests(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+
+
+class WeeklyFeatureFrameTests(unittest.TestCase):
+    """Weekly features must vary per week, not be one end-of-history snapshot.
+
+    Broadcasting the snapshot gave every 2023 row the 2026 weekly state:
+    look-ahead bias, and weekly_align constant per stock - which silently
+    zeroed the seven v10 rules that gate on it.
+    """
+
+    def _weekly(self, n=60, start=10.0, step=0.5):
+        return pd.DataFrame({
+            "datetime": pd.date_range("2024-01-05", periods=n, freq="7D"),
+            "close": [start + i * step for i in range(n)],
+        })
+
+    def test_returns_one_row_per_week(self):
+        frame = BacktestEngine.compute_weekly_feature_frame(self._weekly(60))
+        self.assertEqual(len(frame), 60)
+        self.assertIn("week_end", frame.columns)
+
+    def test_short_history_returns_empty_frame(self):
+        self.assertTrue(BacktestEngine.compute_weekly_feature_frame(self._weekly(5)).empty)
+        self.assertTrue(BacktestEngine.compute_weekly_feature_frame(None).empty)
+
+    def test_align_is_true_in_a_steady_uptrend(self):
+        frame = BacktestEngine.compute_weekly_feature_frame(self._weekly(60, step=0.5))
+        self.assertTrue(bool(frame["weekly_align"].iloc[-1]))
+
+    def test_align_is_false_in_a_steady_downtrend(self):
+        frame = BacktestEngine.compute_weekly_feature_frame(
+            self._weekly(60, start=50.0, step=-0.5))
+        self.assertFalse(bool(frame["weekly_align"].iloc[-1]))
+
+    def test_align_actually_varies_across_a_reversal(self):
+        up = [10.0 + i * 0.5 for i in range(40)]
+        down = [up[-1] - i * 0.5 for i in range(1, 41)]
+        wdf = pd.DataFrame({
+            "datetime": pd.date_range("2024-01-05", periods=80, freq="7D"),
+            "close": up + down,
+        })
+        frame = BacktestEngine.compute_weekly_feature_frame(wdf)
+        values = set(bool(x) for x in frame["weekly_align"])
+        self.assertEqual(values, {True, False},
+                         "weekly_align must change across a trend reversal")
+
+    def test_daily_rows_get_the_last_completed_week_not_their_own(self):
+        """A given day must not see weekly state from its own unfinished week."""
+        wdf = self._weekly(60)
+        engine = BacktestEngine()
+        wfeats = engine.compute_weekly_features(wdf)
+        wfeats["_frame"] = engine.compute_weekly_feature_frame(wdf)
+
+        daily = pd.DataFrame({
+            "datetime": pd.date_range("2024-06-03", periods=40, freq="D"),
+            "open": [20.0] * 40, "high": [21.0] * 40,
+            "low": [19.0] * 40, "close": [20.0] * 40,
+            "vol": [1000.0] * 40, "amount": [20000.0] * 40,
+        })
+        out = engine.compute_daily_features(daily, wfeats)
+
+        frame = wfeats["_frame"]
+        checked = 0
+        for i in range(len(out)):
+            day = pd.Timestamp(out["datetime"].iloc[i])
+            eligible = frame[frame["week_end"] < day]
+            if eligible.empty:
+                continue
+            expected = eligible.iloc[-1]
+            self.assertEqual(bool(out["weekly_align"].iloc[i]),
+                             bool(expected["weekly_align"]),
+                             "row %d (%s) took the wrong week" % (i, day.date()))
+            checked += 1
+        self.assertGreater(checked, 0, "test asserted nothing")
+
+    def test_daily_features_no_longer_constant_per_stock(self):
+        up = [10.0 + i * 0.5 for i in range(40)]
+        down = [up[-1] - i * 0.5 for i in range(1, 41)]
+        wdf = pd.DataFrame({
+            "datetime": pd.date_range("2023-01-06", periods=80, freq="7D"),
+            "close": up + down,
+        })
+        engine = BacktestEngine()
+        wfeats = engine.compute_weekly_features(wdf)
+        wfeats["_frame"] = engine.compute_weekly_feature_frame(wdf)
+        daily = pd.DataFrame({
+            "datetime": pd.date_range("2023-03-01", periods=400, freq="D"),
+            "open": [20.0] * 400, "high": [21.0] * 400,
+            "low": [19.0] * 400, "close": [20.0] * 400,
+            "vol": [1000.0] * 400, "amount": [20000.0] * 400,
+        })
+        out = engine.compute_daily_features(daily, wfeats)
+        self.assertGreater(out["weekly_slope"].nunique(), 1,
+                           "weekly_slope must vary across a daily history")
+
+
+class IntradayBuyZoneTests(unittest.TestCase):
+    """bz_direction / bz_rt_direction gate seven of the eleven v10 rules."""
+
+    def _bars(self, closes, hours, minutes):
+        return pd.DataFrame({
+            "datetime": pd.to_datetime(["2026-08-14 09:30:00"] * len(closes)),
+            "hour": hours, "minute": minutes,
+            "open": closes, "close": closes, "vol": [100.0] * len(closes),
+        })
+
+    def test_empty_input_is_neutral_not_missing(self):
+        feats = BacktestEngine.compute_intraday_buy_zone(None)
+        self.assertEqual(feats["bz_direction"], 0.0)
+        self.assertEqual(feats["bz_rt_direction"], 0.0)
+
+    def test_rising_buy_zone_is_positive(self):
+        bars = self._bars([100.0, 101.0, 102.0, 103.0],
+                          [14, 14, 14, 14], [30, 40, 50, 55])
+        self.assertGreater(BacktestEngine.compute_intraday_buy_zone(bars)["bz_direction"], 0)
+
+    def test_falling_buy_zone_is_negative(self):
+        bars = self._bars([100.0, 99.0, 98.0, 97.0],
+                          [14, 14, 14, 14], [30, 40, 50, 55])
+        self.assertLess(BacktestEngine.compute_intraday_buy_zone(bars)["bz_direction"], 0)
+
+    def test_rt_window_stops_at_1450(self):
+        """bz_rt covers 14:30-14:50; a 14:55 bar must not affect it."""
+        bars = self._bars([100.0, 102.0, 104.0, 200.0],
+                          [14, 14, 14, 14], [30, 40, 50, 55])
+        feats = BacktestEngine.compute_intraday_buy_zone(bars)
+        self.assertAlmostEqual(feats["bz_rt_direction"], 4.0, places=6)
+
+    def test_bars_outside_the_buy_zone_are_ignored(self):
+        bars = self._bars([50.0, 100.0, 101.0, 102.0],
+                          [10, 14, 14, 14], [15, 30, 40, 50])
+        feats = BacktestEngine.compute_intraday_buy_zone(bars)
+        self.assertAlmostEqual(feats["bz_direction"], 2.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
