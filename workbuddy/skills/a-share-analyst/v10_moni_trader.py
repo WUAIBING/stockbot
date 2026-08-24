@@ -3747,6 +3747,97 @@ def get_positions():
     return positions
 
 
+# ---- 买入参考价合理性校验 ----
+# 2026-08-24 事故：688205 的 ref_price 记为 22.92，实际成交 155.81。
+# ref_price 只用于去重与日志，但**买入数量是用它算出来的**
+# （calc_buy_quantity = 目标金额 / ref_price），所以价格错 N 倍，仓位就大 N 倍。
+# 同一故障在 002487 上把 121k 的目标仓位放大成 686k（16300 股 @ 42.1），
+# 当时被 oversized 保护拦下并撤单；688205 这次没有被拦住。
+# 这里在下单前用当日 opening_tradability 快照的 last_close 做一次量级校验。
+PRICE_SANITY_REFERENCE_MAX_AGE_DAYS = 5
+PRICE_SANITY_MIN_TOLERANCE_PCT = 25.0
+
+
+def _board_daily_limit_pct(code):
+    """A 股各板日内涨跌幅上限，用来判断偏离多少才算“不可能”。"""
+    c = str(code or "").zfill(6)
+    if c.startswith(("688", "300", "301")):
+        return 20.0
+    if c.startswith(("43", "83", "87", "920")):
+        return 30.0
+    return 10.0
+
+
+def _price_sanity_reference(code):
+    """取当日 opening_tradability 快照里的 last_close 作为参考价。"""
+    c = str(code or "").zfill(6)
+    payload = _load_opening_tradability_payload()
+    records = payload.get("records", []) if isinstance(payload, dict) else []
+    if not isinstance(records, list):
+        return 0.0, "", ""
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("code", "")).zfill(6) != c:
+            continue
+        for field in ("last_close", "last_price", "open_price"):
+            price = _fnum(item.get(field, 0.0), 0.0)
+            if price > 0:
+                return price, field, str(payload.get("trade_date", "")).strip()
+        return 0.0, "", str(payload.get("trade_date", "")).strip()
+    return 0.0, "", str(payload.get("trade_date", "")).strip() if isinstance(payload, dict) else ""
+
+
+def _check_buy_ref_price_sanity(code, ref_price):
+    """下单前校验 ref_price 与参考价的偏离，返回 (ok, detail)。
+
+    没有参考数据时放行（fail-open）：宁可漏拦一单，也不要因为快照缺失
+    把当天所有买入全部打死。放行时 detail['reason'] 会说明原因。
+    """
+    price = _fnum(ref_price, 0.0)
+    detail = {
+        "code": str(code or "").zfill(6),
+        "ref_price": price,
+        "reference_price": 0.0,
+        "reference_field": "",
+        "reference_date": "",
+        "deviation_pct": 0.0,
+        "tolerance_pct": 0.0,
+    }
+    if price <= 0:
+        # 0 是市价占位，不是报价，跳过校验
+        detail["reason"] = "market_price_placeholder"
+        return True, detail
+
+    reference, field, trade_date = _price_sanity_reference(code)
+    detail["reference_price"] = reference
+    detail["reference_field"] = field
+    detail["reference_date"] = trade_date
+    if reference <= 0:
+        detail["reason"] = "no_reference_price"
+        return True, detail
+
+    if trade_date:
+        try:
+            age_days = (datetime.strptime(_market_today(), "%Y-%m-%d")
+                        - datetime.strptime(trade_date[:10], "%Y-%m-%d")).days
+        except Exception:
+            age_days = 0
+        if age_days > PRICE_SANITY_REFERENCE_MAX_AGE_DAYS:
+            detail["reason"] = "reference_stale"
+            detail["reference_age_days"] = age_days
+            return True, detail
+
+    tolerance = max(_board_daily_limit_pct(code) * 2.0, PRICE_SANITY_MIN_TOLERANCE_PCT)
+    deviation = abs(price - reference) / reference * 100.0
+    detail["deviation_pct"] = round(deviation, 2)
+    detail["tolerance_pct"] = tolerance
+    if deviation > tolerance:
+        detail["reason"] = "ref_price_out_of_range"
+        return False, detail
+    detail["reason"] = "ok"
+    return True, detail
+
 def buy_stock(code, quantity, ref_price=None, order_context=None):
     """市价买入（带5min去重拦截）
 
@@ -3757,6 +3848,25 @@ def buy_stock(code, quantity, ref_price=None, order_context=None):
     """
     order_context = order_context or {}
     p = _fnum(ref_price, 0.0)
+    sane, sanity = _check_buy_ref_price_sanity(code, p)
+    if not sane:
+        print(
+            f"  [BLOCK] [PRICE] {code} {quantity}股 @ {p:.2f} 与参考价 "
+            f"{sanity['reference_price']:.2f} 偏离 {sanity['deviation_pct']:.1f}% "
+            f"(上限 {sanity['tolerance_pct']:.0f}%)，仓位可能已被错误放大，拒绝下单"
+        )
+        result = {"code": "PRICE_SANITY", "message": "ref_price 与参考价偏离过大，已拒绝下单", "__retry_attempts": 0}
+        _log_trade_api(
+            "buy", code, quantity, p, result,
+            extra={**order_context, "final_outcome": "price_sanity_rejected", "price_sanity": sanity},
+        )
+        _write_buy_diagnostic("ref_price_out_of_range", **sanity)
+        return {
+            "success": False,
+            "result": result,
+            "result_code": "PRICE_SANITY",
+            "order_id": "",
+        }
     min_interval_seconds = _resolve_trade_min_interval(TRADE_BUY_MIN_INTERVAL_SECONDS, order_context)
     if _is_duplicate(code, quantity, p, 'buy'):
         print(f"  [SKIP] [DEDUP] {code} {quantity}股 @ {p:.2f}  5min内已下过，跳过")
