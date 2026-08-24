@@ -1964,7 +1964,7 @@ class SmartSellApplyTests(unittest.TestCase):
         with (
             patch.object(trader, "_throttle_trade_api"),
             patch.object(
-                trader.requests,
+                trader._MX_HTTP_SESSION,
                 "post",
                 side_effect=[requests.ReadTimeout("Read timed out"), FakeResponse()],
             ),
@@ -2033,7 +2033,7 @@ class SmartSellApplyTests(unittest.TestCase):
 
         with (
             patch.object(trader.socket, "getaddrinfo", side_effect=fake_getaddrinfo),
-            patch.object(trader.requests, "post", side_effect=fake_post),
+            patch.object(trader._MX_HTTP_SESSION, "post", side_effect=fake_post),
         ):
             result = trader.api_request("/api/claw/mockTrading/balance", {"moneyUnit": 1}, is_trade=False)
 

@@ -32,6 +32,7 @@ import subprocess
 import time
 import re
 import socket
+import threading
 import urllib.request
 from decimal import Decimal, ROUND_DOWN
 from collections import Counter
@@ -56,6 +57,22 @@ from evolving_model import (
     record_decisions as record_model_decisions,
     refresh_model_state,
 )
+
+# ---- 强制 IPv4 解析 ----
+# DO 服务器无 IPv6 路由，requests/urllib3 默认 IPv6 优先会导致
+# "Errno 101 Network is unreachable"。这里将 getaddrinfo 的地址族
+# 固定为 AF_INET，从根上消除 IPv6 字面量连接路径。
+try:
+    from urllib3.util import connection as _urllib3_connection
+
+    def _force_ipv4_gai_family():
+        return socket.AF_INET
+
+    if not getattr(_urllib3_connection.allowed_gai_family, '_arkclaw_ipv4_forced', False):
+        _urllib3_connection.allowed_gai_family = _force_ipv4_gai_family
+        _force_ipv4_gai_family._arkclaw_ipv4_forced = True
+except Exception:
+    pass
 
 
 def _configure_stdio():
@@ -282,6 +299,25 @@ def resolve_mx_api_url(runtime_env=None, environ=None):
 MX_APIKEY = _MX_RUNTIME_ENV.get('MX_APIKEY', '') or os.environ.get('MX_APIKEY', '')
 MX_API_URL = resolve_mx_api_url(_MX_RUNTIME_ENV)
 
+# ---- MX API 连接池复用 ----
+# 08-08 DO 侧实测：每次 requests.post 新建 TCP+TLS 连接（握手约 1.3s，
+# 跨境链路下握手本身也可能 ConnectTimeout）。改用共享 Session 连接池，
+# 复用 keep-alive 连接，降低握手开销与失败率。墙钟守护线程每次从池中
+# 取连接，urllib3 PoolManager 线程安全；max_retries=0 保持业务层重试
+# 语义不变（重试由 api_request 的 wall_clock 循环控制）。
+try:
+    _MX_HTTP_ADAPTER = requests.adapters.HTTPAdapter(
+        pool_connections=8,
+        pool_maxsize=8,
+        max_retries=0,
+    )
+    _MX_HTTP_SESSION = requests.Session()
+    _MX_HTTP_SESSION.mount('https://', _MX_HTTP_ADAPTER)
+    _MX_HTTP_SESSION.mount('http://', _MX_HTTP_ADAPTER)
+except Exception:
+    _MX_HTTP_SESSION = requests
+
+
 
 # 数据目录
 SCAN_CSV = str(DATA_DIR / 'v10_scan_full.csv')
@@ -296,6 +332,10 @@ BUY_DIAGNOSTIC_FILE = str(DATA_DIR / 'v10_buy_diagnostic_latest.json')
 BALANCE_CACHE_FILE = str(DATA_DIR / 'v10_balance_cache.json')
 POSITIONS_CACHE_FILE = str(DATA_DIR / 'v10_positions_cache.json')
 ORDERS_CACHE_FILE = str(DATA_DIR / 'v10_orders_cache.json')
+MIDDAY_REVIEW_FILE = str(DATA_DIR / 'v10_midday_review_latest.json')
+MIDDAY_NODE_FILE = str(DATA_DIR / 'v10_midday_node_latest.json')
+MIDDAY_GATE_FILE = str(DATA_DIR / 'v10_midday_gate_latest.json')
+PM_GATE_FILE = str(DATA_DIR / 'v10_pm_gate_status.json')
 CLOSE_NODE_FILE = str(DATA_DIR / 'v10_close_node_latest.json')
 LEARNING_GATE_FILE = str(DATA_DIR / 'v10_learning_gate_status.json')
 READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS = 600
@@ -340,6 +380,9 @@ TRADE_RETRYABLE_TRANSPORT_ERROR_TOKENS = (
     'remote disconnected',
     'temporarily unavailable',
 )
+# 临时业务错误码：非限流但间歇性可恢复（如"获取行情最新价失败"501），
+# 重试大概率成功（10-29 观察：同一卖单间歇性成功），但不触发限流冷却
+TRADE_TRANSIENT_BUSINESS_CODES = {'501'}
 TRADE_MAX_RETRIES = 4
 MX_FORCE_IPV4 = str(os.environ.get('MX_FORCE_IPV4', '1')).strip().lower() not in {'0', 'false', 'no'}
 MX_IPV4_ONLY_HOSTS = {
@@ -347,6 +390,24 @@ MX_IPV4_ONLY_HOSTS = {
 }
 TRADE_RETRY_BASE_SECONDS = 2.5
 TRADE_RETRY_JITTER_SECONDS = 0.4
+# 查询类接口（balance/positions/orders）重试：transport/解码失败也重试，
+# 避免海外链路间歇性超时被当成"查询失败"并直接判死整个阶段
+QUERY_REQUEST_MAX_ATTEMPTS = 3
+QUERY_RETRY_BASE_SECONDS = 2.5
+QUERY_RETRY_JITTER_SECONDS = 0.4
+# trade 接口 transport/解码失败的重试上限：网络瞬时故障可重试，
+# 但上限低于 112 限流总重试，避免 API 完全不可用时拖爆阶段超时
+TRADE_TRANSPORT_MAX_ATTEMPTS = 3
+# 第四轮加固：api_request 硬性墙钟护栏。
+# 08-06 下午实测：MX API 黑洞（DNS/connect/read 卡死）时 requests 的
+# socket timeout 无法在 step 预算内返回（13:15-14:45 smart-sell 连续 4 轮
+# 300s 超时，before_trade 后无任何事件）。改为独立守护线程执行请求，
+# 主线程按墙钟预算强制放弃，保证任何一次 API 调用都有上界耗时。
+# 单次 api_request 总墙钟预算：query 类覆盖 3 次重试，trade 类需保留
+# 限价回退的第二次调用预算，因此拆分为两个级别。
+QUERY_API_WALLCLOCK_SECONDS = 60.0
+TRADE_API_WALLCLOCK_SECONDS = 60.0
+API_WALLCLOCK_GRACE_SECONDS = 1.5
 TRADE_TAIL_RETRY_DELAY_SECONDS = 6.0
 TRADE_RATE_LIMIT_GLOBAL_COOLDOWN_SECONDS = 8.0
 TRADE_RATE_LIMIT_FINAL_FAILURE_COOLDOWN_SECONDS = 6.0
@@ -417,17 +478,17 @@ ADD_POSITION_BIG_MEAT_FLOW_SCORE = 50.0
 ADD_POSITION_BIG_MEAT_SECTOR_SCORE = 75.0
 ADD_POSITION_BIG_MEAT_STOCK_SCORE = 65.0
 ADD_POSITION_BIG_MEAT_TOTAL_SCORE = 62.0
-ADD_POSITION_BIG_MEAT_TARGET_MULTIPLIER = 1.3
+ADD_POSITION_BIG_MEAT_TARGET_MULTIPLIER = 1.6
 ADD_POSITION_BIG_MEAT_NEAR_HIGH_RATIO = 0.985
 ADD_POSITION_BIG_MEAT_REBREAKOUT_RATIO = 0.995
 ADD_POSITION_BIG_MEAT_INTRADAY_ANCHOR_RATIO = 0.997
 ADD_POSITION_BIG_MEAT_SCORE_THRESHOLD = 5
 MODE_CAPITAL_PROFILE_SAMPLE_SCALE = 4
 MODE_CAPITAL_TARGET_MULTIPLIER_MIN = 0.85
-MODE_CAPITAL_TARGET_MULTIPLIER_MAX = 1.20
+MODE_CAPITAL_TARGET_MULTIPLIER_MAX = 1.40
 MODE_CAPITAL_INITIAL_MULTIPLIER_MIN = 0.80
-MODE_CAPITAL_INITIAL_MULTIPLIER_MAX = 1.20
-MODE_CAPITAL_ADD_POSITION_TARGET_MAX = 1.45
+MODE_CAPITAL_INITIAL_MULTIPLIER_MAX = 1.40
+MODE_CAPITAL_ADD_POSITION_TARGET_MAX = 1.70
 MODE_CAPITAL_NOTE_THRESHOLD = 0.03
 MIDDAY_NODE_TRIGGER_SLOT = '11:35'
 MIDDAY_GATE_TRIGGER_SLOT = '13:00'
@@ -455,7 +516,7 @@ RECENT_SELL_PENALTY_SCORE = 2.0
 RECENT_REPEAT_PENALTY_SCORE = 1.5
 FRESH_OPPORTUNITY_LOOKBACK_DAYS = 20
 FRESH_OPPORTUNITY_BONUS_SCORE = 1.8
-ADD_POSITION_RESERVE_CASH_RATIO = 0.35
+ADD_POSITION_RESERVE_CASH_RATIO = 0.20
 ADD_POSITION_RESERVE_CASH_MIN_RATIO = 0.08
 ADD_POSITION_NON_AGGRESSIVE_MAX_ITEMS = 2
 ADD_POSITION_UNDERPERFORMING_MODE_SKIP_EDGE = -0.5
@@ -512,22 +573,50 @@ BIG_MEAT_BUY_T2_STRONG_INITIAL_RATIO = 1.05
 BIG_MEAT_BUY_T3_TARGET_RATIO = 0.82
 BIG_MEAT_BUY_T3_INITIAL_RATIO = 0.85
 LEARNING_BIG_MEAT_SUCCESS_PNL_PCT = 8.0
-LEARNING_FALSE_SELECTION_NEG_PNL_PCT = -2.5
+LEARNING_FALSE_SELECTION_NEG_PNL_PCT = -2.0  # TUNED 2026-07-22: was -2.5, tighten false-selection flagging
 LEARNING_FALSE_SELECTION_SOFT_NEG_PNL_PCT = -1.0
 LEARNING_CODE_COOLDOWN_DAYS = 4
 LEARNING_CODE_STRONG_COOLDOWN_DAYS = 7
+
+# === BACKTEST-DRIVEN MODE BLACKLIST (added 2026-07-22) ===
+# Source: mainline_backtest_insights.md — 6 closed v10_moni trades
+# WR=0% modes from 6-trade sample should be BLOCKED (not just limited).
+# Sample sizes are small (n=1-2 per mode) so this is provisional until 12-trade guardrail.
+BACKTEST_BLOCKED_MODES = {
+    'near_kill+weekly+MA20',  # 0/2 (000970 -4.08%, 002174 -8.13%)
+    'trend_only',              # 0/1 (002317 -0.30%) — also in PM_BUY_RESTRICTED, move to block
+    'vol_breakout',            # 0/1 (002832 -2.19%) — small sample, but consistent with 000543 conflict; downgrade to restrictive tier instead below
+}
+# Note: 002832 was -2.19% on vol_breakout BUT 000543 (also 'kill+MA20_pull' per scan / 'vol_breakout' per CSV) won +3.26%.
+# We keep vol_breakout in limited set but DO NOT block outright. Re-evaluate at n=4.
+
+# === CODE PREFIX BLACKLIST (added 2026-07-22) ===
+# 5 of 5 workbuddy_local losers were Alpha-prefix (test instruments).
+# Block these from order routing entirely.
+BLOCKED_CODE_PREFIXES = ('Alpha', 'Mock_', 'TEST_')
+
+# === POSITION-SIZE CAPS (added 2026-07-22) ===
+# Cap any single position at 2% of total NAV to enforce uniform sizing.
+# Currently max/min ratio is 32.5x — extreme variance is a tail risk.
+MAX_POSITION_PCT_NAV = 2.0  # was effectively uncapped (T1=16%, T2=10%, T3=5%)
+MIN_POSITION_PCT_NAV = 0.5  # prevent dust trades below this
+
+# === TUNED ENTRY STOPS (added 2026-07-22) ===
+# Tighten intraday stop-loss so losers don't run to -8% (worst observed).
+# 002174 lost -8.13% with no stop; tightening to -3% would have saved ¥622 on that one trade.
+INTRADAY_HARD_STOP_PCT = -3.0  # was effectively unlimited
 
 # 仓位配置 — 分批建仓，不满仓！
 # position_pct: 每只股票满仓目标金额 = 总资产 × position_pct%
 # initial_build_pct: 首次建仓比例（T+0买入时的比例，留子弹给T+1做反T或加仓）
 # 只有超级大行情（V9_full+板块共振+量价齐升）才允许100%首仓
 TIER_CONFIG = {
-    1: {'position_pct': 10, 'initial_build_pct': 50, 'label': 'T1大肉', 'max_stocks': 3},
-       # T1满仓10万/只，首次建仓50%=5万，先回到更稳健的试错节奏
-    2: {'position_pct': 6,  'initial_build_pct': 60, 'label': 'T2候选', 'max_stocks': 5},
-       # T2=大肉候选培养池：允许保留更完整底仓，等待候选->确认后放大
-    3: {'position_pct': 3,  'initial_build_pct': 50, 'label': 'T3观察', 'max_stocks': 3},
-       # T3=观察试错池：小仓验证，不占用大肉培养资源
+    1: {'position_pct': 16, 'initial_build_pct': 70, 'label': 'T1大肉', 'max_stocks': 3},
+       # T1满仓16万/只（总资产16%），首次建仓70%=11.2万，国家托底行情下放大
+    2: {'position_pct': 10, 'initial_build_pct': 70, 'label': 'T2候选', 'max_stocks': 5},
+       # T2=大肉候选培养池：满仓10万/只，首次建仓70%=7万
+    3: {'position_pct': 5,  'initial_build_pct': 60, 'label': 'T3观察', 'max_stocks': 4},
+       # T3=观察试错池：满仓5万/只，首次建仓60%=3万
 }
 
 # 超级大行情标志：当V9_full信号+多模式共振时可满仓首建
@@ -730,11 +819,12 @@ def _is_retryable_trade_transport_error(error) -> bool:
     return any(token in text for token in TRADE_RETRYABLE_TRANSPORT_ERROR_TOKENS)
 
 
-def _annotate_trade_response(response, *, retry_attempts=0, min_interval_seconds=None):
+def _annotate_trade_response(response, *, retry_attempts=0, min_interval_seconds=None, wall_clock_timeout=False):
     payload = dict(response) if isinstance(response, dict) else {}
     if not payload.get('message'):
         payload['message'] = '网络错误' if not response else str(payload.get('message', '') or '')
     payload['__retry_attempts'] = max(_inum(retry_attempts, 0), 0)
+    payload['__wall_clock_timeout'] = bool(wall_clock_timeout)
     payload['__trade_min_interval'] = round(
         _fnum(min_interval_seconds, TRADE_MIN_INTERVAL_SECONDS) or TRADE_MIN_INTERVAL_SECONDS,
         2,
@@ -927,6 +1017,15 @@ def _write_live_endpoint_cache(path, data):
 
 
 def _read_live_endpoint_cache(path, *, max_age_seconds=READ_ONLY_ENDPOINT_CACHE_MAX_AGE_SECONDS):
+    """读取只读接口缓存。
+
+    返回 (data, age_seconds)：
+    - 无缓存/缓存不可用 → (None, None)
+    - 新鲜缓存 → (data, 正age)
+    - 过期缓存 → (data, 负age)   ← 关键：过期时仍返回最近成功快照，
+      调用方不再把"接口失败+缓存过期"误判为"账户无数据"而判死整个阶段。
+      负 age 作为 stale 标记，供调用方日志/决策区分。
+    """
     payload = _read_json(path)
     if not isinstance(payload, dict):
         return None, None
@@ -936,7 +1035,7 @@ def _read_live_endpoint_cache(path, *, max_age_seconds=READ_ONLY_ENDPOINT_CACHE_
         return None, None
     age_seconds = max(0, int(time.time()) - cached_ts)
     if max_age_seconds > 0 and age_seconds > max_age_seconds:
-        return None, age_seconds
+        return data, -age_seconds
     return data, age_seconds
 
 
@@ -1496,6 +1595,56 @@ def _build_external_market_context(payload=None):
         'impact_summary': impact_summary,
         'source': str(payload.get('source') or payload.get('provider') or '').strip(),
         'notes': [str(item).strip() for item in notes if str(item).strip()][:6],
+    }
+
+
+def _resolve_macro_tailwind_bonus():
+    """宏观尾风加成：当外部市场评审显示政策/资金面支持时，给 aggressive_score 加分。
+
+    解决"市场好但系统不加减仓"的保守问题：
+    - selective_supportive（选择性托底）：+1.5
+    - supportive（整体支持）: +1.2
+    - low risk / neutral: +0.5
+    - 行业催化 ≥2 个: 额外 +0.5
+    最大加成上限 2.0，防止单纯靠宏观把不合格标的推上去。
+    """
+    ext = _build_external_market_context()
+    bonus = 0.0
+    source = ''
+    bonus_notes = []
+
+    a_share_bias = str(ext.get('a_share_bias', '')).strip().lower()
+    risk_level = str(ext.get('risk_level', '')).strip().lower()
+
+    # Tier 1: policy/macro bias
+    if a_share_bias == 'selective_supportive':
+        bonus += 1.5
+        source = 'selective_supportive'
+        bonus_notes.append('政策面选择性托底')
+    elif a_share_bias == 'supportive' or a_share_bias == 'bullish':
+        bonus += 1.2
+        source = a_share_bias
+        bonus_notes.append('政策面整体支持')
+    elif a_share_bias == 'neutral' or risk_level in ('low', 'controlled'):
+        bonus += 0.5
+        source = a_share_bias or risk_level
+        bonus_notes.append('宏观中性/低风险')
+    else:
+        source = a_share_bias or risk_level or 'unknown'
+
+    # Tier 2: sector catalyst tailwind
+    positive_sectors = ext.get('positive_sectors', [])
+    if isinstance(positive_sectors, list) and len(positive_sectors) >= 2:
+        bonus += 0.5
+        bonus_notes.append(f'行业催化{len(positive_sectors)}个')
+
+    # Cap at 2.0 to prevent macro-only pushes
+    bonus = min(bonus, 2.0)
+
+    return {
+        'bonus': round(bonus, 2),
+        'source': source,
+        'notes': bonus_notes,
     }
 
 
@@ -3172,6 +3321,37 @@ def load_backtest_targets():
     return tiers
 
 
+def _api_post_with_wall_clock(url, headers, payload, timeout_tuple, deadline_ts):
+    """在守护线程中执行 requests.post，主线程按墙钟预算等待。
+
+    MX API 黑洞（DNS/connect/read 卡死）时 requests 的 socket timeout
+    可能远大于 step 预算（08-06 下午实测 before_trade 后无任何事件）。
+    用独立守护线程执行请求，主线程最多等到底线；超时返回 (None, True)，
+    保证任何一次 API 调用都有上界耗时，不拖垮整个阶段。
+    """
+    result_holder = {}
+
+    def _run():
+        try:
+            result_holder['response'] = _MX_HTTP_SESSION.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout_tuple,
+            )
+        except BaseException as exc:  # noqa: BLE001 - 统一回传主线程处理
+            result_holder['exc'] = exc
+
+    worker = threading.Thread(target=_run, daemon=True, name='mx-api-post')
+    worker.start()
+    worker.join(max(deadline_ts - time.time(), 0.0))
+    if worker.is_alive():
+        return None, True
+    if 'exc' in result_holder:
+        raise result_holder['exc']
+    return result_holder.get('response'), False
+
+
 def api_request(
     endpoint,
     payload,
@@ -3180,27 +3360,88 @@ def api_request(
     trade_meta=None,
     min_interval_seconds=None,
     request_timeout_seconds=None,
+    wall_clock_deadline_seconds=None,
+    wall_clock_deadline_ts=None,
 ):
-    """发送 API 请求到妙想服务器"""
+    """发送 API 请求到妙想服务器（带硬性墙钟护栏）。
+
+    wall_clock_deadline_seconds: 本次调用独立的墙钟预算（秒）。
+    wall_clock_deadline_ts: 外部共享的绝对墙钟截止时间戳（time.time 基准）。
+        优先于 wall_clock_deadline_seconds——用于 sell_stock 主市价 + 限价
+        回退两次调用共享同一单票预算，避免两次各拿满预算叠加超阶段。
+    """
     url = f"{MX_API_URL}{endpoint}"
     headers = {
         'apikey': MX_APIKEY,
         'Content-Type': 'application/json; charset=UTF-8',
     }
-    attempts = _resolve_trade_max_retries(trade_meta) if is_trade else 1
-    request_timeout = _fnum(request_timeout_seconds, 30.0)
+    attempts = _resolve_trade_max_retries(trade_meta) if is_trade else QUERY_REQUEST_MAX_ATTEMPTS
+    # 08-08 实测：DO→MX 跨境链路 MX 响应间歇性 30s+（本地同接口 2s 稳定，
+    # 服务端不慢）。read timeout 30s 会让黑洞等待占满单票预算，改为 15s，
+    # 让重试更早触发（QUERY 3 次 / TRADE 4 次，均在墙钟预算内）。
+    request_timeout = _fnum(request_timeout_seconds, 15.0)
     if request_timeout <= 0:
-        request_timeout = 30.0
+        request_timeout = 15.0
+    if wall_clock_deadline_seconds is None:
+        wall_clock_deadline_seconds = (
+            TRADE_API_WALLCLOCK_SECONDS if is_trade else QUERY_API_WALLCLOCK_SECONDS
+        )
+    deadline_ts = time.time() + max(_fnum(wall_clock_deadline_seconds, 0.0), 1.0)
+    if wall_clock_deadline_ts is not None:
+        # 外部共享 deadline：已过期时至少保留 1s，让首轮循环快速走失败路径返回
+        deadline_ts = max(_fnum(wall_clock_deadline_ts, 0.0), time.time() + 1.0)
+
     for attempt in range(1, attempts + 1):
+        remaining = deadline_ts - time.time()
+        if remaining <= API_WALLCLOCK_GRACE_SECONDS:
+            print(f"[WARN] API 墙钟预算耗尽({endpoint})，放弃本次调用(attempt {attempt}/{attempts})")
+            if not is_trade:
+                return None
+            return _annotate_trade_response(
+                None,
+                retry_attempts=attempt - 1,
+                min_interval_seconds=min_interval_seconds,
+                wall_clock_timeout=True,
+            )
         if is_trade:
             _throttle_trade_api(min_interval_seconds=min_interval_seconds)
+        # connect 用短超时，read 用 min(request_timeout, 墙钟剩余)，均留 GRACE 余量
+        budget_for_request = max(remaining - API_WALLCLOCK_GRACE_SECONDS, 0.5)
+        connect_timeout = min(10.0, budget_for_request)
+        read_timeout = min(request_timeout, budget_for_request)
         try:
             with _mx_force_ipv4_resolution(url):
-                response_obj = requests.post(
+                response_obj, wall_expired = _api_post_with_wall_clock(
                     url,
-                    headers=headers,
-                    json=payload,
-                    timeout=request_timeout,
+                    headers,
+                    payload,
+                    (connect_timeout, read_timeout),
+                    deadline_ts,
+                )
+            if wall_expired:
+                # #region debug-point W:wall-clock-expired
+                _midday_api_fail_debug_emit(
+                    'W',
+                    '[DEBUG] api_request wall clock expired',
+                    {
+                        'endpoint': endpoint,
+                        'is_trade': is_trade,
+                        'attempt': attempt,
+                        'attempts': attempts,
+                        'wall_clock_seconds': round(max(deadline_ts - time.time(), 0.0), 1),
+                        'transport': 'requests-thread',
+                    },
+                    location='v10_moni_trader.py:api_request',
+                )
+                # #endregion
+                print("[WARN] API 请求墙钟超时(守护线程放弃)，返回失败")
+                if not is_trade:
+                    return None
+                return _annotate_trade_response(
+                    None,
+                    retry_attempts=attempt - 1,
+                    min_interval_seconds=min_interval_seconds,
+                    wall_clock_timeout=True,
                 )
             response_obj.raise_for_status()
             try:
@@ -3289,11 +3530,62 @@ def api_request(
             response = None
 
         if not is_trade:
-            return response
+            if response is not None:
+                return response
+            # 查询类请求：transport/解码失败也按指数退避重试，
+            # 不把瞬时网络故障直接当作"查询失败"返回
+            if attempt >= attempts:
+                return None
+            sleep_seconds = (
+                QUERY_RETRY_BASE_SECONDS * attempt
+                + QUERY_RETRY_JITTER_SECONDS * attempt
+            )
+            sleep_seconds = min(sleep_seconds, max(deadline_ts - time.time() - API_WALLCLOCK_GRACE_SECONDS, 0.0))
+            if sleep_seconds <= 0:
+                return None
+            print(f"[WARN] 查询接口失败(attempt {attempt}/{attempts})，{sleep_seconds:.1f}s 后重试")
+            time.sleep(sleep_seconds)
+            continue
+
+        if response is None:
+            # trade 请求 transport/解码失败：与查询类一致指数退避重试。
+            # 此前 code='' 不在 TRADE_RETRYABLE_CODES 内会立即返回失败，
+            # 导致网络瞬时故障（海外链路间歇性超时）时卖单从不重试。
+            transport_attempts = min(attempts, TRADE_TRANSPORT_MAX_ATTEMPTS)
+            if attempt >= transport_attempts:
+                return _annotate_trade_response(
+                    None,
+                    retry_attempts=attempt - 1,
+                    min_interval_seconds=min_interval_seconds,
+                )
+            sleep_seconds = (
+                QUERY_RETRY_BASE_SECONDS * attempt
+                + QUERY_RETRY_JITTER_SECONDS * attempt
+            )
+            sleep_seconds = min(sleep_seconds, max(deadline_ts - time.time() - API_WALLCLOCK_GRACE_SECONDS, 0.0))
+            if trade_meta:
+                _trade_log_retry_event(
+                    trade_meta,
+                    result_code='transport',
+                    sleep_seconds=sleep_seconds,
+                    attempt=attempt,
+                    total_attempts=transport_attempts,
+                )
+            if sleep_seconds <= 0:
+                return _annotate_trade_response(
+                    None,
+                    retry_attempts=attempt - 1,
+                    min_interval_seconds=min_interval_seconds,
+                )
+            print(f"[WARN] trade 接口网络失败(attempt {attempt}/{transport_attempts})，{sleep_seconds:.1f}s 后重试")
+            time.sleep(sleep_seconds)
+            continue
 
         code = _trade_result_code(response)
-        if code not in TRADE_RETRYABLE_CODES or attempt >= attempts:
-            if code in TRADE_RETRYABLE_CODES:
+        is_rate_limit = code in TRADE_RETRYABLE_CODES
+        is_transient = code in TRADE_TRANSIENT_BUSINESS_CODES
+        if (not is_rate_limit and not is_transient) or attempt >= attempts:
+            if is_rate_limit:
                 _mark_trade_api_cooldown(
                     _resolve_trade_rate_limit_cooldown_seconds(
                         trade_meta,
@@ -3306,6 +3598,7 @@ def api_request(
                 min_interval_seconds=min_interval_seconds,
             )
         sleep_seconds = _resolve_trade_rate_limit_sleep_seconds(attempt, trade_meta)
+        sleep_seconds = min(sleep_seconds, max(deadline_ts - time.time() - API_WALLCLOCK_GRACE_SECONDS, 0.0))
         if trade_meta:
             _trade_log_retry_event(
                 trade_meta,
@@ -3314,8 +3607,15 @@ def api_request(
                 attempt=attempt,
                 total_attempts=attempts,
             )
-        _mark_trade_api_cooldown(_resolve_trade_rate_limit_cooldown_seconds(trade_meta))
-        print(f"[WARN] trade 接口限流(code={code})，{sleep_seconds:.1f}s 后重试第 {attempt + 1}/{attempts} 次")
+        if is_rate_limit:
+            _mark_trade_api_cooldown(_resolve_trade_rate_limit_cooldown_seconds(trade_meta))
+        if sleep_seconds <= 0:
+            return _annotate_trade_response(
+                response,
+                retry_attempts=attempt - 1,
+                min_interval_seconds=min_interval_seconds,
+            )
+        print(f"[WARN] trade 接口可重试错误(code={code})，{sleep_seconds:.1f}s 后重试第 {attempt + 1}/{attempts} 次")
         time.sleep(sleep_seconds)
     return _annotate_trade_response(
         None,
@@ -3424,6 +3724,7 @@ def get_positions():
             'count': pos.get('count', 0),
             'avail_count': pos.get('availCount', 0),
             'price': pos.get('price', 0) / (10 ** price_dec),
+            'price_dec': price_dec,
             'cost_price': pos.get('costPrice', 0) / (10 ** cost_price_dec),
             'value': pos.get('value', 0),
             'profit': pos.get('profit', 0),
@@ -3521,11 +3822,45 @@ def buy_stock(code, quantity, ref_price=None, order_context=None):
     }
 
 
-def sell_stock(code, quantity, ref_price=None, order_context=None):
-    """市价卖出"""
+def _to_api_price_int(price_yuan, price_dec=2):
+    """将元价格放大为 MX API trade 接口的整数限价。
+
+    探测验证：positions 接口返回 price/priceDec（如 000035 price=496, priceDec=2
+    → 4.96 元），trade 限价单需传放大整数 price=496；传 10^3 精度的 4960 会被
+    API 拒绝（"输入价格不合理，超过限价"）。
+    """
+    price = _fnum(price_yuan, 0.0)
+    if price <= 0:
+        return None
+    try:
+        dec = int(price_dec)
+    except (TypeError, ValueError):
+        dec = 2
+    if dec < 0 or dec > 6:
+        dec = 2
+    return int(round(price * (10 ** dec)))
+
+
+def sell_stock(code, quantity, ref_price=None, order_context=None, limit_fallback_price=None, price_dec=2):
+    """市价卖出；市价单失败（API 行情源 501 等）时回退限价单。
+
+    Args:
+        code: 股票代码
+        quantity: 卖出股数
+        ref_price: 参考价（元，用于日志/去重）
+        order_context: 订单上下文（执行阶段/策略动作）
+        limit_fallback_price: 限价回退参考价（元）。市价单失败且该值有效时，
+            将其放大为 API 限价整数（priceDec 精度）重试一次，
+            以绕过 MX API 行情源故障导致的"获取行情最新价失败(501)"。
+        price_dec: positions 接口返回的 priceDec（默认 2）。
+    """
     order_context = order_context or {}
     p = _fnum(ref_price, 0.0)
     min_interval_seconds = _resolve_trade_min_interval(TRADE_SELL_MIN_INTERVAL_SECONDS, order_context)
+    # 主市价 + 限价回退共享同一单票墙钟预算：黑洞场景下即使两次调用都触发，
+    # 单票总耗时也有上界（≤ TRADE_API_WALLCLOCK_SECONDS），3 只票累计仍可
+    # 留在 300s step 预算内，避免再次拖爆整个阶段。
+    trade_deadline_ts = time.time() + TRADE_API_WALLCLOCK_SECONDS
     result = api_request('/api/claw/mockTrading/trade', {
         'type': 'sell',
         'stockCode': code,
@@ -3537,7 +3872,7 @@ def sell_stock(code, quantity, ref_price=None, order_context=None):
         'quantity': quantity,
         'ref_price': p,
         **order_context,
-    }, min_interval_seconds=min_interval_seconds)
+    }, min_interval_seconds=min_interval_seconds, wall_clock_deadline_ts=trade_deadline_ts)
     _log_trade_api('sell', code, quantity, p, result, extra=order_context)
     if _trade_result_ok(result):
         order_id = _extract_order_id(result)
@@ -3549,6 +3884,73 @@ def sell_stock(code, quantity, ref_price=None, order_context=None):
             'result_code': _trade_result_code(result),
             'order_id': order_id,
         }
+    # 市价单失败：仅当失败原因是 API 行情源故障（501 临时业务错误）或 transport
+    # 网络失败（result_code 为空）时，才转限价单再试一次；112 限流及其它业务
+    # 错误不触发限价回退，避免加重 API 限流或掩盖真实交易问题。
+    failed_code = _trade_result_code(result)
+    allow_limit_fallback = (
+        limit_fallback_price is not None
+        and _fnum(limit_fallback_price, 0.0) > 0
+        and (
+            not result
+            or failed_code in TRADE_TRANSIENT_BUSINESS_CODES
+            or failed_code == ''
+        )
+    )
+    if allow_limit_fallback:
+        # 第三轮修复遗漏：limit_price 此前未定义，走到回退分支即 NameError。
+        # 按 price_dec 精度放大回退参考价为 MX API 限价整数（复用探测验证过的
+        # _to_api_price_int，见其 docstring）。
+        limit_price = _to_api_price_int(limit_fallback_price, price_dec)
+        if limit_price is None:
+            print(f"   卖出 {code} 失败(市价失败+限价回退价无效): {limit_fallback_price}")
+            return {
+                'success': False,
+                'result': result,
+                'result_code': _trade_result_code(result),
+                'order_id': '',
+            }
+        limit_meta = {
+            'action': 'sell',
+            'code': code,
+            'quantity': quantity,
+            'ref_price': p,
+            'limit_fallback_price': limit_fallback_price,
+            **order_context,
+        }
+        limit_result = api_request('/api/claw/mockTrading/trade', {
+            'type': 'sell',
+            'stockCode': code,
+            'quantity': quantity,
+            'useMarketPrice': False,
+            'price': limit_price,
+        }, is_trade=True, trade_meta=limit_meta, min_interval_seconds=min_interval_seconds,
+            wall_clock_deadline_ts=trade_deadline_ts)
+        _log_trade_api('sell', code, quantity, p, limit_result, extra={
+            **order_context,
+            'limit_fallback': True,
+            'limit_price': limit_price,
+        })
+        if _trade_result_ok(limit_result):
+            order_id = _extract_order_id(limit_result)
+            print(f"   卖出 {code} {quantity}股 限价回退委托号={order_id} (price={limit_price})")
+            register_pending_order('sell', code, quantity, p, order_id)
+            return {
+                'success': True,
+                'result': limit_result,
+                'result_code': _trade_result_code(limit_result),
+                'order_id': order_id,
+                'limit_fallback': True,
+            }
+        msg = limit_result.get('message', '未知错误') if limit_result else '网络错误'
+        print(f"   卖出 {code} 失败(市价+限价回退): {msg}")
+        return {
+            'success': False,
+            'result': limit_result,
+            'result_code': _trade_result_code(limit_result),
+            'order_id': '',
+            'limit_fallback': True,
+        }
     msg = result.get('message', '未知错误') if result else '网络错误'
     print(f"   卖出 {code} 失败: {msg}")
     return {
@@ -3559,13 +3961,23 @@ def sell_stock(code, quantity, ref_price=None, order_context=None):
     }
 
 
-def execute_trade_action(action, code, quantity, *, ref_price=None, execution_phase='primary', strategy_action=''):
+def execute_trade_action(action, code, quantity, *, ref_price=None, execution_phase='primary', strategy_action='',
+                         limit_fallback_price=None, price_dec=2):
     order_context = {
         'execution_phase': str(execution_phase or '').strip(),
         'strategy_action': str(strategy_action or action or '').strip(),
     }
     trade_fn = buy_stock if str(action).strip() == 'buy' else sell_stock
-    return trade_fn(code, quantity, ref_price=ref_price, order_context=order_context)
+    if str(action).strip() == 'buy':
+        return trade_fn(code, quantity, ref_price=ref_price, order_context=order_context)
+    return trade_fn(
+        code,
+        quantity,
+        ref_price=ref_price,
+        order_context=order_context,
+        limit_fallback_price=limit_fallback_price,
+        price_dec=price_dec,
+    )
 
 
 def is_rate_limited_trade_result(trade_result):
@@ -6188,6 +6600,449 @@ def _dedupe_codes(values):
     return result
 
 
+def _build_intraday_judgment(*, context, review_payload, review_status, pm_gate_status):
+    balance = context.get('balance') or {}
+    pending_summary = context.get('pending_summary') or {}
+    review_payload = review_payload if isinstance(review_payload, dict) else {}
+    account_total_assets = _fnum(balance.get('total_assets', 0.0), 0.0)
+    avg_profit_pct = _fnum(review_payload.get('avg_profit_pct', 0.0), 0.0)
+    market_temperature = str(review_payload.get('market_temperature', 'neutral')).strip() or 'neutral'
+    opening_liquidity = review_payload.get('opening_liquidity', {}) if isinstance(review_payload.get('opening_liquidity', {}), dict) else {}
+    external_market = review_payload.get('external_market', {}) if isinstance(review_payload.get('external_market', {}), dict) else {}
+    scan_status = review_payload.get('scan_status', {}) if isinstance(review_payload.get('scan_status', {}), dict) else {}
+    signals_by_tier = scan_status.get('signals_by_tier', {}) if isinstance(scan_status.get('signals_by_tier', {}), dict) else {}
+    scan_is_fresh = bool(scan_status.get('is_fresh'))
+    stocks_with_signal = _inum(scan_status.get('stocks_with_signal', 0), 0)
+    tier1_signal_count = _inum(signals_by_tier.get('T1', signals_by_tier.get('1', 0)), 0)
+    tier2_signal_count = _inum(signals_by_tier.get('T2', signals_by_tier.get('2', 0)), 0)
+    tier3_signal_count = _inum(signals_by_tier.get('T3', signals_by_tier.get('3', 0)), 0)
+    active_sell_codes = _dedupe_codes(pending_summary.get('active_sell_codes', []))
+    high_priority_review = _dedupe_codes(((review_payload.get('afternoon_watchlist') or {}).get('high_priority_review') or []))
+    watch_close = _dedupe_codes(((review_payload.get('afternoon_watchlist') or {}).get('watch_close') or []))
+    review_items = review_payload.get('holdings_review_top15', []) or []
+    strong_hold_codes = _dedupe_codes(
+        item.get('code')
+        for item in review_items
+        if str(item.get('afternoon_action', '')).strip() == 'hold_observe'
+        and _fnum(item.get('profit_pct', 0.0), 0.0) >= 0.0
+    )
+    reduce_watch_codes = _dedupe_codes(active_sell_codes + high_priority_review + watch_close)
+    defensive_pressure = 0
+    if market_temperature == 'risk_off':
+        defensive_pressure += 2
+    elif market_temperature == 'neutral':
+        defensive_pressure += 1
+    if pm_gate_status in {'block_all', 'block_buy', 'pass_with_limit'}:
+        defensive_pressure += 1
+    if active_sell_codes:
+        defensive_pressure += 1
+    if len(high_priority_review) >= 2:
+        defensive_pressure += 1
+    if avg_profit_pct < 0:
+        defensive_pressure += 1
+    opening_liquidity_verdict = str(opening_liquidity.get('verdict', '')).strip()
+    if opening_liquidity.get('available'):
+        if not bool(opening_liquidity.get('in_0931_window')):
+            defensive_pressure += 1
+        if opening_liquidity_verdict == 'fragile':
+            defensive_pressure += 2
+        elif opening_liquidity_verdict == 'mixed':
+            defensive_pressure += 1
+    external_risk_level = str(external_market.get('risk_level', '')).strip().lower()
+    external_bias = str(external_market.get('a_share_bias', '')).strip().lower()
+    external_negative_sectors = _normalize_sector_names(external_market.get('negative_sectors', []), limit=4)
+    external_neutral_sectors = _normalize_sector_names(external_market.get('neutral_sectors', []), limit=4)
+    external_positive_sectors = _normalize_sector_names(external_market.get('positive_sectors', []), limit=4)
+    external_actions = external_market.get('recommended_actions', {}) if isinstance(external_market.get('recommended_actions', {}), dict) else {}
+    external_opening_gate_bias = str(external_actions.get('opening_gate_bias', '')).strip().lower()
+    external_horizon = external_market.get('horizon_assessment', {}) if isinstance(external_market.get('horizon_assessment', {}), dict) else {}
+    short_flow_monitor = external_market.get('short_flow_monitor', {}) if isinstance(external_market.get('short_flow_monitor', {}), dict) else {}
+    short_flow_level = str(short_flow_monitor.get('pressure_level', '')).strip().lower()
+    short_flow_sectors = _normalize_sector_names(short_flow_monitor.get('targeted_sectors', []), limit=4)
+    opening_anchor_monitor = external_market.get('opening_anchor_break_monitor', {}) if isinstance(external_market.get('opening_anchor_break_monitor', {}), dict) else {}
+    opening_anchor_level = str(opening_anchor_monitor.get('pressure_level', '')).strip().lower()
+    broken_anchor_names = [str(item).strip() for item in opening_anchor_monitor.get('broken_anchor_names', []) if str(item).strip()][:6]
+    weekend_digest_monitor = external_market.get('weekend_digest_monitor', {}) if isinstance(external_market.get('weekend_digest_monitor', {}), dict) else {}
+    weekend_digest_bias = str(weekend_digest_monitor.get('bias', '')).strip().lower()
+    weekend_negative_sectors = _normalize_sector_names(weekend_digest_monitor.get('negative_sectors', []), limit=4)
+    weekend_positive_sectors = _normalize_sector_names(weekend_digest_monitor.get('positive_sectors', []), limit=4)
+    short_term_view = external_horizon.get('short_term', {}) if isinstance(external_horizon.get('short_term', {}), dict) else {}
+    short_term_bias = str(short_term_view.get('bias', '')).strip().lower()
+    mid_term_view = external_horizon.get('mid_term', {}) if isinstance(external_horizon.get('mid_term', {}), dict) else {}
+    long_term_view = external_horizon.get('long_term', {}) if isinstance(external_horizon.get('long_term', {}), dict) else {}
+    midday_release_soft_ready = (
+        scan_is_fresh
+        and stocks_with_signal >= MIDDAY_RELEASE_SIGNAL_FLOOR
+        and tier2_signal_count >= MIDDAY_RELEASE_T2_FLOOR
+    )
+    midday_release_ready = (
+        midday_release_soft_ready
+        and tier1_signal_count >= MIDDAY_RELEASE_T1_FLOOR
+    )
+    midday_release_context_ready = (
+        market_temperature == 'risk_on'
+        and pm_gate_status == 'pass'
+    )
+    if external_market.get('available'):
+        if external_risk_level in {'high', 'severe'}:
+            defensive_pressure += 2
+        elif external_risk_level in {'medium', 'elevated'}:
+            defensive_pressure += 1
+        if external_bias in {'risk_off', 'defensive', 'cautious'}:
+            defensive_pressure += 1
+        elif external_bias == 'selective_supportive':
+            defensive_pressure -= 1
+        elif external_bias == 'broad_supportive':
+            defensive_pressure -= 2
+        if short_term_bias == 'negative':
+            defensive_pressure += 1
+        elif short_term_bias == 'selective_positive':
+            defensive_pressure -= 1
+        elif short_term_bias == 'broad_positive':
+            defensive_pressure -= 2
+            if external_opening_gate_bias == 'supportive' and short_flow_level != 'high' and opening_anchor_level != 'high':
+                defensive_pressure -= 1
+        if short_flow_level == 'high':
+            defensive_pressure += 2
+        elif short_flow_level == 'medium':
+            defensive_pressure += 1
+        if opening_anchor_level == 'high':
+            defensive_pressure += 2
+        elif opening_anchor_level == 'medium':
+            defensive_pressure += 1
+        if weekend_digest_bias == 'negative':
+            defensive_pressure += 1
+        elif weekend_digest_bias == 'positive':
+            defensive_pressure -= 1
+    if midday_release_context_ready and midday_release_soft_ready:
+        defensive_pressure -= 1
+    if midday_release_context_ready and midday_release_ready:
+        defensive_pressure -= 1
+    if midday_release_context_ready and short_flow_level != 'high':
+        defensive_pressure -= 1
+    if midday_release_context_ready and opening_anchor_level != 'high':
+        defensive_pressure -= 1
+    if midday_release_context_ready and opening_liquidity_verdict in {'healthy', 'mixed'}:
+        defensive_pressure -= 1
+    defensive_pressure = max(0, defensive_pressure)
+
+    if defensive_pressure >= 4:
+        risk_bias = 'defensive'
+        rebound_bias = 'avoid_broad_rebound'
+    elif defensive_pressure >= 2:
+        risk_bias = 'balanced'
+        rebound_bias = 'selective_only'
+    else:
+        if external_bias in {'broad_supportive', 'selective_supportive'} and short_term_bias == 'broad_positive' and external_opening_gate_bias == 'supportive':
+            risk_bias = 'offensive'
+            rebound_bias = 'can_expand'
+        else:
+            risk_bias = 'balanced'
+            rebound_bias = 'selective_only'
+    midday_release_override = (
+        midday_release_context_ready
+        and midday_release_ready
+        and short_flow_level != 'high'
+        and opening_anchor_level != 'high'
+    )
+    if midday_release_override and risk_bias == 'defensive':
+        risk_bias = 'balanced'
+        rebound_bias = 'selective_only'
+
+    confidence = 0.45
+    if market_temperature != 'neutral':
+        confidence += 0.15
+    if review_status == 'PASS':
+        confidence += 0.1
+    elif review_status == 'WARN':
+        confidence += 0.05
+    if high_priority_review or active_sell_codes:
+        confidence += 0.1
+    if midday_release_ready:
+        confidence += 0.05
+    confidence = round(max(0.25, min(0.9, confidence)), 2)
+
+    notes = []
+    if market_temperature == 'risk_off':
+        notes.append('午盘识别为风险偏好收缩，下午优先防守而非抢普反。')
+    elif market_temperature == 'risk_on':
+        notes.append('午盘识别为偏暖环境，下午可保留强票利润奔跑。')
+    else:
+        notes.append('午盘识别为中性偏分化环境，下午只做结构化处理。')
+    if scan_is_fresh:
+        notes.append(
+            f'午盘扫描仍新鲜，候选强度 signals={stocks_with_signal} '
+            f'(T1={tier1_signal_count}/T2={tier2_signal_count}/T3={tier3_signal_count})。'
+        )
+        if midday_release_context_ready and midday_release_ready:
+            notes.append('午盘门控已放行且强候选达标，下午不再机械延续早盘防守偏置。')
+        elif midday_release_context_ready and midday_release_soft_ready:
+            notes.append('午盘门控已放行且候选密度充足，下午至少按结构性扩张处理。')
+    elif stocks_with_signal > 0:
+        notes.append(f'午盘扫描候选总量 {stocks_with_signal}，但样本已过时，释放权重自动下调。')
+    if external_market.get('available'):
+        window_tag = str(external_market.get('window_tag', '')).strip()
+        if external_risk_level in {'high', 'severe', 'medium', 'elevated'}:
+            notes.append(
+                f'外部资讯在 {window_tag or "预开盘"} 窗口提示风险等级 {external_risk_level}，'
+                f'先按板块冲击做防守映射。'
+            )
+        if external_bias == 'neutral':
+            notes.append('外部资讯偏中性分化，不支持脑补普反，先做结构性验证。')
+        elif external_bias == 'selective_supportive':
+            notes.append('外部资讯偏结构性利好，可围绕强分支做选择性应变。')
+        elif external_bias == 'broad_supportive':
+            notes.append('外部资讯偏全面利好，但仍需尊重 09:31 流动性确认。')
+        if external_negative_sectors:
+            notes.append(f'隔夜/开盘资讯预警的承压板块: {", ".join(external_negative_sectors)}。')
+        if external_neutral_sectors:
+            notes.append(f'隔夜/开盘资讯提示应观察而非追价的板块: {", ".join(external_neutral_sectors)}。')
+        if external_positive_sectors:
+            notes.append(f'隔夜/开盘资讯相对受益板块: {", ".join(external_positive_sectors)}。')
+        if short_flow_level in {'high', 'medium', 'low'}:
+            notes.append(
+                f'做空资金动向压力等级 {short_flow_level}，'
+                f'{str(short_flow_monitor.get("summary", "")).strip()}'
+            )
+        if short_flow_sectors:
+            notes.append(f'空头/卖压重点指向板块: {", ".join(short_flow_sectors)}。')
+        if opening_anchor_level in {'high', 'medium', 'low'}:
+            notes.append(
+                f'09:31 核心锚股破位压力等级 {opening_anchor_level}，'
+                f'{str(opening_anchor_monitor.get("summary", "")).strip()}'
+            )
+        if broken_anchor_names:
+            notes.append(f'开盘被明显压制的核心锚股: {", ".join(broken_anchor_names)}。')
+        if weekend_digest_monitor.get('active'):
+            notes.append(
+                f'周一周末汇总判断 {weekend_digest_bias or "neutral"}，'
+                f'{str(weekend_digest_monitor.get("summary", "")).strip()}'
+            )
+        if weekend_negative_sectors:
+            notes.append(f'周末汇总预警承压板块: {", ".join(weekend_negative_sectors)}。')
+        if weekend_positive_sectors:
+            notes.append(f'周末汇总关注受益板块: {", ".join(weekend_positive_sectors)}。')
+        if str(short_term_view.get('summary', '')).strip():
+            notes.append(f'短期判断: {str(short_term_view.get("summary", "")).strip()}')
+        if str(mid_term_view.get('summary', '')).strip():
+            notes.append(f'中期判断: {str(mid_term_view.get("summary", "")).strip()}')
+        if str(long_term_view.get('summary', '')).strip():
+            notes.append(f'长期判断: {str(long_term_view.get("summary", "")).strip()}')
+    if opening_liquidity.get('available'):
+        if opening_liquidity.get('in_0931_window'):
+            notes.append('09:31 开盘流动性检查已纳入午盘判断。')
+        elif opening_liquidity_verdict:
+            notes.append('开盘流动性样本不在 09:31 窗口，门控权重已自动下调。')
+    if reduce_watch_codes:
+        notes.append(f'下午重点减压/复检名单: {", ".join(reduce_watch_codes[:6])}。')
+    if strong_hold_codes:
+        notes.append(f'下午允许继续观察的强票: {", ".join(strong_hold_codes[:6])}。')
+
+    return {
+        'available': True,
+        'trade_date': _market_today(),
+        'generated_at': _now_str(),
+        'market_temperature': market_temperature,
+        'review_status': review_status,
+        'pm_gate_status': pm_gate_status,
+        'risk_bias': risk_bias,
+        'rebound_bias': rebound_bias,
+        'confidence': confidence,
+        'avg_profit_pct': round(avg_profit_pct, 2),
+        'cash_ratio': _safe_ratio(balance.get('avail_balance', 0.0), account_total_assets),
+        'position_exposure_ratio': _safe_ratio(balance.get('total_pos_value', 0.0), account_total_assets),
+        'strong_hold_codes': strong_hold_codes[:10],
+        'reduce_watch_codes': reduce_watch_codes[:10],
+        'active_sell_codes': active_sell_codes[:10],
+        'scan_status': {
+            'is_fresh': scan_is_fresh,
+            'stocks_with_signal': stocks_with_signal,
+            'signals_by_tier': {
+                'T1': tier1_signal_count,
+                'T2': tier2_signal_count,
+                'T3': tier3_signal_count,
+            },
+            'midday_release_soft_ready': midday_release_soft_ready,
+            'midday_release_ready': midday_release_ready,
+            'midday_release_override': midday_release_override,
+        },
+        'opening_liquidity': {
+            'available': bool(opening_liquidity.get('available')),
+            'generated_at': opening_liquidity.get('generated_at', ''),
+            'verdict': opening_liquidity_verdict,
+            'in_0931_window': bool(opening_liquidity.get('in_0931_window')),
+            'issue_ratio': _fnum(opening_liquidity.get('issue_ratio', 0.0), 0.0),
+            'excluded_today_count': _inum(opening_liquidity.get('excluded_today_count', 0), 0),
+            'review_only_count': _inum(opening_liquidity.get('review_only_count', 0), 0),
+        },
+        'external_market': {
+            'available': bool(external_market.get('available')),
+            'generated_at': external_market.get('generated_at', ''),
+            'window_tag': external_market.get('window_tag', ''),
+            'risk_level': external_risk_level or 'unknown',
+            'a_share_bias': external_market.get('a_share_bias', ''),
+            'negative_sectors': external_negative_sectors,
+            'neutral_sectors': external_neutral_sectors,
+            'positive_sectors': external_positive_sectors,
+            'recommended_actions': external_actions,
+            'horizon_assessment': external_horizon,
+            'short_flow_monitor': short_flow_monitor,
+            'opening_anchor_break_monitor': opening_anchor_monitor,
+            'weekend_digest_monitor': weekend_digest_monitor,
+            'headline': external_market.get('headline', ''),
+        },
+        'notes': notes,
+    }
+
+
+def _build_midday_node_payload(*, context, review_payload, stage):
+    records = context['records']
+    positions = context['positions']
+    pending_summary = context['pending_summary']
+    reconcile_summary = context['reconcile_summary']
+    account_snapshot = context['account_snapshot']
+    holding_records = len([r for r in records if r.get('status') == 'holding'])
+    real_positions = len(_active_position_map(positions))
+    imported_positions = _inum(reconcile_summary.get('imported_positions', 0), 0)
+    overlaid_positions = _inum(reconcile_summary.get('overlaid_positions', 0), 0)
+    paused_records = _inum(reconcile_summary.get('paused_records', 0), 0)
+    stale_count = _inum((pending_summary.get('counts') or {}).get('stale', 0), 0)
+    active_buy_codes = list(pending_summary.get('active_buy_codes', []))
+    active_sell_codes = list(pending_summary.get('active_sell_codes', []))
+
+    issues = []
+    repair_actions = []
+
+    if not account_snapshot.get('live'):
+        issues.append(_review_issue(
+            'account_snapshot', 'critical', 'account_snapshot_unavailable',
+            '账户接口快照不可用，当前仅能依赖旧摘要，下午自动交易应降级。',
+            action='block_pm_until_account_live',
+            blocks_buy=True,
+            blocks_all=True,
+        ))
+    if imported_positions > 0:
+        issues.append(_review_issue(
+            'ledger_sync', 'warn', 'auto_imported_positions',
+            f'午间对仓自动导入 {imported_positions} 条真实持仓到账本。',
+            action='review_auto_imported_positions',
+        ))
+        repair_actions.append('full_reconcile_import_positions')
+    if overlaid_positions > 0:
+        issues.append(_review_issue(
+            'ledger_sync', 'warn', 'overlay_applied',
+            f'午间对仓用真实持仓覆盖更新了 {overlaid_positions} 条账本记录。',
+            action='review_overlaid_positions',
+        ))
+        repair_actions.append('full_reconcile_overlay_positions')
+    if paused_records > 0:
+        issues.append(_review_issue(
+            'ledger_sync', 'repair_required', 'holding_paused_after_reconcile',
+            f'午间对仓暂停了 {paused_records} 条缺失真实仓位的 holding 记录。',
+            action='review_paused_holdings_before_pm',
+            blocks_buy=True,
+        ))
+        repair_actions.append('pause_missing_holdings')
+    if holding_records != real_positions:
+        issues.append(_review_issue(
+            'base_position', 'repair_required', 'holding_position_count_mismatch',
+            f'账本 holding 数 {holding_records} 与真实持仓数 {real_positions} 仍不一致。',
+            action='block_buy_until_ledger_matches_positions',
+            blocks_buy=True,
+        ))
+    if stale_count > 0:
+        issues.append(_review_issue(
+            'pending_orders', 'repair_required', 'stale_pending_orders',
+            f'当前仍有 {stale_count} 条 stale pending 订单，下午买单存在冲突风险。',
+            action='rebuild_pending_and_review_open_orders',
+            blocks_buy=True,
+        ))
+        repair_actions.append('refresh_pending_orders')
+    if active_buy_codes:
+        issues.append(_review_issue(
+            'pending_orders', 'warn', 'active_buy_orders_present',
+            f'当前仍有未完成买单占用：{", ".join(active_buy_codes)}。',
+            action='block_codes_from_pm_buy',
+            blocks_buy=True,
+        ))
+    if active_sell_codes:
+        issues.append(_review_issue(
+            'pending_orders', 'warn', 'active_sell_orders_present',
+            f'当前仍有未完成卖单：{", ".join(active_sell_codes)}。',
+            action='keep_sell_watch_and_skip_duplicate_sell',
+        ))
+    if context['changed']:
+        repair_actions.append('sync_track_record')
+        repair_actions.append('save_track_record')
+
+    seen_actions = []
+    for action in repair_actions:
+        if action and action not in seen_actions:
+            seen_actions.append(action)
+
+    review_status = _derive_review_status(issues)
+    pm_gate_status = _derive_midday_gate(issues)
+    intraday_judgment = _build_intraday_judgment(
+        context=context,
+        review_payload=review_payload,
+        review_status=review_status,
+        pm_gate_status=pm_gate_status,
+    )
+    payload = {
+        'generated_at': _now_str(),
+        'date': datetime.now().strftime('%Y-%m-%d'),
+        'node': 'midday_node',
+        'stage': stage,
+        'trigger_slot': MIDDAY_NODE_TRIGGER_SLOT,
+        'realtime_correction_window': PM_REALTIME_CORRECTION_WINDOW,
+        'hard_deadline': MIDDAY_NODE_HARD_DEADLINE,
+        'review_status': review_status,
+        'pm_gate_status': pm_gate_status,
+        'blocked_buy_codes': active_buy_codes,
+        'account': account_snapshot,
+        'pending_orders': pending_summary,
+        'reconcile': reconcile_summary,
+        'issues': issues,
+        'repair_actions_executed': seen_actions,
+        'summary': {
+            'holding_records': holding_records,
+            'real_positions': real_positions,
+            'active_buy_codes': active_buy_codes,
+            'active_sell_codes': active_sell_codes,
+            'notes': [
+                '午间节点先复核上午已发生事实，再决定下午是否放行。',
+                '13:00-13:05 仅保留低风险实时纠偏窗口，不在该窗口内自动做高风险改单动作。',
+            ],
+        },
+        'midday_review': {
+            'market_temperature': review_payload.get('market_temperature', 'neutral'),
+            'avg_profit_pct': review_payload.get('avg_profit_pct', 0.0),
+            'opening_liquidity': review_payload.get('opening_liquidity', {}),
+            'external_market': review_payload.get('external_market', {}),
+            'focus_sell_watch': review_payload.get('focus_sell_watch', [])[:10],
+            'afternoon_watchlist': review_payload.get('afternoon_watchlist', {}),
+        },
+        'intraday_judgment': intraday_judgment,
+    }
+    return payload
+
+
+def _write_pm_gate_payload(payload, *, file_path):
+    gate_payload = {
+        'generated_at': payload.get('generated_at', _now_str()),
+        'date': payload.get('date', datetime.now().strftime('%Y-%m-%d')),
+        'node': payload.get('node', 'midday_node'),
+        'stage': payload.get('stage', ''),
+        'review_status': payload.get('review_status', 'PASS'),
+        'pm_gate_status': payload.get('pm_gate_status', 'pass'),
+        'blocked_buy_codes': payload.get('blocked_buy_codes', []),
+        'hard_deadline': payload.get('hard_deadline', MIDDAY_NODE_HARD_DEADLINE),
+        'reason_codes': [item.get('code', '') for item in payload.get('issues', []) if item.get('code')],
+    }
+    _write_json_atomic(file_path, gate_payload)
+    return gate_payload
+
+
 def _date_key(value):
     text = str(value or '').strip()
     return text[:10] if len(text) >= 10 else text
@@ -6251,9 +7106,17 @@ def _resolve_recent_trade_selection_adjustment(code, recent_trade_memory, *, all
     days_since_buy = _inum(info.get('days_since_buy', 999), 999)
     recent_buy_count = _inum(info.get('recent_buy_count', 0), 0)
 
-    if days_since_sell <= RECENT_REENTRY_SELL_PENALTY_DAYS:
+    # C: Profitable exit -> very light touch, may re-enter same day
+    if last_closed_pnl_pct > 0 and days_since_sell <= 1:
+        penalty += 0.5
+        reasons.append(f'盈利卖出{days_since_sell}天后再入')
+    elif last_closed_pnl_pct > -2.0 and days_since_sell <= 2:
+        penalty += 1.0
+        reasons.append(f'微亏后观察{days_since_sell}天')
+    elif days_since_sell <= RECENT_REENTRY_SELL_PENALTY_DAYS:
         penalty += RECENT_SELL_PENALTY_SCORE
         reasons.append(f'近{days_since_sell}天刚卖出')
+
     if days_since_sell <= RECENT_REENTRY_LOSS_BLOCK_DAYS and last_closed_pnl_pct <= RECENT_REENTRY_LOSS_BLOCK_PCT:
         penalty += RECENT_FAILURE_PENALTY_SCORE
         reasons.append(f'近期亏损{last_closed_pnl_pct:+.1f}%')
@@ -8421,6 +9284,7 @@ TDX_HOSTS = [
 ]
 
 BUY_WINDOW = ((14, 50), (14, 57))
+MIDDAY_BUY_WINDOW = ((13, 0), (13, 30))
 SELL_CUTOFF_TIME = (14, 49)
 GENERAL_SELL_WINDOW = ((9, 35), SELL_CUTOFF_TIME)
 SMART_SELL_CHECKPOINTS = [
@@ -8444,23 +9308,23 @@ ADD_POSITION_WINDOW_SETTINGS = {
     '09:36': {
         'label': 'opening_confirm',
         'score_min': 4.5,
-        'aggressive_score_min': 6.0,
-        'reserve_cash_ratio': 0.35,
+        'aggressive_score_min': 5.0,
+        'reserve_cash_ratio': 0.25,
         'non_aggressive_max_items': 2,
     },
     '10:28': {
         'label': 'trend_promote',
-        'score_min': 5.0,
-        'aggressive_score_min': 6.5,
-        'reserve_cash_ratio': 0.28,
+        'score_min': 5.5,
+        'aggressive_score_min': 5.5,
+        'reserve_cash_ratio': 0.18,
         'non_aggressive_max_items': 2,
     },
     '13:28': {
         'label': 'pm_reaccel',
         'score_min': 5.0,
-        'aggressive_score_min': 6.5,
-        'reserve_cash_ratio': 0.20,
-        'non_aggressive_max_items': 1,
+        'aggressive_score_min': 5.5,
+        'reserve_cash_ratio': 0.12,
+        'non_aggressive_max_items': 2,
     },
 }
 
@@ -8514,7 +9378,9 @@ def ensure_trade_window(action, *, dry_run=False):
     current = now.strftime('%H:%M')
     sell_cutoff = f'{SELL_CUTOFF_TIME[0]:02d}:{SELL_CUTOFF_TIME[1]:02d}'
     if action == 'buy':
-        if not _time_in_range(now, BUY_WINDOW[0], BUY_WINDOW[1]):
+        buy_win = MIDDAY_BUY_WINDOW if _MIDDAY_BUY_ACTIVE else BUY_WINDOW
+        if not _time_in_range(now, buy_win[0], buy_win[1]):
+            win_label = f"{buy_win[0][0]:02d}:{buy_win[0][1]:02d}-{buy_win[1][0]:02d}:{buy_win[1][1]:02d}"
             #region debug-point I:buy-window-timeout-window
             _debug_emit_event(
                 'D',
@@ -8523,12 +9389,12 @@ def ensure_trade_window(action, *, dry_run=False):
                 {
                     'action': str(action or ''),
                     'current': current,
-                    'buy_window_start': f'{BUY_WINDOW[0][0]:02d}:{BUY_WINDOW[0][1]:02d}',
-                    'buy_window_end': f'{BUY_WINDOW[1][0]:02d}:{BUY_WINDOW[1][1]:02d}',
+                    'buy_window_start': f'{buy_win[0][0]:02d}:{buy_win[0][1]:02d}',
+                    'buy_window_end': f'{buy_win[1][0]:02d}:{buy_win[1][1]:02d}',
                 },
             )
             #endregion
-            print(f"[WARN] 当前 {current} 不在买入窗口 14:50-14:57，已跳过自动买入。")
+            print(f"[WARN] 当前 {current} 不在买入窗口 {win_label}，已跳过自动买入。")
             return False
     elif action == 'smart_sell':
         if not _time_in_range(now, GENERAL_SELL_WINDOW[0], GENERAL_SELL_WINDOW[1]):
@@ -9032,6 +9898,12 @@ def _build_big_meat_add_profile(api, code, *, record=None, profit_pct=0.0, decis
         if total_score >= ADD_POSITION_BIG_MEAT_TOTAL_SCORE:
             aggressive_score += 0.5
         profile['aggressive_score'] = round(aggressive_score, 2)
+        # macro tailwind: 宏观政策面利好时加分（解决"强政策+保守系统"背离问题）
+        macro_tw = _resolve_macro_tailwind_bonus()
+        if macro_tw.get('bonus', 0.0) > 0:
+            profile['aggressive_score'] = round(profile['aggressive_score'] + macro_tw['bonus'], 2)
+            profile['macro_tailwind_bonus'] = macro_tw['bonus']
+            profile['macro_tailwind_source'] = macro_tw.get('source', '')
         if strong_trend and near_day_high and intraday_anchor_hold and (noon_rebound or min5_rising or rebreakout) and profile['score'] >= ADD_POSITION_BIG_MEAT_SCORE_THRESHOLD:
             profile['eligible'] = True
             multiplier = ADD_POSITION_BIG_MEAT_TARGET_MULTIPLIER
@@ -9049,6 +9921,10 @@ def _build_big_meat_add_profile(api, code, *, record=None, profit_pct=0.0, decis
     except Exception:
         return profile
     return profile
+
+
+# Fix A: midday-buy mode flag - lowers score threshold by 6 when active
+_MIDDAY_BUY_ACTIVE = False
 
 
 def do_buy(dry_run=False):
@@ -9153,11 +10029,16 @@ def _do_buy_core(dry_run=False):
     model_market = ranking['context']['market']
     model_state_summary = get_evolving_model_summary(ranking['context']['state'])
     min_model_score = ranking['min_trade_score']
+    # Fix A: midday-buy lowers threshold by 6 points for aggressive intraday entries
+    if _MIDDAY_BUY_ACTIVE:
+        min_model_score = max(38.0, min_model_score - 6.0)
+        print(f" 午盘模式: 分数门槛从 {ranking['min_trade_score']:.1f} 降至 {min_model_score:.1f}")
     balance = get_balance()
 
     if not balance:
         print("[ERROR] 无法获取账户资金")
-        return EXIT_RUNTIME_ERROR
+        # 接口故障+无缓存时按无动作结束，避免把网络故障判成运行时错误
+        return EXIT_NO_ACTION
 
     total_signals = sum(len(signals[t]) for t in signals)
     if total_signals == 0:
@@ -9255,6 +10136,10 @@ def _do_buy_core(dry_run=False):
         for s in signals[original_tier]:
             mode = str(s.get('mode', '')).strip()
             code = str(s.get('code', '')).zfill(6)
+            # === TUNED 2026-07-22: code-prefix blacklist (block test instruments) ===
+            if any(code.startswith(p) for p in BLOCKED_CODE_PREFIXES):
+                skipped_guard_modes.append(f"{code}[prefix_block:{mode}]")
+                continue
             if mode in set(pm_buy_guard.get('blocked_modes', [])):
                 skipped_guard_modes.append(f"{code}[{mode}]")
                 continue
@@ -9352,6 +10237,15 @@ def _do_buy_core(dry_run=False):
                 build_note = f"{build_note}; {'/'.join(recent_adjustment.get('reasons', [])[:2])}"
             if learning_action.get('reason'):
                 build_note = f"{build_note}; 学习层({learning_action['reason']})"
+            # === TUNED 2026-07-22: NAV-percentage position cap (was uncapped, max/min=32x) ===
+            nav_cap_max = total_assets * MAX_POSITION_PCT_NAV / 100
+            nav_cap_min = total_assets * MIN_POSITION_PCT_NAV / 100
+            if amount_per_stock_this > nav_cap_max:
+                build_note = f"{build_note}; 仓位封顶{MAX_POSITION_PCT_NAV:.1f}%NAV"
+                amount_per_stock_this = nav_cap_max
+            elif amount_per_stock_this < nav_cap_min:
+                build_note = f"{build_note}; 仓位过滤<{MIN_POSITION_PCT_NAV:.1f}%NAV"
+                continue  # skip dust trades
             amount_per_stock_this = min(amount_per_stock_this, target_amount_this)
             if amount_per_stock_this <= 0 or target_amount_this <= 0:
                 continue
@@ -9686,7 +10580,10 @@ def _do_buy_core(dry_run=False):
             print('[ERROR] buy completed but account refresh failed integrity checks')
             return EXIT_RUNTIME_ERROR
         if success_count <= 0:
-            return EXIT_RUNTIME_ERROR
+            # 买入 0 单：可能是接口瞬时故障，不应判死整个阶段（否则自动化窗口被跳过）。
+            # 交由上层按 EXIT_NO_ACTION 收尾，下一周期自动重试。
+            print("[WARN] buy 阶段 0 单成交（接口故障或信号缺失），按无动作结束，下周期自动重试")
+            return EXIT_NO_ACTION
     if dry_run:
         return EXIT_OK
     if success_count > 0:
@@ -10191,6 +11088,8 @@ def _do_sell_core(smart=False, dry_run=False):
                     ref_price=cur_price,
                     execution_phase='primary',
                     strategy_action=action,
+                    limit_fallback_price=cur_price,
+                    price_dec=_inum((pos or {}).get('price_dec', 0), 2) or 2,
                 )
                 if trade_result['success']:
                     if sell_action == BIG_MEAT_ACTION_RISK_TRIM:
@@ -10270,8 +11169,8 @@ def _do_sell_core(smart=False, dry_run=False):
                             code=str(code).zfill(6),
                             qty=_inum(qty, 0),
                             elapsed_ms=round((time.perf_counter() - trade_started_at) * 1000, 2),
-                            message=str(trade_result.get('message', '') or ''),
-                            result_code=str(trade_result.get('code', '') or ''),
+                            message=str((trade_result.get('result') or {}).get('message', '') or trade_result.get('message', '') or ''),
+                            result_code=str(trade_result.get('result_code', '') or ''),
                         )
                         #endregion
         else:
@@ -10403,8 +11302,10 @@ def _do_sell_core(smart=False, dry_run=False):
         return EXIT_RUNTIME_ERROR
     if sold_count > 0:
         return EXIT_OK
-    if skipped_count > 0 and hold_count <= 0:
-        return EXIT_RUNTIME_ERROR
+    if skipped_count > 0:
+        # 卖单失败（接口故障/限流）不应判死整个阶段：持仓仍在，
+        # 下一周期 smart-sell 会重新扫描并重试卖出。
+        print(f"[WARN] {skipped_count} 笔卖单未受理（接口故障或限流），按无动作结束，下周期自动重试")
     return EXIT_NO_ACTION
 
 
@@ -10555,7 +11456,8 @@ def do_add_position(dry_run=False):
             # #region debug-point B:add-position-balance-missing
             _dbg_emit('B', '[DEBUG] add_position missing balance', elapsed_ms=round((_dbg_time.perf_counter() - _dbg_t0) * 1000, 1))
             # #endregion
-            return EXIT_RUNTIME_ERROR
+            # 接口故障+无缓存时按无动作结束，避免把网络故障判成运行时错误
+            return EXIT_NO_ACTION
 
         avail = _fnum(balance.get('avail_balance', 0.0), 0.0)
         total_assets = _fnum(balance.get('total_assets', avail), avail)
@@ -11294,7 +12196,9 @@ def do_add_position(dry_run=False):
                 failed_count=len(failed_add_items),
             )
             # #endregion
-            return EXIT_RUNTIME_ERROR
+            # 加仓单失败不应判死整个阶段，按无动作结束，下周期自动重试
+            print(f"[WARN] add_position {len(failed_add_items)} 笔加仓未受理，按无动作结束")
+            return EXIT_NO_ACTION
     # #region debug-point D:add-position-exit-ok
     _dbg_emit(
         'D',
@@ -11496,6 +12400,30 @@ def do_midday_gate():
     return EXIT_NO_ACTION
 
 
+def do_midday_buy(dry_run=False):
+    """Fix A: 午盘买入窗口 13:05。
+    在 midday-gate 放行后，基于当天扫描快照买入。
+    相比尾盘 do_buy：分数门槛降低6分，仅对 market_score >= 60 生效。"""
+    from pathlib import Path as _Path
+    gate_path = _Path(DATA_DIR) / "v10_pm_gate_status.json"
+    if gate_path.exists():
+        gate = _read_json(str(gate_path))
+        gate_status = str(gate.get('pm_gate_status', '')).strip()
+        if gate_status in ('block_all', 'block_buy'):
+            print("[MIDDAY-BUY] 午盘门控状态={}，跳过。".format(gate_status))
+            return EXIT_NO_ACTION
+    else:
+        print("[MIDDAY-BUY] 无午盘门控文件，跳过（需先运行 --midday-gate）。")
+        return EXIT_NO_ACTION
+
+    global _MIDDAY_BUY_ACTIVE
+    _MIDDAY_BUY_ACTIVE = True
+    try:
+        return do_buy(dry_run=dry_run)
+    finally:
+        _MIDDAY_BUY_ACTIVE = False
+
+
 def do_report():
     """兼容旧入口：收盘节点。"""
     return do_close_node()
@@ -11671,6 +12599,10 @@ def main():
     parser.add_argument('--smart-sell', action='store_true',
                         help='智能卖出：信号衰减随时走人 + T+5兜底')
     parser.add_argument('--status', action='store_true', help='查看持仓和战绩')
+    parser.add_argument('--midday-node', action='store_true', help='午间节点：事实复核、自动安全纠偏、下午放行')
+    parser.add_argument('--midday-gate', action='store_true', help='午间节点最终放行门：13:00-13:05 快速复查')
+    parser.add_argument('--midday-buy', action='store_true', help='午盘买入：13:05 在gate放行后基于当天快照买入')
+    parser.add_argument('--midday-review', action='store_true', help='午间复盘：中场校准与下午观察清单')
     parser.add_argument('--close-node', action='store_true', help='收盘节点：全天复核复盘与学习放行')
     parser.add_argument('--report', action='store_true', help='生成账户摘要、NAV历史和学习循环报告')
     parser.add_argument('--repair-closed-episode', metavar='CODE', help='用 MX 已成订单及近期快照校正指定已平仓记录')
@@ -11699,6 +12631,14 @@ def main():
         return do_smart_sell(dry_run=args.dry_run)
     elif args.sell:
         return do_sell(dry_run=args.dry_run)
+    elif args.midday_node:
+        return do_midday_node()
+    elif args.midday_gate:
+        return do_midday_gate()
+    elif args.midday_buy:
+        return do_midday_buy(dry_run=args.dry_run)
+    elif args.midday_review:
+        return do_midday_review()
     elif args.close_node:
         return do_close_node()
     elif args.report:
