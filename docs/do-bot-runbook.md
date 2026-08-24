@@ -8,8 +8,9 @@ Read this before doing any account query, runtime inspection, or repository oper
 
 1. Read `docs/stockbot-code-map.md`
 2. Read `docs/do-bot-runbook.md`
-3. If the task involves the mock trading account, read `docs/mx-moni-bot-prompt.md`
-4. Only then read the specific implementation file you need
+3. If a current handoff exists, read the latest dated handoff note in `docs/`
+4. If the task involves the mock trading account, read `docs/mx-moni-bot-prompt.md`
+5. Only then read the specific implementation file you need
 
 ## Main Goals
 
@@ -227,8 +228,6 @@ Important note:
 - `10:45` -> `smart-sell`
 - `11:02` -> `workbuddy-buy` with trigger slot `11:00`
 - `11:15` -> `smart-sell`
-- `11:35` -> `midday-node`
-- `13:00` -> `midday-gate`
 - `13:15` -> `smart-sell`
 - `13:28` -> `add-position`
 - `13:32` -> `workbuddy-buy` with trigger slot `13:30`
@@ -236,7 +235,7 @@ Important note:
 - `13:45` -> `smart-sell`
 - `14:02` -> `workbuddy-buy` with trigger slot `14:00`
 - `14:15` -> `smart-sell`
-- `14:30` -> `prewarm`
+- `14:25` -> `prewarm`
 - `14:32` -> `workbuddy-buy` with trigger slot `14:30`
 - `14:45` -> `smart-sell`
 - `14:49` -> `decision`
@@ -408,7 +407,7 @@ Typical things to check:
 - latest phase status
 - phase history
 - `v10_opening_node_latest.json` for the `09:31 opening-data` morning node summary
-- `v10_midday_inspection_latest.json` for the midday inspection summary
+- `automation_status/prewarm_timing_signal.json` for tail prewarm timing and decision buffer
 - close-node outputs
 - candidate pool freshness
 - account summary outputs

@@ -1,71 +1,38 @@
-name: Manual Phase Self-Hosted
+name: Repair MX Filled Episode Self-Hosted
 
 on:
   workflow_dispatch:
     inputs:
-      phase:
-        description: Phase to execute through v10_auto_runner.py.
+      code:
+        description: Closed record stock code to repair.
         required: true
-        default: workbuddy-status
-        type: choice
-        options:
-          - opening-data
-          - workbuddy-refresh
-          - workbuddy-buy
-          - workbuddy-sell
-          - workbuddy-smart-sell
-          - workbuddy-status
-          - prewarm
-          - decision
-          - buy
-          - buy-watch
-          - add-position
-          - smart-sell
-          - sell
-          - repair-mx-002487
-          - status
-          - close-node
-          - report
-      trigger_slot:
-        description: Logical trigger slot like 14:30 or manual.
-        required: false
-        default: manual
+        default: '002487'
         type: string
-      task_name:
-        description: Optional task name shown in status logs.
-        required: false
-        default: ''
+      buy_order_ids:
+        description: Comma-separated MX filled buy order IDs.
+        required: true
+        default: '262214600000064468,262214500000070240'
         type: string
-      with_email:
-        description: Whether to send phase email if supported.
+      sell_order_id:
+        description: MX filled sell order ID.
         required: true
-        default: false
-        type: boolean
-      max_attempts:
-        description: Watch-mode retry ceiling.
-        required: true
-        default: '12'
-        type: string
-      interval_seconds:
-        description: Watch-mode retry interval in seconds.
-        required: true
-        default: '30'
+        default: '262244500000038738'
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: stockbot-manual-phase
+  group: stockbot-trading-day
   cancel-in-progress: false
 
 jobs:
-  run-manual-phase:
+  repair-mx-filled-episode:
     runs-on:
       - self-hosted
       - linux
       - stockbot-do
-    timeout-minutes: 120
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -114,42 +81,47 @@ jobs:
           } >> "$GITHUB_ENV"
           "$python_exe" --version
 
-      - name: Run selected phase
+      - name: Verify MX fills and rebuild one closed episode
         shell: bash
+        env:
+          REPAIR_CODE: ${{ inputs.code }}
+          REPAIR_BUY_ORDER_IDS: ${{ inputs.buy_order_ids }}
+          REPAIR_SELL_ORDER_ID: ${{ inputs.sell_order_id }}
         run: |
-          phase="${{ github.event.inputs.phase }}"
-          trigger_slot="${{ github.event.inputs.trigger_slot }}"
-          task_name="${{ github.event.inputs.task_name }}"
-          if [ -z "$trigger_slot" ]; then
-            trigger_slot="manual"
+          if ! [[ "$REPAIR_CODE" =~ ^[0-9]{6}$ ]]; then
+            echo "Invalid stock code"
+            exit 2
           fi
-          if [ -z "$task_name" ]; then
-            task_name="GHA-Manual-$phase"
+          if ! [[ "$REPAIR_SELL_ORDER_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid sell order ID"
+            exit 2
           fi
-          safe_phase="$(printf '%s' "$phase" | tr -cs '[:alnum:]' '-' | sed 's/^-//; s/-$//' | tr '[:upper:]' '[:lower:]')"
-          run_id="gha-manual-${{ github.run_id }}-$safe_phase"
+          IFS=',' read -r -a buy_order_ids <<< "$REPAIR_BUY_ORDER_IDS"
           args=(
-            "/opt/stockbot/workbuddy/skills/a-share-analyst/v10_auto_runner.py"
-            --phase "$phase"
-            --task-name "$task_name"
-            --trigger-slot "$trigger_slot"
-            --run-id "$run_id"
-            --max-attempts "${{ github.event.inputs.max_attempts }}"
-            --interval-seconds "${{ github.event.inputs.interval_seconds }}"
+            "/opt/stockbot/workbuddy/skills/a-share-analyst/v10_moni_trader.py"
+            --repair-closed-episode "$REPAIR_CODE"
+            --repair-sell-order-id "$REPAIR_SELL_ORDER_ID"
           )
-          if [ "${{ github.event.inputs.with_email }}" = "true" ]; then
-            args+=(--with-email)
-          fi
+          for order_id in "${buy_order_ids[@]}"; do
+            order_id="$(printf '%s' "$order_id" | tr -d '[:space:]')"
+            if ! [[ "$order_id" =~ ^[0-9]+$ ]]; then
+              echo "Invalid buy order ID"
+              exit 2
+            fi
+            args+=(--repair-buy-order-id "$order_id")
+          done
           "$TLFZ_PYTHON_EXE" "${args[@]}"
 
-      - name: Upload runtime artifacts
+      - name: Upload repair evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: manual-phase-${{ github.run_id }}
+          name: mx-filled-episode-repair-${{ github.run_id }}
           if-no-files-found: warn
           path: |
-            /opt/stockbot/workbuddy/a-share-analyst/automation_status/**
-            /opt/stockbot/workbuddy/a-share-analyst/*latest*.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_mx_verified_fills.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_mx_fill_repair_latest.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_trade_episode_history_latest.json
+            /opt/stockbot/workbuddy/a-share-analyst/v10_account_summary_latest.json
             /opt/stockbot/workbuddy/a-share-analyst/v10_orders_cache.json
             /opt/stockbot/workbuddy/a-share-analyst/v10_positions_cache.json

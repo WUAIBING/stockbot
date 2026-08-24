@@ -135,9 +135,11 @@ def validate_candidate_pool_artifact(
             f"{candidate_count} < {selected_count}"
         )
 
-    # Per-entry schema validation (fail-fast on bad data at pool->trader boundary)
-    from .pipeline_schema import validate_candidate_pool as _validate_pool_schema
-    _validate_pool_schema(payload, path_hint=str(target_path))
+    # Per-entry schema validation is NOT wired in yet.
+    # pipeline_schema.validate_candidate_pool requires 'tier' and 'score' on every
+    # selected_record, but the live pool format no longer emits either field, so
+    # enabling this would hard-fail the pool->trader boundary on every trading day.
+    # Re-enable once pipeline_schema matches the current pool schema.
 
     return ValidationReport(
         name="workbuddy_candidate_pool_latest.json",

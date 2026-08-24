@@ -3,20 +3,82 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import socket
 import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
+
 import evolving_model
 import external_market_review
+import github_actions_trade_day as day_controller
+import mx_api_env
 import register_workbuddy_tasks as task_register
 import v10_auto_runner as auto_runner
 import v10_moni_trader as trader
 import workbuddy_local_challenger as challenger
 import workbuddy_local_review as challenger_review
+
+
+def _write_valid_decision_snapshot(root: Path, *, trade_date: str = "2026-07-14") -> tuple[dict, Path]:
+    producer_run_id = "decision-run-1"
+    run_slot = f"{trade_date}_145030_000001_1"
+    cutoff = f"{trade_date} 14:50:00"
+    profile_id = trader._ACTIVE_STRATEGY_PROFILE_ID
+    profile_hash = trader._ACTIVE_STRATEGY_PROFILE_HASH
+    csv_path = root / f"v10_scan_full.{run_slot}.csv"
+    meta_path = root / f"v10_scan_meta.{run_slot}.json"
+    pointer_path = root / "v10_decision_latest.json"
+    csv_path.write_text(
+        "code,tier,mode,strategy_profile_id,strategy_profile_hash,"
+        "decision_cutoff_at,decision_cutoff_ready,source_bar_end_at\n"
+        f"000001,1,V9_full,{profile_id},{profile_hash},{cutoff},True,{cutoff}\n",
+        encoding="utf-8-sig",
+    )
+    csv_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    protocol = {
+        "schema_version": 1,
+        "artifact_id": f"{trade_date}:decision:{producer_run_id}",
+        "producer_run_id": producer_run_id,
+        "started_at": f"{trade_date} 14:49:00.000000+08:00",
+        "published_at": f"{trade_date} 14:50:30.000000+08:00",
+        "market_timezone": "UTC+08",
+        "scan_csv_sha256": csv_hash,
+        "cutoff_not_ready_count": 0,
+        "run_time": f"{trade_date} 14:49:00",
+        "run_slot": run_slot,
+        "phase": "decision",
+        "trade_date": trade_date,
+        "decision_cutoff_at": cutoff,
+        "complete": True,
+        "requested_count": 1,
+        "refreshed_count": 1,
+        "strategy_profile_id": profile_id,
+        "strategy_profile_hash": profile_hash,
+        "stocks_with_signal": 1,
+        "signals_by_tier": {"T1": 1, "T2": 0, "T3": 0},
+    }
+    paths = {
+        "scan_csv": str(csv_path),
+        "scan_meta": str(meta_path),
+        "latest_scan_csv": str(root / "v10_scan_full.csv"),
+        "latest_scan_meta": str(root / "v10_scan_meta.json"),
+        "snapshot_scan_csv": str(csv_path),
+        "snapshot_scan_meta": str(meta_path),
+    }
+    meta_path.write_text(
+        json.dumps({**protocol, **paths, "stocks_scanned": 1}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    pointer = {**protocol, **paths}
+    pointer_path.write_text(json.dumps(pointer, ensure_ascii=False), encoding="utf-8")
+    return pointer, pointer_path
 
 
 class RunPhaseWatchTests(unittest.TestCase):
@@ -28,10 +90,30 @@ class RunPhaseWatchTests(unittest.TestCase):
         self.assertEqual(code, auto_runner.EXIT_WINDOW_SKIPPED)
         self.assertEqual(detail, "step finished with window skipped: workbuddy_local_challenger.py")
 
+    def test_enrich_buy_detail_includes_no_action_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            diagnostic_file = Path(tmpdir) / "v10_buy_diagnostic_latest.json"
+            diagnostic_file.write_text(
+                json.dumps({"action": "buy", "reason": "budget_or_lot_size"}),
+                encoding="utf-8",
+            )
+            with patch.object(auto_runner, "BUY_DIAGNOSTIC_FILE", diagnostic_file):
+                detail = auto_runner.enrich_buy_detail(
+                    "buy",
+                    "v10_moni_trader.py",
+                    "step finished with no action: v10_moni_trader.py",
+                )
+
+        self.assertIn("buy_no_action_reason=budget_or_lot_size", detail)
+
     def test_buy_watch_retries_on_decision_not_ready(self) -> None:
         fixed_now = datetime(2026, 6, 25, 14, 50, 0)
         with (
-            patch.object(auto_runner, "run_phase_once", side_effect=[1, 0]) as run_once,
+            patch.object(
+                auto_runner,
+                "run_phase_once",
+                side_effect=[auto_runner.EXIT_DECISION_NOT_READY, 0],
+            ) as run_once,
             patch.object(auto_runner, "record_status") as record_status,
             patch.object(auto_runner.time, "sleep") as sleep_mock,
             patch.object(auto_runner, "datetime") as mock_datetime,
@@ -50,6 +132,107 @@ class RunPhaseWatchTests(unittest.TestCase):
         record_status.assert_called_once()
         sleep_mock.assert_called_once()
 
+    def test_buy_watch_does_not_retry_runtime_or_timeout_failures(self) -> None:
+        fixed_now = datetime(2026, 6, 25, 14, 50, 0)
+        for exit_code in (auto_runner.EXIT_RUNTIME_ERROR, 124, auto_runner.EXIT_CONFIG_ERROR):
+            with self.subTest(exit_code=exit_code):
+                with (
+                    patch.object(auto_runner, "run_phase_once", return_value=exit_code) as run_once,
+                    patch.object(auto_runner, "record_status") as record_status,
+                    patch.object(auto_runner.time, "sleep") as sleep_mock,
+                    patch.object(auto_runner, "datetime") as mock_datetime,
+                ):
+                    mock_datetime.now.return_value = fixed_now
+                    code = auto_runner.run_phase_watch(
+                        "buy",
+                        run_meta={"task_name": "BuyWatch", "trigger_slot": "14:50", "run_id": "rid"},
+                        with_email=False,
+                        max_attempts=12,
+                        interval_seconds=30,
+                    )
+
+                self.assertEqual(code, exit_code)
+                run_once.assert_called_once()
+                record_status.assert_not_called()
+                sleep_mock.assert_not_called()
+
+    def test_buy_watch_records_one_terminal_failure_when_decision_never_arrives(self) -> None:
+        fixed_now = datetime(2026, 6, 25, 14, 50, 0)
+        with (
+            patch.object(auto_runner, "run_phase_once", return_value=auto_runner.EXIT_DECISION_NOT_READY),
+            patch.object(auto_runner, "record_status") as record_status,
+            patch.object(auto_runner.time, "sleep"),
+            patch.object(auto_runner, "datetime") as mock_datetime,
+        ):
+            mock_datetime.now.return_value = fixed_now
+            code = auto_runner.run_phase_watch(
+                "buy",
+                run_meta={"task_name": "BuyWatch", "trigger_slot": "14:50", "run_id": "rid"},
+                with_email=False,
+                max_attempts=2,
+                interval_seconds=30,
+            )
+
+        self.assertEqual(code, auto_runner.EXIT_DECISION_NOT_READY)
+        terminal_calls = [
+            item for item in record_status.call_args_list
+            if item.kwargs.get("status") == "failed"
+        ]
+        self.assertEqual(len(terminal_calls), 1)
+        self.assertEqual(terminal_calls[0].kwargs["step"], "watch_terminal")
+
+    def test_late_buy_watch_without_attempt_is_terminal_not_no_action(self) -> None:
+        fixed_now = datetime(2026, 6, 25, 14, 58, 0)
+        with (
+            patch.object(auto_runner, "run_phase_once") as run_once,
+            patch.object(auto_runner, "record_status") as record_status,
+            patch.object(auto_runner, "datetime") as mock_datetime,
+        ):
+            mock_datetime.now.return_value = fixed_now
+            code = auto_runner.run_phase_watch(
+                "buy",
+                run_meta={"task_name": "BuyWatch", "trigger_slot": "14:50", "run_id": "rid"},
+                with_email=False,
+                max_attempts=12,
+                interval_seconds=30,
+            )
+
+        self.assertEqual(code, auto_runner.EXIT_DECISION_NOT_READY)
+        run_once.assert_not_called()
+        record_status.assert_called_once()
+        self.assertEqual(record_status.call_args.kwargs["status"], "failed")
+
+    def test_buy_transient_exit_codes_have_nonfatal_semantics(self) -> None:
+        self.assertEqual(
+            auto_runner.classify_step_status("buy", "v10_moni_trader.py", auto_runner.EXIT_DECISION_NOT_READY),
+            "decision_not_ready",
+        )
+        self.assertEqual(
+            auto_runner.classify_step_status("buy", "v10_moni_trader.py", auto_runner.EXIT_STALE_DECISION),
+            "stale_decision",
+        )
+        self.assertEqual(
+            auto_runner.classify_step_status("buy", "v10_moni_trader.py", auto_runner.EXIT_CONFIG_ERROR),
+            "failed",
+        )
+
+    def test_decision_phase_publishes_running_marker_before_steps(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 49, 0, tzinfo=auto_runner.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pointer_file = Path(tmpdir) / "v10_decision_latest.json"
+            with (
+                patch.object(auto_runner, "DECISION_POINTER_FILE", pointer_file),
+                patch.object(auto_runner, "market_now", return_value=market_now),
+            ):
+                marker = auto_runner.publish_decision_running_marker(
+                    {"task_name": "Decision", "trigger_slot": "14:49", "run_id": "decision-run-1"}
+                )
+            persisted = json.loads(pointer_file.read_text(encoding="utf-8"))
+
+        self.assertFalse(marker["complete"])
+        self.assertEqual(marker["artifact_id"], "2026-07-14:decision:decision-run-1")
+        self.assertEqual(persisted, marker)
+
     def test_workbuddy_refresh_phase_includes_distill_refresh(self) -> None:
         steps = auto_runner.build_steps("workbuddy-refresh", with_email=False)
         self.assertEqual(steps[0], [str(auto_runner.REFRESH_DISTILL_PIPELINE_SCRIPT)])
@@ -57,6 +240,26 @@ class RunPhaseWatchTests(unittest.TestCase):
     def test_workbuddy_buy_phase_calls_challenger_only(self) -> None:
         steps = auto_runner.build_steps("workbuddy-buy", with_email=False)
         self.assertEqual(steps, [["workbuddy_local_challenger.py", "--buy"]])
+
+    def test_prewarm_phase_uses_fast_scanner_mode(self) -> None:
+        steps = auto_runner.build_steps("prewarm", with_email=False)
+        self.assertEqual(steps[0], ["data_freshness_probe.py"])
+        self.assertEqual(steps[1], ["scanner_v10.py", "--prewarm-fast"])
+
+    def test_buy_phase_timeout_extended_for_tail_window(self) -> None:
+        self.assertEqual(auto_runner.STEP_TIMEOUTS[("buy", "v10_moni_trader.py")], 420)
+
+    def test_prewarm_timing_defaults_to_active_schedule_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(auto_runner, "PREWARM_TIMING_SIGNAL", Path(tmpdir) / "prewarm_timing_signal.json"):
+                payload = auto_runner.evaluate_prewarm_timing(
+                    run_meta={"task_name": "Prewarm", "trigger_slot": "", "run_id": "rid"},
+                    status="ok",
+                    started_at=datetime(2026, 7, 14, 14, 25),
+                    finished_at=datetime(2026, 7, 14, 14, 30),
+                )
+
+        self.assertEqual(payload["recommended_trigger_slot"], "14:25")
 
     def test_run_phase_once_fails_fast_when_preflight_breaks(self) -> None:
         with (
@@ -73,6 +276,328 @@ class RunPhaseWatchTests(unittest.TestCase):
 
         self.assertEqual(code, 3)
         record_status.assert_called_once()
+
+    def test_auto_runner_main_checks_runtime_write_identity_before_phase_execution(self) -> None:
+        with (
+            patch("sys.argv", ["v10_auto_runner.py", "--phase", "workbuddy-status"]),
+            patch.object(auto_runner, "assert_runtime_write_identity", side_effect=RuntimeError("owner mismatch")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "owner mismatch"):
+                auto_runner.main()
+
+
+class TraderWindowTimezoneTests(unittest.TestCase):
+    def test_write_buy_diagnostic_records_reason_and_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "v10_buy_diagnostic_latest.json"
+            with (
+                patch.object(trader, "BUY_DIAGNOSTIC_FILE", str(output_file)),
+                patch.object(trader, "_now_str", return_value="2026-07-14 14:52:00"),
+                patch.object(trader, "_market_today", return_value="2026-07-14"),
+            ):
+                payload = trader._write_buy_diagnostic(
+                    "candidate_filters",
+                    signal_count=3,
+                    skipped_low_model=["000001:42.0"],
+                )
+
+            persisted = json.loads(output_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["reason"], "candidate_filters")
+        self.assertEqual(persisted["details"]["signal_count"], 3)
+        self.assertEqual(persisted["details"]["skipped_low_model"], ["000001:42.0"])
+
+    def test_resolve_mx_api_url_falls_back_when_runtime_and_env_values_are_blank(self) -> None:
+        self.assertEqual(
+            trader.resolve_mx_api_url({"MX_API_URL": ""}, {"MX_API_URL": ""}),
+            trader.DEFAULT_MX_API_URL,
+        )
+
+    def test_add_position_window_uses_market_timezone(self) -> None:
+        market_now = datetime(2026, 7, 14, 9, 36, 30, tzinfo=trader.MARKET_TZ)
+        with patch.object(trader, "_market_now", return_value=market_now):
+            self.assertTrue(trader.ensure_trade_window("add_position", dry_run=False))
+            self.assertEqual(trader._current_add_position_window_tag(), "09:36")
+
+    def test_buy_window_uses_market_timezone(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with patch.object(trader, "_market_now", return_value=market_now):
+            self.assertTrue(trader.ensure_trade_window("buy", dry_run=False))
+
+    def test_calc_buy_quantity_preserves_main_board_boundary_budget(self) -> None:
+        with patch.object(trader, "_debug_emit_event"):
+            qty = trader.calc_buy_quantity(81.43, 8143, "000001")
+
+        self.assertEqual(qty, 100)
+
+    def test_calc_buy_quantity_blocks_star_board_budget_below_min_lot(self) -> None:
+        with patch.object(trader, "_debug_emit_event"):
+            qty = trader.calc_buy_quantity(81.43, 8143, "688362")
+
+        self.assertEqual(qty, 0)
+
+    def test_calc_buy_quantity_accepts_star_board_exact_two_hundred_lot(self) -> None:
+        with patch.object(trader, "_debug_emit_event"):
+            qty = trader.calc_buy_quantity(81.43, 16286, "688362")
+
+        self.assertEqual(qty, 200)
+
+    def test_wait_for_today_decision_ready_uses_dedicated_valid_pointer(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload, pointer_file = _write_valid_decision_snapshot(root)
+            status_file = root / "latest_decision_status.json"
+            with (
+                patch.object(trader, "DATA_DIR", root),
+                patch.object(trader, "DECISION_LATEST_FILE", str(pointer_file)),
+                patch.object(trader, "LATEST_DECISION_STATUS_FILE", str(status_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                ready, message, latest = trader.wait_for_today_decision_ready(
+                    max_wait_seconds=0,
+                    poll_seconds=0,
+                )
+
+        self.assertTrue(ready)
+        self.assertEqual(message, "")
+        self.assertEqual(latest, payload)
+
+    def test_live_decision_snapshot_validates_pointer_meta_csv_and_hash(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload, _pointer_file = _write_valid_decision_snapshot(root)
+            with patch.object(trader, "DATA_DIR", root):
+                ok, message, context, exit_code = trader.validate_live_decision_snapshot(
+                    payload,
+                    now=market_now,
+                )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(exit_code, trader.EXIT_OK)
+        self.assertEqual(context["pointer"]["artifact_id"], payload["artifact_id"])
+        self.assertEqual(len(context["rows"]), 1)
+
+    def test_live_decision_snapshot_rejects_tampered_csv(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload, _pointer_file = _write_valid_decision_snapshot(root)
+            Path(payload["scan_csv"]).write_text("tampered\n", encoding="utf-8")
+            with patch.object(trader, "DATA_DIR", root):
+                ok, message, _context, exit_code = trader.validate_live_decision_snapshot(
+                    payload,
+                    now=market_now,
+                )
+
+        self.assertFalse(ok)
+        self.assertIn("SHA-256", message)
+        self.assertEqual(exit_code, trader.EXIT_RUNTIME_ERROR)
+
+    def test_decision_pointer_change_is_detected_before_order_side_effects(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            expected, pointer_file = _write_valid_decision_snapshot(root)
+            pointer_file.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "artifact_id": "2026-07-14:decision:new-run",
+                    "producer_run_id": "new-run",
+                    "phase": "decision",
+                    "trade_date": "2026-07-14",
+                    "complete": False,
+                    "decision_cutoff_at": "2026-07-14 14:50:00",
+                }),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(trader, "DECISION_LATEST_FILE", str(pointer_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                current, _message, exit_code = trader.validate_decision_pointer_still_current(
+                    expected,
+                    now=market_now,
+                )
+
+        self.assertFalse(current)
+        self.assertEqual(exit_code, trader.EXIT_DECISION_NOT_READY)
+
+    def test_live_decision_pointer_rejects_wrong_phase_cutoff_and_profile(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        base = {
+            "schema_version": 1,
+            "artifact_id": "2026-07-14:decision:decision-run-1",
+            "producer_run_id": "decision-run-1",
+            "phase": "decision",
+            "trade_date": "2026-07-14",
+            "complete": True,
+            "decision_cutoff_at": "2026-07-14 14:50:00",
+            "strategy_profile_id": trader._ACTIVE_STRATEGY_PROFILE_ID,
+            "strategy_profile_hash": trader._ACTIVE_STRATEGY_PROFILE_HASH,
+            "scan_csv_sha256": "a" * 64,
+            "published_at": "2026-07-14 14:50:30.000000+08:00",
+        }
+        mutations = (
+            {"phase": "prewarm"},
+            {"decision_cutoff_at": "2026-07-14 14:45:00"},
+            {"strategy_profile_id": "unknown-profile"},
+            {"strategy_profile_hash": "sha256:" + ("b" * 64)},
+            {"complete": "true"},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                state, _message, exit_code = trader._classify_live_decision_pointer(
+                    {**base, **mutation},
+                    now=market_now,
+                )
+                self.assertEqual(state, "invalid")
+                self.assertEqual(exit_code, trader.EXIT_RUNTIME_ERROR)
+
+    def test_decision_wait_never_falls_back_to_generic_pointer(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "v10_scan_latest.json").write_text(
+                json.dumps({"phase": "decision", "complete": True}),
+                encoding="utf-8",
+            )
+            decision_file = root / "v10_decision_latest.json"
+            status_file = root / "latest_decision_status.json"
+            with (
+                patch.object(trader, "DECISION_LATEST_FILE", str(decision_file)),
+                patch.object(trader, "LATEST_DECISION_STATUS_FILE", str(status_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                ready, message, payload = trader.wait_for_today_decision_ready(
+                    max_wait_seconds=0,
+                    poll_seconds=0,
+                )
+
+        self.assertFalse(ready)
+        self.assertIn("尚未发布", message)
+        self.assertEqual(
+            payload[trader.DECISION_READINESS_EXIT_CODE_KEY],
+            trader.EXIT_DECISION_NOT_READY,
+        )
+
+    def test_decision_wait_ignores_failed_status_from_older_same_day_producer(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        marker = {
+            "schema_version": 1,
+            "artifact_id": "2026-07-14:decision:new-run",
+            "producer_run_id": "new-run",
+            "phase": "decision",
+            "trade_date": "2026-07-14",
+            "complete": False,
+            "decision_cutoff_at": "2026-07-14 14:50:00",
+        }
+        old_status = {
+            "run_id": "old-run",
+            "status": "failed",
+            "started_at": "2026-07-14 14:49:00",
+            "finished_at": "2026-07-14 14:49:30",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pointer_file = root / "v10_decision_latest.json"
+            status_file = root / "latest_decision_status.json"
+            pointer_file.write_text(json.dumps(marker), encoding="utf-8")
+            status_file.write_text(json.dumps(old_status), encoding="utf-8")
+            with (
+                patch.object(trader, "DECISION_LATEST_FILE", str(pointer_file)),
+                patch.object(trader, "LATEST_DECISION_STATUS_FILE", str(status_file)),
+                patch.object(trader, "_market_now", return_value=market_now),
+            ):
+                ready, _message, payload = trader.wait_for_today_decision_ready(
+                    max_wait_seconds=0,
+                    poll_seconds=0,
+                )
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            payload[trader.DECISION_READINESS_EXIT_CODE_KEY],
+            trader.EXIT_DECISION_NOT_READY,
+        )
+
+    def test_decision_pointer_previous_day_is_retryable_stale(self) -> None:
+        market_now = datetime(2026, 7, 14, 14, 52, 0, tzinfo=trader.MARKET_TZ)
+        state, _message, exit_code = trader._classify_live_decision_pointer(
+            {"trade_date": "2026-07-13"},
+            now=market_now,
+        )
+        self.assertEqual(state, "stale")
+        self.assertEqual(exit_code, trader.EXIT_STALE_SCAN)
+
+    def test_shared_phase_lock_does_not_reclaim_fresh_initializing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lock_file = root / "buy_shared.lock.json"
+            lock_file.write_bytes(b"")
+            with patch.object(trader, "DATA_DIR", root):
+                result = trader.acquire_shared_phase_lock(
+                    "buy_shared",
+                    owner="second",
+                    ttl_seconds=480,
+                )
+
+            still_exists = lock_file.exists()
+
+        self.assertFalse(result["acquired"])
+        self.assertTrue(result["initializing"])
+        self.assertTrue(still_exists)
+
+    def test_shared_phase_lock_reclaims_old_malformed_file_with_snapshot_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lock_file = root / "buy_shared.lock.json"
+            lock_file.write_bytes(b"")
+            old_time = trader.time.time() - 10
+            os.utime(lock_file, (old_time, old_time))
+            with patch.object(trader, "DATA_DIR", root):
+                result = trader.acquire_shared_phase_lock(
+                    "buy_shared",
+                    owner="replacement",
+                    ttl_seconds=480,
+                )
+                released = trader.release_shared_phase_lock(
+                    "buy_shared",
+                    owner="replacement",
+                )
+
+        self.assertTrue(result["acquired"])
+        self.assertTrue(released)
+
+    def test_buy_shared_lock_prevents_parallel_decision_consumption(self) -> None:
+        with (
+            patch.object(trader, "acquire_shared_phase_lock", return_value={"acquired": False, "owner": "other"}),
+            patch.object(trader, "_do_buy_core") as core_mock,
+        ):
+            code = trader.do_buy(dry_run=False)
+
+        self.assertEqual(code, trader.EXIT_NO_ACTION)
+        core_mock.assert_not_called()
+
+    def test_buy_shared_lock_is_released_after_core(self) -> None:
+        with (
+            patch.object(trader, "acquire_shared_phase_lock", return_value={"acquired": True}),
+            patch.object(trader, "_do_buy_core", return_value=trader.EXIT_OK) as core_mock,
+            patch.object(trader, "release_shared_phase_lock") as release_mock,
+        ):
+            code = trader.do_buy(dry_run=False)
+
+        self.assertEqual(code, trader.EXIT_OK)
+        core_mock.assert_called_once_with(dry_run=False)
+        release_mock.assert_called_once()
+
+    def test_trader_main_checks_runtime_write_identity_before_running(self) -> None:
+        with (
+            patch("sys.argv", ["v10_moni_trader.py", "--status"]),
+            patch.object(trader, "assert_runtime_write_identity", side_effect=RuntimeError("owner mismatch")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "owner mismatch"):
+                trader.main()
 
     def test_run_phase_once_records_step_running_before_exec(self) -> None:
         started_at = datetime(2026, 7, 7, 10, 0, 0)
@@ -120,6 +645,686 @@ class RunPhaseWatchTests(unittest.TestCase):
             if call.kwargs.get("step") == "phase" and call.kwargs.get("status") == "failed"
         ]
         self.assertTrue(failure_calls)
+
+
+class AccountBatchIntegrityTests(unittest.TestCase):
+    def test_three_live_positions_form_valid_account_batch(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        positions = [
+            {"code": "000001", "value": 40000.25, "profit": 300.0},
+            {"code": "000002", "value": 35000.25, "profit": -100.0},
+            {"code": "600000", "value": 32170.5, "profit": 25.5},
+        ]
+
+        result = trader._validate_and_parse_account_batch(
+            balance,
+            positions,
+            {
+                "total_assets": 1.0,
+                "avail_balance": 1.0,
+                "total_pos_value": 1.0,
+                "position_count": 1,
+                "floating_pnl": 1.0,
+            },
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(
+            result["account"],
+            {
+                "total_assets": 200000.0,
+                "avail_balance": 92829.0,
+                "total_pos_value": 107171.0,
+                "position_count": 3,
+                "floating_pnl": 225.5,
+            },
+        )
+        self.assertTrue(result["status"]["live"])
+        self.assertEqual(result["status"]["source"], "live")
+        self.assertTrue(result["status"]["integrity"])
+
+    def test_true_empty_account_does_not_inherit_previous_floating_pnl(self) -> None:
+        previous_account = {
+            "total_assets": 180000.0,
+            "avail_balance": 72829.0,
+            "total_pos_value": 107171.0,
+            "position_count": 3,
+            "floating_pnl": 2345.67,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            summary_file.write_text(json.dumps({"account": previous_account}), encoding="utf-8")
+            with patch.object(trader, "SUMMARY_FILE", str(summary_file)):
+                snapshot = trader._build_account_snapshot(
+                    balance={
+                        "total_assets": 250000.0,
+                        "avail_balance": 250000.0,
+                        "total_pos_value": 0.0,
+                    },
+                    positions=[],
+                )
+
+        self.assertEqual(snapshot["total_assets"], 250000.0)
+        self.assertEqual(snapshot["avail_balance"], 250000.0)
+        self.assertEqual(snapshot["total_pos_value"], 0.0)
+        self.assertEqual(snapshot["position_count"], 0)
+        self.assertEqual(snapshot["floating_pnl"], 0.0)
+        self.assertTrue(snapshot["live"])
+        self.assertEqual(snapshot["source"], "live")
+        self.assertTrue(snapshot["integrity"])
+
+    def test_nonzero_balance_with_empty_positions_falls_back_as_one_batch(self) -> None:
+        previous_account = {
+            "total_assets": 180000.0,
+            "avail_balance": 72829.0,
+            "total_pos_value": 107171.0,
+            "position_count": 3,
+            "floating_pnl": 2345.67,
+        }
+        positions = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            nav_file = Path(tmpdir) / "nav.csv"
+            summary_file.write_text(json.dumps({"account": previous_account}), encoding="utf-8")
+            with (
+                patch.object(trader, "SUMMARY_FILE", str(summary_file)),
+                patch.object(trader, "NAV_FILE", str(nav_file)),
+                patch.object(trader, "load_track_record", return_value=[]) as load_records_mock,
+                patch.object(trader, "refresh_model_state", return_value={}),
+                patch.object(trader, "load_backtest_targets", return_value={}),
+                patch.object(trader, "get_scan_status", return_value={}),
+                patch.object(trader, "_mx_api_flap_debug_emit"),
+            ):
+                summary = trader.write_account_artifacts(
+                    "integrity_test",
+                    balance={
+                        "total_assets": 200000.0,
+                        "avail_balance": 199999.5,
+                        "total_pos_value": 0.5,
+                    },
+                    positions=positions,
+                    pending_items=[],
+                )
+
+            nav_exists = nav_file.exists()
+
+        self.assertEqual(summary["account"], previous_account)
+        self.assertFalse(summary["account_status"]["live"])
+        self.assertEqual(summary["account_status"]["source"], "fallback_summary")
+        self.assertEqual(
+            summary["account_status"]["reason"],
+            "positions_empty_with_nonzero_total_pos_value",
+        )
+        self.assertFalse(summary["account_status"]["integrity"])
+        self.assertFalse(nav_exists)
+        load_records_mock.assert_called_once()
+        self.assertIs(load_records_mock.call_args.kwargs["positions"], positions)
+
+    def test_position_value_mismatch_falls_back_as_one_batch(self) -> None:
+        previous_account = {
+            "total_assets": 180000.0,
+            "avail_balance": 72829.0,
+            "total_pos_value": 107171.0,
+            "position_count": 3,
+            "floating_pnl": 2345.67,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            summary_file.write_text(json.dumps({"account": previous_account}), encoding="utf-8")
+            with patch.object(trader, "SUMMARY_FILE", str(summary_file)):
+                snapshot = trader._build_account_snapshot(
+                    balance={
+                        "total_assets": 200000.0,
+                        "avail_balance": 100000.0,
+                        "total_pos_value": 100000.0,
+                    },
+                    positions=[
+                        {"code": "000001", "value": 30000.0, "profit": 500.0},
+                        {"code": "000002", "value": 30000.0, "profit": 600.0},
+                    ],
+                )
+
+        for field, value in previous_account.items():
+            self.assertEqual(snapshot[field], value)
+        self.assertFalse(snapshot["live"])
+        self.assertEqual(snapshot["source"], "fallback_summary")
+        self.assertEqual(snapshot["reason"], "position_value_mismatch")
+        self.assertFalse(snapshot["integrity"])
+
+    def test_non_finite_account_values_fail_integrity_validation(self) -> None:
+        balance_result = trader._validate_and_parse_account_batch(
+            {
+                "total_assets": float("nan"),
+                "avail_balance": 100000.0,
+                "total_pos_value": 50000.0,
+            },
+            [{"code": "000001", "value": 50000.0, "profit": 1000.0}],
+            None,
+        )
+        position_result = trader._validate_and_parse_account_batch(
+            {
+                "total_assets": 150000.0,
+                "avail_balance": 100000.0,
+                "total_pos_value": 50000.0,
+            },
+            [{"code": "000001", "value": float("inf"), "profit": 1000.0}],
+            None,
+        )
+
+        self.assertFalse(balance_result["valid"])
+        self.assertEqual(balance_result["status"]["reason"], "balance_non_finite_values")
+        self.assertFalse(position_result["valid"])
+        self.assertEqual(position_result["status"]["reason"], "positions_non_finite_values")
+
+    def test_invalid_batch_without_fallback_is_explicitly_unavailable(self) -> None:
+        result = trader._validate_and_parse_account_batch(None, [], None)
+
+        self.assertEqual(
+            result["account"],
+            {
+                "total_assets": 0.0,
+                "avail_balance": 0.0,
+                "total_pos_value": 0.0,
+                "position_count": 0,
+                "floating_pnl": 0.0,
+            },
+        )
+        self.assertFalse(result["status"]["live"])
+        self.assertEqual(result["status"]["source"], "unavailable")
+        self.assertEqual(result["status"]["reason"], "balance_missing")
+        self.assertFalse(result["status"]["integrity"])
+
+    def test_collect_reconcile_context_reuses_single_positions_read(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 150000.0,
+            "total_pos_value": 50000.0,
+        }
+        positions = [{"code": "000001", "value": 50000.0, "profit": 1000.0}]
+        records = [{"code": "000001", "status": "holding"}]
+        reconcile_summary = {
+            "pending": {
+                "counts": {},
+                "active_buy_codes": [],
+                "active_sell_codes": [],
+            }
+        }
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_midday_review_debug_emit"),
+            patch.object(trader, "get_balance", return_value=balance),
+            patch.object(trader, "get_positions", return_value=positions) as get_positions_mock,
+            patch.object(trader, "load_track_record", return_value=records) as load_records_mock,
+            patch.object(trader, "get_orders", return_value=[]),
+            patch.object(trader, "refresh_pending_orders", return_value=[]) as pending_mock,
+            patch.object(trader, "sync_track_record", return_value=(records, False)) as sync_mock,
+            patch.object(
+                trader,
+                "full_reconcile_positions",
+                return_value=(records, False, reconcile_summary),
+            ) as reconcile_mock,
+            patch.object(trader, "_build_account_snapshot", return_value={"live": True}),
+        ):
+            context = trader._collect_reconcile_context()
+
+        self.assertIs(context["positions"], positions)
+        get_positions_mock.assert_called_once_with()
+        load_records_mock.assert_called_once()
+        self.assertIs(load_records_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(pending_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(sync_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(reconcile_mock.call_args.kwargs["positions"], positions)
+
+    def test_collect_reconcile_context_retries_whole_batch_and_uses_second_positions(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        positions = [
+            {"code": "000001", "value": 40000.25, "profit": 300.0},
+            {"code": "000002", "value": 35000.25, "profit": -100.0},
+            {"code": "600000", "value": 32170.5, "profit": 25.5},
+        ]
+        records = [{"code": row["code"], "status": "holding"} for row in positions]
+        reconcile_summary = {
+            "pending": {
+                "counts": {},
+                "active_buy_codes": [],
+                "active_sell_codes": [],
+            }
+        }
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_midday_review_debug_emit"),
+            patch.object(trader, "get_balance", side_effect=[balance, balance]) as get_balance_mock,
+            patch.object(trader, "get_positions", side_effect=[[], positions]) as get_positions_mock,
+            patch.object(trader, "load_track_record", return_value=records) as load_records_mock,
+            patch.object(trader, "get_orders", return_value=[]),
+            patch.object(trader, "refresh_pending_orders", return_value=[]),
+            patch.object(trader, "sync_track_record", return_value=(records, False)),
+            patch.object(
+                trader,
+                "full_reconcile_positions",
+                return_value=(records, False, reconcile_summary),
+            ),
+            patch.object(trader, "_build_account_snapshot", return_value={"live": True}),
+        ):
+            context = trader._collect_reconcile_context()
+
+        self.assertIs(context["positions"], positions)
+        self.assertEqual(get_balance_mock.call_count, 2)
+        self.assertEqual(get_positions_mock.call_count, 2)
+        load_records_mock.assert_called_once()
+        self.assertIs(load_records_mock.call_args.kwargs["positions"], positions)
+
+    def test_refresh_live_artifact_state_retries_whole_account_batch(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 150000.0,
+            "total_pos_value": 50000.0,
+        }
+        positions = [{"code": "000001", "value": 50000.0, "profit": 1000.0}]
+        records = [{"code": "000001", "status": "holding"}]
+        reconcile_summary = {"pending": {}}
+        with (
+            patch.object(trader, "get_balance", side_effect=[balance, balance]),
+            patch.object(trader, "get_positions", side_effect=[[], positions]),
+            patch.object(trader, "get_orders", return_value=[]),
+            patch.object(trader, "refresh_pending_orders", return_value=[]),
+            patch.object(trader, "sync_track_record", return_value=(records, False)) as sync_mock,
+            patch.object(
+                trader,
+                "full_reconcile_positions",
+                return_value=(records, False, reconcile_summary),
+            ) as reconcile_mock,
+        ):
+            state = trader._refresh_live_artifact_state(records)
+
+        self.assertIs(state["positions"], positions)
+        self.assertIs(sync_mock.call_args.kwargs["positions"], positions)
+        self.assertIs(reconcile_mock.call_args.kwargs["positions"], positions)
+
+    def test_refresh_live_artifact_state_fails_closed_after_two_invalid_batches(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        records = [{"code": "000001", "status": "holding"}]
+        pending_items = [{"code": "000001", "action": "sell", "status": "submitted"}]
+        with (
+            patch.object(trader, "get_balance", side_effect=[balance, balance]) as get_balance_mock,
+            patch.object(trader, "get_positions", side_effect=[[], []]) as get_positions_mock,
+            patch.object(trader, "load_pending_orders", return_value=pending_items),
+            patch.object(trader, "get_orders") as get_orders_mock,
+            patch.object(trader, "refresh_pending_orders") as refresh_pending_mock,
+            patch.object(trader, "sync_track_record") as sync_mock,
+            patch.object(trader, "full_reconcile_positions") as reconcile_mock,
+            patch.object(trader, "save_track_record") as save_mock,
+        ):
+            state = trader._refresh_live_artifact_state(records)
+
+        self.assertFalse(state["account_batch_valid"])
+        self.assertIs(state["records"], records)
+        self.assertIs(state["pending_items"], pending_items)
+        self.assertTrue(state["reconcile_summary"]["skipped"])
+        self.assertEqual(get_balance_mock.call_count, 2)
+        self.assertEqual(get_positions_mock.call_count, 2)
+        get_orders_mock.assert_not_called()
+        refresh_pending_mock.assert_not_called()
+        sync_mock.assert_not_called()
+        reconcile_mock.assert_not_called()
+        save_mock.assert_not_called()
+
+    def test_collect_reconcile_context_fails_closed_after_two_invalid_batches(self) -> None:
+        balance = {
+            "total_assets": 200000.0,
+            "avail_balance": 92829.0,
+            "total_pos_value": 107171.0,
+        }
+        pending_items = [{"code": "000001", "action": "sell", "status": "submitted"}]
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_midday_review_debug_emit"),
+            patch.object(trader, "get_balance", side_effect=[balance, balance]),
+            patch.object(trader, "get_positions", side_effect=[[], []]),
+            patch.object(trader, "load_pending_orders", return_value=pending_items),
+            patch.object(trader, "load_track_record") as load_records_mock,
+            patch.object(trader, "get_orders") as get_orders_mock,
+            patch.object(trader, "refresh_pending_orders") as refresh_pending_mock,
+            patch.object(trader, "sync_track_record") as sync_mock,
+            patch.object(trader, "full_reconcile_positions") as reconcile_mock,
+            patch.object(trader, "save_track_record") as save_mock,
+            patch.object(
+                trader,
+                "_build_account_snapshot",
+                return_value={"live": False, "source": "fallback_summary"},
+            ),
+        ):
+            context = trader._collect_reconcile_context()
+
+        self.assertFalse(context["account_batch_valid"])
+        self.assertEqual(context["records"], [])
+        self.assertIs(context["pending_summary"], context["reconcile_summary"]["pending"])
+        load_records_mock.assert_not_called()
+        get_orders_mock.assert_not_called()
+        refresh_pending_mock.assert_not_called()
+        sync_mock.assert_not_called()
+        reconcile_mock.assert_not_called()
+        save_mock.assert_not_called()
+
+    def test_account_integrity_failure_summary_preserves_last_good_performance(self) -> None:
+        previous_summary = {
+            "generated_at": "2026-08-17 15:10:00",
+            "tag": "report",
+            "account": {
+                "total_assets": 200000.0,
+                "avail_balance": 92829.0,
+                "total_pos_value": 107171.0,
+                "position_count": 3,
+                "floating_pnl": 225.5,
+            },
+            "performance": {"holding_count": 3, "closed_count": 8},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summary_file = Path(tmpdir) / "summary.json"
+            summary_file.write_text(json.dumps(previous_summary), encoding="utf-8")
+            with patch.object(trader, "SUMMARY_FILE", str(summary_file)):
+                summary = trader._write_account_integrity_failure_summary(
+                    "report",
+                    balance={
+                        "total_assets": 200000.0,
+                        "avail_balance": 92829.0,
+                        "total_pos_value": 107171.0,
+                    },
+                    positions=[],
+                    reconcile_summary={"skipped": True},
+                    pending_items=[{"code": "000001", "action": "sell", "status": "submitted"}],
+                    execution_result={"action": "sell", "status": "account_refresh_failed"},
+                )
+
+        self.assertEqual(summary["performance"], previous_summary["performance"])
+        self.assertEqual(summary["account"], previous_summary["account"])
+        self.assertFalse(summary["account_status"]["live"])
+        self.assertEqual(summary["account_status"]["source"], "fallback_summary")
+        self.assertEqual(summary["full_reconcile"], {"skipped": True})
+        self.assertEqual(summary["pending_orders"]["counts"]["submitted"], 1)
+        self.assertEqual(summary["latest_execution_result"]["status"], "account_refresh_failed")
+
+    def test_live_state_artifact_writer_uses_safe_summary_for_invalid_batch(self) -> None:
+        live_state = {
+            "balance": {"total_assets": 200000.0, "avail_balance": 92829.0, "total_pos_value": 107171.0},
+            "positions": [],
+            "pending_items": [{"code": "000001", "action": "sell", "status": "submitted"}],
+            "records": [{"code": "000001", "status": "holding"}],
+            "reconcile_summary": {"skipped": True},
+            "account_batch_valid": False,
+        }
+        execution_result = {"action": "sell", "status": "account_refresh_failed"}
+        with (
+            patch.object(trader, "_write_account_integrity_failure_summary") as failure_summary_mock,
+            patch.object(trader, "write_account_artifacts") as artifacts_mock,
+        ):
+            valid = trader._write_live_state_account_artifacts(
+                "sell",
+                live_state,
+                execution_result=execution_result,
+            )
+
+        self.assertFalse(valid)
+        failure_summary_mock.assert_called_once_with(
+            "sell",
+            balance=live_state["balance"],
+            positions=live_state["positions"],
+            reconcile_summary=live_state["reconcile_summary"],
+            pending_items=live_state["pending_items"],
+            execution_result=execution_result,
+        )
+        artifacts_mock.assert_not_called()
+
+    def test_close_node_returns_runtime_error_before_learning_on_invalid_account_batch(self) -> None:
+        context = {
+            "balance": {"total_assets": 200000.0, "avail_balance": 92829.0, "total_pos_value": 107171.0},
+            "positions": [],
+            "orders": [],
+            "records": [],
+            "reconcile_summary": {"skipped": True},
+            "account_batch_valid": False,
+            "account_batch_attempts": 2,
+        }
+        fallback_summary = {
+            "account": {"position_count": 3},
+            "account_status": {
+                "live": False,
+                "source": "fallback_summary",
+                "reason": "positions_empty_with_nonzero_total_pos_value",
+            },
+        }
+        with (
+            patch.object(trader, "_main_strategy_chain_emit"),
+            patch.object(trader, "_collect_reconcile_context", return_value=context),
+            patch.object(
+                trader,
+                "_write_account_integrity_failure_summary",
+                return_value=fallback_summary,
+            ) as failure_summary_mock,
+            patch.object(trader, "write_account_artifacts") as artifacts_mock,
+            patch.object(trader, "_build_daily_evolution_bundle") as evolution_mock,
+        ):
+            code = trader.do_close_node()
+
+        self.assertEqual(code, trader.EXIT_RUNTIME_ERROR)
+        failure_summary_mock.assert_called_once()
+        artifacts_mock.assert_not_called()
+        evolution_mock.assert_not_called()
+
+
+class TradingDayControllerTests(unittest.TestCase):
+    def test_should_skip_auxiliary_task_when_next_critical_slot_too_close(self) -> None:
+        trade_date = datetime(2026, 7, 14).date()
+        specs = [
+            task_register.TaskSpec("ChallengerBuy1432", "14:32", "workbuddy-buy", trigger_slot="14:30"),
+            task_register.TaskSpec("SmartSell1445", "14:45", "smart-sell"),
+        ]
+        now = datetime(2026, 7, 14, 14, 41, 0, tzinfo=day_controller.MARKET_TZ)
+
+        should_skip, reason = day_controller.should_skip_auxiliary_task(
+            specs[0],
+            now=now,
+            current_index=0,
+            specs=specs,
+            trade_date=trade_date,
+        )
+
+        self.assertTrue(should_skip)
+        self.assertIn("preserve next critical slot 14:45", reason)
+
+    def test_main_returns_zero_when_only_auxiliary_tasks_fail(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 15, 30, 0, tzinfo=day_controller.MARKET_TZ)
+        specs = [
+            task_register.TaskSpec("ChallengerBuy1432", "14:32", "workbuddy-buy", trigger_slot="14:30"),
+            task_register.TaskSpec("Decision", "14:49", "decision"),
+        ]
+        with (
+            patch("sys.argv", ["github_actions_trade_day.py", "--trade-date", "2026-07-14"]),
+            patch.object(day_controller, "is_trading_day", return_value=True),
+            patch.object(day_controller, "ensure_runtime_env", return_value={}),
+            patch.object(day_controller, "iter_selected_specs", return_value=specs),
+            patch.object(day_controller, "target_datetime", return_value=fixed_now),
+            patch.object(day_controller, "market_now", return_value=fixed_now),
+            patch.object(day_controller, "should_skip_auxiliary_task", return_value=(False, "")),
+            patch.object(day_controller, "run_task", return_value=1),
+            patch.object(day_controller, "start_async_task", return_value=None) as start_async_mock,
+            patch.object(day_controller, "collect_finished_async_tasks", return_value=([], [])),
+            patch.object(day_controller, "finish_async_tasks", return_value=[]),
+        ):
+            code = day_controller.main()
+
+        self.assertEqual(code, 0)
+        start_async_mock.assert_called_once()
+
+    def test_main_starts_decision_async_before_running_buy_watch(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 14, 50, 0, tzinfo=day_controller.MARKET_TZ)
+        specs = [
+            task_register.TaskSpec("Decision", "14:49", "decision"),
+            task_register.TaskSpec("BuyWatch", "14:50", "buy-watch", max_attempts=12, interval_seconds=30),
+        ]
+        events = []
+
+        def fake_start(spec, **_kwargs):
+            events.append(f"start:{spec.suffix}")
+            return None
+
+        def fake_run(spec, **_kwargs):
+            events.append(f"run:{spec.suffix}")
+            return 0
+
+        with (
+            patch("sys.argv", ["github_actions_trade_day.py", "--trade-date", "2026-07-14"]),
+            patch.object(day_controller, "is_trading_day", return_value=True),
+            patch.object(day_controller, "ensure_runtime_env", return_value={}),
+            patch.object(day_controller, "iter_selected_specs", return_value=specs),
+            patch.object(day_controller, "target_datetime", return_value=fixed_now),
+            patch.object(day_controller, "market_now", return_value=fixed_now),
+            patch.object(day_controller, "start_async_task", side_effect=fake_start),
+            patch.object(day_controller, "run_task", side_effect=fake_run),
+            patch.object(day_controller, "collect_finished_async_tasks", return_value=([], [])),
+            patch.object(day_controller, "finish_async_tasks", return_value=[]),
+        ):
+            code = day_controller.main()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["start:Decision", "run:BuyWatch"])
+
+    def test_main_treats_no_signal_as_schedule_nonfatal(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 14, 51, 0, tzinfo=day_controller.MARKET_TZ)
+        specs = [task_register.TaskSpec("BuyWatch", "14:50", "buy-watch")]
+        with (
+            patch("sys.argv", ["github_actions_trade_day.py", "--trade-date", "2026-07-14"]),
+            patch.object(day_controller, "is_trading_day", return_value=True),
+            patch.object(day_controller, "ensure_runtime_env", return_value={}),
+            patch.object(day_controller, "iter_selected_specs", return_value=specs),
+            patch.object(day_controller, "target_datetime", return_value=fixed_now),
+            patch.object(day_controller, "market_now", return_value=fixed_now),
+            patch.object(day_controller, "run_task", return_value=10),
+            patch.object(day_controller, "collect_finished_async_tasks", return_value=([], [])),
+            patch.object(day_controller, "finish_async_tasks", return_value=[]),
+        ):
+            code = day_controller.main()
+
+        self.assertEqual(code, 0)
+
+    def test_start_async_decision_publishes_parent_marker_before_popen(self) -> None:
+        fixed_now = datetime(2026, 7, 14, 14, 49, 0, tzinfo=day_controller.MARKET_TZ)
+        observed = {}
+
+        class FakeProcess:
+            pid = 123
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+            def start(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+
+            def fake_popen(*_args, **_kwargs):
+                pointer_file = data_dir / "v10_decision_latest.json"
+                observed["marker"] = json.loads(pointer_file.read_text(encoding="utf-8"))
+                return FakeProcess()
+
+            with (
+                patch.object(day_controller, "market_now", return_value=fixed_now),
+                patch.object(day_controller.subprocess, "Popen", side_effect=fake_popen),
+                patch.object(day_controller.threading, "Thread", FakeThread),
+            ):
+                task = day_controller.start_async_task(
+                    task_register.TaskSpec("Decision", "14:49", "decision"),
+                    env={"TLFZ_WORKBUDDY_DATA_DIR": str(data_dir)},
+                    run_prefix="day-run-1",
+                    dry_run=False,
+                )
+
+        self.assertIsNotNone(task)
+        self.assertFalse(observed["marker"]["complete"])
+        self.assertEqual(
+            observed["marker"]["artifact_id"],
+            "2026-07-14:decision:day-run-1-decision",
+        )
+
+    def test_async_watchdog_enforces_timeout_while_main_thread_is_blocked(self) -> None:
+        class FakeProcess:
+            def wait(self, timeout=None):
+                raise day_controller.subprocess.TimeoutExpired("decision", timeout)
+
+        task = day_controller.AsyncTask(
+            spec=task_register.TaskSpec("Decision", "14:49", "decision"),
+            process=FakeProcess(),
+            started_monotonic=0.0,
+            timeout_seconds=360,
+        )
+        with patch.object(day_controller, "_terminate_async_process_tree") as terminate_mock:
+            day_controller._async_task_watchdog(task)
+
+        self.assertTrue(task.timed_out)
+        terminate_mock.assert_called_once_with(task)
+
+    def test_collect_finished_async_task_reaps_zero_exit_code(self) -> None:
+        process = type("FakeProcess", (), {"poll": lambda self: 0})()
+        task = day_controller.AsyncTask(
+            spec=task_register.TaskSpec("Decision", "14:49", "decision"),
+            process=process,
+            started_monotonic=0.0,
+            timeout_seconds=360,
+        )
+        with patch.object(day_controller.time, "monotonic", return_value=1.0):
+            remaining, results = day_controller.collect_finished_async_tasks([task])
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(results, [("Decision", 0)])
+
+    def test_collect_finished_async_task_terminates_at_absolute_timeout(self) -> None:
+        process = type("FakeProcess", (), {"poll": lambda self: None})()
+        task = day_controller.AsyncTask(
+            spec=task_register.TaskSpec("Decision", "14:49", "decision"),
+            process=process,
+            started_monotonic=10.0,
+            timeout_seconds=360,
+        )
+        with (
+            patch.object(day_controller.time, "monotonic", return_value=371.0),
+            patch.object(day_controller, "_terminate_async_process_tree") as terminate_mock,
+        ):
+            remaining, results = day_controller.collect_finished_async_tasks([task])
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(results, [("Decision", 124)])
+        terminate_mock.assert_called_once_with(task)
+
+
+class ChallengerOwnershipGuardTests(unittest.TestCase):
+    def test_challenger_main_checks_runtime_write_identity_before_running(self) -> None:
+        with (
+            patch("sys.argv", ["workbuddy_local_challenger.py", "--status"]),
+            patch.object(challenger, "assert_runtime_write_identity", side_effect=RuntimeError("owner mismatch")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "owner mismatch"):
+                challenger.main()
 
 
 class PhaseInspectionSnapshotTests(unittest.TestCase):
@@ -189,100 +1394,23 @@ class PhaseInspectionSnapshotTests(unittest.TestCase):
             self.assertTrue(payload["checklist"]["opening_tradability_today"])
             self.assertEqual(payload["summary"]["record_count"], 12)
 
-    def test_write_phase_inspection_snapshot_generates_midday_inspection_file(self) -> None:
-        today = datetime.now().strftime("%Y-%m-%d")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            midday_review_file = tmp / "v10_midday_review_latest.json"
-            midday_node_file = tmp / "v10_midday_node_latest.json"
-            midday_gate_file = tmp / "v10_midday_gate_latest.json"
-            pm_gate_file = tmp / "v10_pm_gate_status.json"
-            account_summary_file = tmp / "v10_account_summary_latest.json"
-            output_file = tmp / "v10_midday_inspection_latest.json"
-            midday_review_file.write_text(
-                json.dumps({"generated_at": f"{today} 11:35:02", "date": today, "market_temperature": "warm"}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            midday_node_file.write_text(
-                json.dumps(
-                    {
-                        "generated_at": f"{today} 11:35:05",
-                        "date": today,
-                        "stage": "midday_node",
-                        "review_status": "ok",
-                        "pm_gate_status": "pass",
-                        "blocked_buy_codes": [],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            midday_gate_file.write_text(
-                json.dumps(
-                    {
-                        "generated_at": f"{today} 13:00:05",
-                        "date": today,
-                        "stage": "pm_gate",
-                        "review_status": "ok",
-                        "pm_gate_status": "pass",
-                        "blocked_buy_codes": [],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            pm_gate_file.write_text(
-                json.dumps(
-                    {
-                        "generated_at": f"{today} 13:00:05",
-                        "date": today,
-                        "stage": "pm_gate",
-                        "review_status": "ok",
-                        "pm_gate_status": "pass",
-                        "blocked_buy_codes": [],
-                        "reason_codes": [],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            account_summary_file.write_text(
-                json.dumps(
-                    {
-                        "generated_at": f"{today} 13:00:08",
-                        "trade_date": today,
-                        "latest_execution_result": {"action": "smart_sell", "status": "ok"},
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            with (
-                patch.object(auto_runner, "MIDDAY_REVIEW_FILE", midday_review_file),
-                patch.object(auto_runner, "MIDDAY_NODE_FILE", midday_node_file),
-                patch.object(auto_runner, "MIDDAY_GATE_FILE", midday_gate_file),
-                patch.object(auto_runner, "PM_GATE_FILE", pm_gate_file),
-                patch.object(auto_runner, "ACCOUNT_SUMMARY_FILE", account_summary_file),
-                patch.object(auto_runner, "MIDDAY_INSPECTION_FILE", output_file),
-            ):
-                written_path = auto_runner.write_phase_inspection_snapshot(
-                    run_meta={"task_name": "TLFZ-WorkBuddy-MiddayGate", "trigger_slot": "13:00", "run_id": "rid-mid"},
-                    phase="midday-gate",
-                    phase_status="ok",
-                    phase_exit_code=0,
-                )
-
-            self.assertEqual(written_path, output_file)
-            payload = json.loads(output_file.read_text(encoding="utf-8"))
-            self.assertEqual(payload["node"], "midday_inspection")
-            self.assertEqual(payload["inspection_status"], "ok")
-            self.assertTrue(payload["checklist"]["pm_gate_today"])
-            self.assertEqual(payload["account_summary"]["latest_execution_action"], "smart_sell")
+    def test_write_phase_inspection_snapshot_skips_removed_legacy_phase(self) -> None:
+        written_path = auto_runner.write_phase_inspection_snapshot(
+            run_meta={"task_name": "TLFZ-WorkBuddy-LegacyPhase", "trigger_slot": "13:00", "run_id": "rid-mid"},
+            phase="legacy-removed-phase",
+            phase_status="ok",
+            phase_exit_code=0,
+        )
+        self.assertIsNone(written_path)
 
 
 class TaskRegisterValidationTests(unittest.TestCase):
     def test_current_task_specs_pass_validation(self) -> None:
         task_register.validate_task_specs(task_register.TASK_SPECS)
+
+    def test_prewarm_is_scheduled_early_enough_for_tail_decision(self) -> None:
+        prewarm = next(spec for spec in task_register.TASK_SPECS if spec.phase == "prewarm")
+        self.assertEqual(prewarm.time_hhmm, "14:25")
 
     def test_missing_required_task_fails_fast(self) -> None:
         filtered = [spec for spec in task_register.TASK_SPECS if spec.suffix != "SmartSell0945"]
@@ -502,6 +1630,99 @@ class ExternalMarketReviewTests(unittest.TestCase):
         self.assertTrue(set(negative).isdisjoint(set(neutral)))
         self.assertTrue(set(neutral).isdisjoint(set(positive)))
 
+    def test_mx_api_env_loads_key_from_repo_file_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.dict("os.environ", {"MX_APIKEY": ""}, clear=False),
+            ):
+                resolved = mx_api_env.ensure_mx_runtime_env()
+                resolved_env = os.environ.get("MX_APIKEY")
+
+        self.assertEqual(resolved["MX_APIKEY"], "demo-fallback-key")
+        self.assertEqual(resolved_env, "demo-fallback-key")
+
+    def test_mx_api_env_does_not_use_mx_apikey_as_api_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.dict("os.environ", {"MX_APIKEY": "", "MX_API_URL": ""}, clear=False),
+            ):
+                resolved = mx_api_env.ensure_mx_runtime_env()
+                resolved_url = os.environ.get("MX_API_URL")
+
+        self.assertEqual(resolved["MX_APIKEY"], "demo-fallback-key")
+        self.assertEqual(resolved["MX_API_URL"], "")
+        self.assertEqual(resolved_url, "")
+
+    def test_build_external_market_review_uses_mx_apikey_fallback(self) -> None:
+        sample_item = {
+            "title": "盘前偏中性，先观察结构轮动与防守方向",
+            "content": "多条消息交织，市场整体偏中性。",
+            "informationType": "新闻",
+            "insName": "东方财富研究中心",
+            "date": "2026-06-26 08:20:00",
+        }
+
+        class FakeClient:
+            def search(self, _query):
+                return {"data": {"data": {"llmSearchResponse": {"data": [sample_item]}}}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            output_json = tmpdir_path / "external_review.json"
+            output_csv = tmpdir_path / "external_review.csv"
+            output_history = tmpdir_path / "external_review.jsonl"
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(external_market_review, "OUTPUT_JSON", output_json),
+                patch.object(external_market_review, "OUTPUT_CSV", output_csv),
+                patch.object(external_market_review, "OUTPUT_HISTORY", output_history),
+                patch.object(external_market_review, "MX_SEARCH_SKILL", Path("fake-skill.py")),
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.object(Path, "exists", return_value=True),
+                patch.object(external_market_review, "_read_json", return_value={"records": []}),
+                patch.object(external_market_review, "_load_module", return_value=type("FakeMod", (), {"MXSearch": lambda self=None: FakeClient()})()),
+                patch.dict("os.environ", {"MX_APIKEY": ""}, clear=False),
+            ):
+                payload = external_market_review.build_external_market_review(
+                    run_id="rid",
+                    task_name="TLFZ-WorkBuddy-OpeningData",
+                    trigger_slot="09:31",
+                )
+                resolved_env = os.environ.get("MX_APIKEY")
+
+        self.assertEqual(payload["trade_date"], datetime.now().strftime("%Y-%m-%d"))
+        self.assertEqual(resolved_env, "demo-fallback-key")
+
+    def test_build_external_market_review_degrades_when_skill_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
+            with (
+                patch.object(external_market_review, "OUTPUT_JSON", tmpdir_path / "degraded.json"),
+                patch.object(external_market_review, "OUTPUT_CSV", tmpdir_path / "degraded.csv"),
+                patch.object(external_market_review, "OUTPUT_HISTORY", tmpdir_path / "degraded.jsonl"),
+                patch.object(external_market_review, "MX_SEARCH_SKILL", tmpdir_path / "missing-skill.py"),
+                patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
+                patch.dict("os.environ", {"MX_APIKEY": ""}, clear=False),
+            ):
+                payload = external_market_review.build_external_market_review(
+                    run_id="rid",
+                    task_name="TLFZ-WorkBuddy-OpeningData",
+                    trigger_slot="09:31",
+                )
+
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["review_status"], "degraded")
+        self.assertEqual(payload["a_share_bias"], "neutral")
+        self.assertEqual(payload["error_count"], 1)
+        self.assertIn("mx-search skill 缺失", payload["errors"][0]["error"])
+
     def test_close_node_merge_external_market_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -545,6 +1766,7 @@ class SmartSellApplyTests(unittest.TestCase):
             patch.object(trader, "ensure_trade_window", return_value=True),
             patch.object(trader, "load_track_record", return_value=[]),
             patch.object(trader, "get_positions", return_value=[]),
+            patch.object(trader, "_get_last_positions_fetch_status", return_value={"source": "api", "ok": True}),
             patch.object(
                 trader,
                 "load_pending_orders",
@@ -566,153 +1788,102 @@ class SmartSellApplyTests(unittest.TestCase):
         orders_mock.assert_not_called()
         refresh_mock.assert_not_called()
 
-    def test_build_intraday_judgment_respects_supportive_external_alignment(self) -> None:
-        context = {
-            "balance": {
-                "total_assets": 1000000.0,
-                "avail_balance": 760000.0,
-                "total_pos_value": 240000.0,
-            },
-            "pending_summary": {
-                "active_sell_codes": [],
-            },
-        }
-        review_payload = {
-            "avg_profit_pct": 1.8,
-            "market_temperature": "neutral",
-            "opening_liquidity": {
-                "available": True,
-                "in_0931_window": True,
-                "verdict": "healthy",
-            },
-            "external_market": {
-                "available": True,
-                "risk_level": "low",
-                "a_share_bias": "selective_supportive",
-                "negative_sectors": [],
-                "neutral_sectors": ["机器人"],
-                "positive_sectors": ["半导体", "AI硬件", "军工"],
-                "recommended_actions": {
-                    "opening_gate_bias": "supportive",
-                    "allow_only_selective_rebound": False,
-                    "broad_rebound_allowed": True,
-                },
-                "horizon_assessment": {
-                    "short_term": {"bias": "broad_positive", "summary": "短期偏积极。"},
-                    "mid_term": {"bias": "selective_positive", "summary": "中期结构偏强。"},
-                    "long_term": {"bias": "selective_positive", "summary": "长期方向保留。"},
-                },
-                "short_flow_monitor": {
-                    "pressure_level": "low",
-                    "targeted_sectors": [],
-                    "summary": "暂未识别到显著做空资金线索。",
-                },
-                "opening_anchor_break_monitor": {
-                    "pressure_level": "low",
-                    "broken_anchor_names": [],
-                    "summary": "开盘锚股承接稳定。",
-                },
-                "weekend_digest_monitor": {
-                    "active": True,
-                    "bias": "neutral",
-                    "summary": "周末信息中性分化。",
-                },
-            },
-            "afternoon_watchlist": {
-                "high_priority_review": [],
-                "watch_close": [],
-            },
-            "holdings_review_top15": [],
-        }
+    def test_do_smart_sell_returns_runtime_error_when_positions_unavailable(self) -> None:
+        records = [{"code": "000001", "name": "平安银行", "status": "holding"}]
+        with (
+            patch.object(trader, "ensure_trade_window", return_value=True),
+            patch.object(trader, "load_track_record", return_value=records),
+            patch.object(trader, "get_positions", return_value=[]),
+            patch.object(
+                trader,
+                "_get_last_positions_fetch_status",
+                return_value={"source": "unavailable", "ok": False, "message": "network timeout", "cache_age_seconds": None},
+            ),
+            patch.object(trader, "load_pending_orders", return_value=[]),
+            patch.object(
+                trader,
+                "summarize_pending_orders",
+                return_value={"active_buy_codes": [], "active_sell_codes": [], "counts": {}},
+            ),
+            patch.object(trader, "get_balance") as balance_mock,
+            patch.object(trader, "_debug_report_smart_sell"),
+        ):
+            code = trader.do_smart_sell(dry_run=False)
 
-        payload = trader._build_intraday_judgment(
-            context=context,
-            review_payload=review_payload,
-            review_status="PASS",
-            pm_gate_status="pass",
-        )
+        self.assertEqual(code, trader.EXIT_RUNTIME_ERROR)
+        balance_mock.assert_not_called()
 
-        self.assertEqual(payload["risk_bias"], "offensive")
-        self.assertEqual(payload["rebound_bias"], "can_expand")
-        self.assertEqual(payload["external_market"]["a_share_bias"], "selective_supportive")
+    def test_do_smart_sell_returns_runtime_error_when_any_trade_fails(self) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        records = [
+            {
+                "code": "000001",
+                "name": "平安银行",
+                "status": "holding",
+                "date": "2026-07-01",
+                "entry_price": 10.0,
+                "quantity": 100,
+                "tier": 1,
+                "mode": "T1",
+            },
+            {
+                "code": "000002",
+                "name": "万科A",
+                "status": "holding",
+                "date": today,
+                "entry_price": 10.0,
+                "quantity": 100,
+                "tier": 1,
+                "mode": "T1",
+            },
+        ]
+        positions = [
+            {"code": "000001", "name": "平安银行", "count": 100, "avail_count": 100, "price": 10.0, "profit_pct": 0.0},
+            {"code": "000002", "name": "万科A", "count": 100, "avail_count": 100, "price": 10.0, "profit_pct": 0.0},
+        ]
+        with (
+            patch.object(trader, "ensure_trade_window", return_value=True),
+            patch.object(trader, "load_track_record", return_value=records),
+            patch.object(trader, "get_positions", return_value=positions),
+            patch.object(trader, "_get_last_positions_fetch_status", return_value={"source": "api", "ok": True}),
+            patch.object(trader, "load_pending_orders", return_value=[]),
+            patch.object(trader, "get_balance", return_value={"avail_balance": 0}),
+            patch.object(trader, "sync_track_record", return_value=(records, False)),
+            patch.object(trader, "full_reconcile_positions", return_value=(records, False, {"imported_positions": 0, "overlaid_positions": 0})),
+            patch.object(trader, "connect_tdx", return_value=None),
+            patch.object(trader, "_read_jsonl", return_value=[]),
+            patch.object(trader, "_build_selected_decision_reference", return_value={}),
+            patch.object(trader, "_load_learning_actions", return_value={}),
+            patch.object(trader, "_load_today_tradability_exclusions", return_value={}),
+            patch.object(trader, "execute_trade_action", return_value={"success": False, "message": "network error", "code": "NETWORK"}),
+            patch.object(
+                trader,
+                "_refresh_live_artifact_state",
+                return_value={"balance": {"avail_balance": 0}, "positions": positions, "pending_items": [], "records": records},
+            ),
+            patch.object(trader, "write_account_artifacts"),
+            patch.object(trader, "_print_stats"),
+            patch.object(trader, "_debug_report_smart_sell"),
+        ):
+            code = trader.do_smart_sell(dry_run=False)
 
-    def test_build_intraday_judgment_releases_from_defensive_when_risk_on_scan_is_strong(self) -> None:
-        context = {
-            "balance": {
-                "total_assets": 1000000.0,
-                "avail_balance": 910000.0,
-                "total_pos_value": 90000.0,
-            },
-            "pending_summary": {
-                "active_sell_codes": [],
-            },
-        }
-        review_payload = {
-            "avg_profit_pct": 0.3,
-            "market_temperature": "risk_on",
-            "opening_liquidity": {
-                "available": True,
-                "in_0931_window": True,
-                "verdict": "mixed",
-            },
-            "external_market": {
-                "available": True,
-                "risk_level": "high",
-                "a_share_bias": "risk_off",
-                "negative_sectors": ["原油化工"],
-                "neutral_sectors": [],
-                "positive_sectors": ["军工"],
-                "recommended_actions": {
-                    "opening_gate_bias": "defensive",
-                    "allow_only_selective_rebound": True,
-                    "broad_rebound_allowed": False,
-                },
-                "horizon_assessment": {
-                    "short_term": {"bias": "negative", "summary": "短期仍偏谨慎。"},
-                },
-                "short_flow_monitor": {
-                    "pressure_level": "medium",
-                    "targeted_sectors": ["原油化工"],
-                    "summary": "卖压仍在，但未继续恶化。",
-                },
-                "opening_anchor_break_monitor": {
-                    "pressure_level": "medium",
-                    "broken_anchor_names": ["上海合晶"],
-                    "summary": "早盘锚股承压但午后未继续破位。",
-                },
-                "weekend_digest_monitor": {
-                    "active": False,
-                    "bias": "neutral",
-                    "summary": "",
-                },
-            },
-            "scan_status": {
-                "is_fresh": True,
-                "stocks_with_signal": 48,
-                "signals_by_tier": {
-                    "T1": 1,
-                    "T2": 6,
-                    "T3": 41,
-                },
-            },
-            "afternoon_watchlist": {
-                "high_priority_review": [],
-                "watch_close": [],
-            },
-            "holdings_review_top15": [],
-        }
+        self.assertEqual(code, trader.EXIT_RUNTIME_ERROR)
 
-        payload = trader._build_intraday_judgment(
-            context=context,
-            review_payload=review_payload,
-            review_status="PASS",
-            pm_gate_status="pass",
-        )
+    def test_pm_buy_guardrails_reports_midday_logic_removed(self) -> None:
+        payload = trader._build_pm_buy_guardrails()
 
-        self.assertEqual(payload["risk_bias"], "balanced")
-        self.assertEqual(payload["rebound_bias"], "selective_only")
-        self.assertTrue(payload["scan_status"]["midday_release_ready"])
-        self.assertTrue(payload["scan_status"]["midday_release_override"])
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["reason"], "midday_logic_removed")
+        self.assertEqual(payload["guard_status"], "")
+        self.assertEqual(payload["blocked_modes"], [])
+        self.assertEqual(payload["limited_modes"], [])
+
+    def test_pm_buy_guardrails_preserves_partial_rollback_note(self) -> None:
+        with patch.object(trader, "PARTIAL_ROLLBACK_DISABLE_FULL_V9_BUILD", True):
+            payload = trader._build_pm_buy_guardrails()
+
+        self.assertFalse(payload["allow_full_v9_build"])
+        self.assertIn("部分回退生效", " ".join(payload["notes"]))
 
     def test_apply_successful_sell_reconciles_and_marks_confirmed(self) -> None:
         records = [{"code": "002947", "status": "holding"}]
@@ -778,6 +1949,96 @@ class SmartSellApplyTests(unittest.TestCase):
             trader._resolve_trade_max_retries({"strategy_action": "smart_sell", "execution_phase": "tail_retry"}),
             2,
         )
+
+    def test_api_request_retries_transport_errors_for_trade(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            text = '{"code":"0","message":"ok"}'
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, str]:
+                return {"code": "0", "message": "ok"}
+
+        with (
+            patch.object(trader, "_throttle_trade_api"),
+            patch.object(
+                trader._MX_HTTP_SESSION,
+                "post",
+                side_effect=[requests.ReadTimeout("Read timed out"), FakeResponse()],
+            ),
+            patch.object(trader, "_trade_log_retry_event") as retry_log_mock,
+            patch.object(trader.time, "sleep") as sleep_mock,
+        ):
+            result = trader.api_request(
+                "/api/claw/mockTrading/trade",
+                {"type": "sell", "stockCode": "600000", "quantity": 100},
+                is_trade=True,
+                trade_meta={"action": "sell", "strategy_action": "smart_sell", "execution_phase": "primary"},
+                min_interval_seconds=0.0,
+            )
+
+        self.assertEqual(result["code"], "0")
+        self.assertEqual(result["__retry_attempts"], 1)
+        retry_log_mock.assert_called_once()
+        sleep_mock.assert_called_once()
+
+    def test_mx_force_ipv4_resolution_limits_target_host_to_ipv4(self) -> None:
+        calls = []
+
+        def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            calls.append((host, family))
+            if family == socket.AF_INET:
+                return [(socket.AF_INET, type, proto, "", ("1.1.1.1", port))]
+            return [
+                (socket.AF_INET6, type, proto, "", ("::1", port, 0, 0)),
+                (socket.AF_INET, type, proto, "", ("1.1.1.1", port)),
+            ]
+
+        with patch.object(trader.socket, "getaddrinfo", side_effect=fake_getaddrinfo):
+            with trader._mx_force_ipv4_resolution("https://mkapi2.dfcfs.com/finskillshub/api/claw/mockTrading/balance"):
+                infos = trader.socket.getaddrinfo("mkapi2.dfcfs.com", 443, type=socket.SOCK_STREAM)
+            fallback_infos = trader.socket.getaddrinfo("example.com", 443, type=socket.SOCK_STREAM)
+
+        self.assertTrue(all(item[0] == socket.AF_INET for item in infos))
+        self.assertEqual(len(fallback_infos), 2)
+        self.assertEqual(calls[0][1], socket.AF_INET)
+
+    def test_api_request_uses_ipv4_resolution_for_mx_host(self) -> None:
+        observed = {"family": None}
+
+        class FakeResponse:
+            status_code = 200
+            text = '{"code":"0","message":"ok"}'
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, str]:
+                return {"code": "0", "message": "ok"}
+
+        def fake_post(*args, **kwargs):
+            infos = trader.socket.getaddrinfo("mkapi2.dfcfs.com", 443, type=socket.SOCK_STREAM)
+            observed["family"] = infos[0][0]
+            return FakeResponse()
+
+        def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if family == socket.AF_INET:
+                return [(socket.AF_INET, type, proto, "", ("1.1.1.1", port))]
+            return [
+                (socket.AF_INET6, type, proto, "", ("::1", port, 0, 0)),
+                (socket.AF_INET, type, proto, "", ("1.1.1.1", port)),
+            ]
+
+        with (
+            patch.object(trader.socket, "getaddrinfo", side_effect=fake_getaddrinfo),
+            patch.object(trader._MX_HTTP_SESSION, "post", side_effect=fake_post),
+        ):
+            result = trader.api_request("/api/claw/mockTrading/balance", {"moneyUnit": 1}, is_trade=False)
+
+        self.assertEqual(result["code"], "0")
+        self.assertEqual(observed["family"], socket.AF_INET)
 
     def test_do_sell_core_refreshes_live_state_before_writing_artifacts(self) -> None:
         old_date = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
@@ -884,7 +2145,7 @@ class SmartSellApplyTests(unittest.TestCase):
             patch.object(trader, "execute_trade_action") as trade_mock,
             patch.object(trader, "_mark_smart_sell_rate_limit") as mark_mock,
         ):
-            _, _, _, sold_count, confirmed_count, skipped_count = trader._run_sell_tail_retry_queue(
+            _, _, _, sold_count, confirmed_count, skipped_count, trade_failed_count = trader._run_sell_tail_retry_queue(
                 sell_retry_queue,
                 action="smart_sell",
                 records=[],
@@ -893,6 +2154,7 @@ class SmartSellApplyTests(unittest.TestCase):
                 sold_count=0,
                 confirmed_count=0,
                 skipped_count=0,
+                trade_failed_count=0,
             )
 
         trade_mock.assert_not_called()
@@ -900,6 +2162,7 @@ class SmartSellApplyTests(unittest.TestCase):
         self.assertEqual(sold_count, 0)
         self.assertEqual(confirmed_count, 0)
         self.assertEqual(skipped_count, 1)
+        self.assertEqual(trade_failed_count, 0)
 
 
 class AddPositionGuardTests(unittest.TestCase):
@@ -925,13 +2188,13 @@ class AddPositionGuardTests(unittest.TestCase):
     def test_opening_add_position_uses_stricter_min_interval(self) -> None:
         class FakeOpeningDateTime:
             @classmethod
-            def now(cls):
-                return datetime(2026, 6, 29, 9, 36, 0)
+            def now(cls, tz=None):
+                return datetime(2026, 6, 29, 9, 36, 0, tzinfo=tz)
 
         class FakeLateDateTime:
             @classmethod
-            def now(cls):
-                return datetime(2026, 6, 29, 10, 15, 0)
+            def now(cls, tz=None):
+                return datetime(2026, 6, 29, 10, 15, 0, tzinfo=tz)
 
         order_context = {"execution_phase": "add_position", "strategy_action": "add_position"}
         with patch.object(trader, "datetime", FakeOpeningDateTime):
@@ -1091,7 +2354,11 @@ class AddPositionAggressiveTests(unittest.TestCase):
         with (
             patch.object(trader, "ensure_trade_window", return_value=True),
             patch.object(trader, "load_track_record", return_value=records),
-            patch.object(trader, "get_balance", return_value={"avail_balance": 50000}),
+            patch.object(
+                trader,
+                "get_balance",
+                return_value={"total_assets": 60000, "avail_balance": 50000, "total_pos_value": 10000},
+            ),
             patch.object(trader, "get_positions", return_value=positions),
             patch.object(trader, "get_orders", return_value=[]),
             patch.object(trader, "refresh_pending_orders", return_value=[]),
@@ -1736,43 +3003,25 @@ class EvolutionAbsorptionTests(unittest.TestCase):
         self.assertIn("不触发仓位收缩", " ".join(action["notes"]))
 
     def test_pm_buy_guardrails_prioritizes_release_when_missed_profit_exists(self) -> None:
-        today = datetime.now().strftime("%Y-%m-%d")
-        midday_payload = {
-            "date": today,
-            "pm_gate_status": "pass",
-            "intraday_judgment": {
-                "trade_date": today,
-                "pm_gate_status": "pass",
-                "risk_bias": "balanced",
-                "rebound_bias": "selective_only",
-                "market_temperature": "risk_on",
-                "confidence": 0.62,
-                "scan_status": {
-                    "midday_release_ready": True,
-                    "midday_release_override": True,
-                },
-            },
-        }
-        learning_actions = {
-            "summary": {
-                "missed_opportunity_positive_count": 2,
-                "missed_opportunity_avg_return_pct": 2.6,
-            }
-        }
-
-        with (
-            patch.object(trader, "_load_latest_midday_payload", return_value=midday_payload),
-            patch.object(trader, "_load_learning_actions", return_value=learning_actions),
-        ):
-            payload = trader._build_pm_buy_guardrails()
-
-        self.assertEqual(payload["reason"], "release_opportunity_confirm")
+        payload = trader._build_pm_buy_guardrails()
+        self.assertEqual(payload["reason"], "midday_logic_removed")
         self.assertTrue(payload["allow_buy"])
-        self.assertNotIn("V9_full", payload["blocked_modes"])
-        self.assertGreaterEqual(payload["max_new_positions"], 2)
-        self.assertIn("盈利机会", " ".join(payload["notes"]))
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["blocked_modes"], [])
+        self.assertEqual(payload["limited_modes"], [])
+        self.assertEqual(payload["max_new_positions"], 0)
+        self.assertEqual(payload["guard_status"], "")
+        self.assertIn("midday logic removed", " ".join(payload["notes"]))
 
-    def test_attach_intraday_judgment_review_validates_midday_defensive_call(self) -> None:
+    def test_pm_buy_guardrails_no_longer_blocks_buy_when_legacy_guard_would_block(self) -> None:
+        payload = trader._build_pm_buy_guardrails()
+        self.assertTrue(payload["allow_buy"])
+        self.assertEqual(payload["reason"], "midday_logic_removed")
+        self.assertEqual(payload["blocked_modes"], [])
+        self.assertEqual(payload["limited_modes"], [])
+        self.assertEqual(payload["guard_status"], "")
+
+    def test_attach_intraday_judgment_review_reports_midday_logic_removed(self) -> None:
         bundle = {
             "trade_date": "2026-06-25",
             "summary": {
@@ -1785,196 +3034,40 @@ class EvolutionAbsorptionTests(unittest.TestCase):
             "direct_learn_items": [{"code": "002254"}],
             "observe_only_items": [{"code": "002947", "blocked_reasons": ["profit_truncation"]}],
         }
-        midday_payload = {
-            "date": "2026-06-25",
-            "stage": "pm_gate",
-            "intraday_judgment": {
-                "available": True,
-                "trade_date": "2026-06-25",
-                "generated_at": "2026-06-25 11:31:00",
-                "risk_bias": "defensive",
-                "rebound_bias": "avoid_broad_rebound",
-                "confidence": 0.72,
-                "cash_ratio": 0.42,
-                "position_exposure_ratio": 0.58,
-                "reduce_watch_codes": ["002254", "002947"],
-                "strong_hold_codes": ["300323"],
-                "opening_liquidity": {
-                    "available": True,
-                    "generated_at": "2026-06-25 09:35:00",
-                    "verdict": "fragile",
-                    "in_0931_window": True,
-                    "issue_ratio": 0.061,
+        reviewed_bundle = trader._attach_intraday_judgment_review(
+            bundle,
+            summary={"account": {"total_assets": 1000000.0}},
+            records=[{"code": "300323", "status": "holding"}],
+            positions=[{"code": "300323", "count": 4300}],
+        )
+
+        self.assertFalse(reviewed_bundle["intraday_judgment_review"]["available"])
+        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["verdict"], "midday_logic_removed")
+        self.assertEqual(reviewed_bundle["summary"]["intraday_judgment_verdict"], "midday_logic_removed")
+        self.assertEqual(reviewed_bundle["summary"]["intraday_judgment_score"], 0)
+        self.assertIn("midday logic removed", " ".join(reviewed_bundle["intraday_judgment_review"]["notes"]))
+
+    def test_intraday_judgment_review_always_skips_removed_midday_logic(self) -> None:
+        reviewed_bundle = trader._attach_intraday_judgment_review(
+            {"trade_date": "2026-07-09", "source_stats": {"today_opened_count": 0}},
+            summary={
+                "account": {
+                    "total_assets": 1000000.0,
+                    "avail_balance": 950000.0,
+                    "total_pos_value": 50000.0,
                 },
-                "external_market": {
-                    "available": True,
-                    "generated_at": "2026-06-25 09:28:00",
-                    "window_tag": "opening_0931",
-                    "risk_level": "high",
-                    "a_share_bias": "risk_off",
-                    "negative_sectors": ["AI硬件", "算力"],
-                    "neutral_sectors": ["消费"],
-                    "positive_sectors": ["黄金"],
-                    "horizon_assessment": {
-                        "short_term": {"bias": "negative", "summary": "短期偏谨慎。"},
-                        "mid_term": {"bias": "neutral", "summary": "中期偏中性分化。"},
-                        "long_term": {"bias": "selective_positive", "summary": "长期保留结构性方向。"},
-                    },
-                    "recommended_actions": {
-                        "opening_gate_bias": "defensive",
-                        "allow_only_selective_rebound": True,
-                    },
-                    "short_flow_monitor": {
-                        "pressure_level": "high",
-                        "pressure_score": 8.4,
-                        "signals": ["index_future_short", "quant_sell"],
-                        "targeted_sectors": ["AI硬件", "算力"],
-                        "summary": "做空资金信号偏强，优先防范高弹性板块被空头集中压制。",
-                    },
-                    "opening_anchor_break_monitor": {
-                        "pressure_level": "high",
-                        "pressure_points": 5,
-                        "broken_anchor_names": ["佳创视讯", "正帆科技"],
-                        "summary": "前期领涨锚股与大成交权重锚同时走弱，属于明显的开盘做空验证信号。",
-                    },
-                    "weekend_digest_monitor": {
-                        "active": True,
-                        "bias": "negative",
-                        "negative_sectors": ["AI硬件"],
-                        "positive_sectors": ["黄金"],
-                        "summary": "周末汇总整体偏谨慎，周一开盘先防止利空集中兑现。",
-                    },
-                    "headline": "隔夜风险资产走弱",
+                "scan_status": {
+                    "stocks_with_signal": 48,
                 },
             },
-        }
-        summary = {
-            "account": {
-                "total_assets": 1000000.0,
-                "avail_balance": 820000.0,
-                "total_pos_value": 180000.0,
-            }
-        }
-        records = [
-            {"code": "300323", "status": "holding"},
-            {"code": "002254", "status": "closed"},
-            {"code": "002947", "status": "closed"},
-        ]
+            records=[],
+            positions=[],
+        )
 
-        with patch.object(trader, "_load_latest_midday_payload", return_value=midday_payload):
-            reviewed_bundle = trader._attach_intraday_judgment_review(
-                bundle,
-                summary=summary,
-                records=records,
-                positions=[{"code": "300323", "count": 4300}],
-            )
-
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["verdict"], "validated")
-        self.assertEqual(reviewed_bundle["summary"]["intraday_judgment_verdict"], "validated")
-        self.assertGreaterEqual(reviewed_bundle["summary"]["intraday_judgment_score"], 80)
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["retained_strong_codes"], ["300323"])
-        self.assertCountEqual(reviewed_bundle["intraday_judgment_review"]["reduced_focus_codes"], ["002254", "002947"])
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["opening_liquidity"]["verdict"], "fragile")
-        self.assertTrue(reviewed_bundle["intraday_judgment_review"]["opening_liquidity"]["in_0931_window"])
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["external_market"]["risk_level"], "high")
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["external_market"]["negative_sectors"], ["AI硬件", "算力"])
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["external_market"]["neutral_sectors"], ["消费"])
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["external_market"]["short_flow_monitor"]["pressure_level"], "high")
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["external_market"]["opening_anchor_break_monitor"]["pressure_level"], "high")
-        self.assertTrue(reviewed_bundle["intraday_judgment_review"]["external_market"]["weekend_digest_monitor"]["active"])
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["external_market"]["weekend_digest_monitor"]["bias"], "negative")
-
-    def test_intraday_judgment_review_downgrades_risk_on_pass_zero_opening_day(self) -> None:
-        bundle = {
-            "trade_date": "2026-07-09",
-            "source_stats": {
-                "today_opened_count": 0,
-            },
-            "direct_learn_items": [{"code": "002254"}],
-            "observe_only_items": [{"code": "002947", "blocked_reasons": ["profit_truncation"]}],
-        }
-        midday_payload = {
-            "date": "2026-07-09",
-            "stage": "pm_gate",
-            "pm_gate_status": "pass",
-            "intraday_judgment": {
-                "available": True,
-                "trade_date": "2026-07-09",
-                "generated_at": "2026-07-09 11:35:00",
-                "risk_bias": "defensive",
-                "market_temperature": "risk_on",
-                "pm_gate_status": "pass",
-                "rebound_bias": "avoid_broad_rebound",
-                "confidence": 0.70,
-                "cash_ratio": 0.42,
-                "position_exposure_ratio": 0.58,
-                "reduce_watch_codes": ["002254", "002947"],
-                "strong_hold_codes": ["300323"],
-                "opening_liquidity": {
-                    "available": True,
-                    "generated_at": "2026-07-09 09:31:00",
-                    "verdict": "mixed",
-                    "in_0931_window": True,
-                    "issue_ratio": 0.01,
-                },
-                "external_market": {
-                    "available": True,
-                    "generated_at": "2026-07-09 09:31:00",
-                    "window_tag": "opening_0931",
-                    "risk_level": "high",
-                    "a_share_bias": "risk_off",
-                    "negative_sectors": ["AI硬件", "算力"],
-                    "neutral_sectors": ["消费"],
-                    "positive_sectors": ["黄金"],
-                    "horizon_assessment": {
-                        "short_term": {"bias": "negative", "summary": "短期偏谨慎。"},
-                    },
-                    "recommended_actions": {
-                        "opening_gate_bias": "defensive",
-                    },
-                    "short_flow_monitor": {
-                        "pressure_level": "high",
-                        "summary": "做空资金偏强。",
-                    },
-                    "opening_anchor_break_monitor": {
-                        "pressure_level": "high",
-                        "summary": "开盘锚股承压。",
-                    },
-                    "headline": "隔夜风险资产走弱",
-                },
-            },
-        }
-        summary = {
-            "account": {
-                "total_assets": 1000000.0,
-                "avail_balance": 950000.0,
-                "total_pos_value": 50000.0,
-            },
-            "scan_status": {
-                "stocks_with_signal": 48,
-            },
-        }
-        records = [
-            {"code": "300323", "status": "holding"},
-            {"code": "002254", "status": "closed"},
-            {"code": "002947", "status": "closed"},
-        ]
-
-        with patch.object(trader, "_load_latest_midday_payload", return_value=midday_payload):
-            reviewed_bundle = trader._attach_intraday_judgment_review(
-                bundle,
-                summary=summary,
-                records=records,
-                positions=[{"code": "300323", "count": 4300}],
-            )
-
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["verdict"], "mixed")
-        self.assertTrue(reviewed_bundle["intraday_judgment_review"]["missed_risk_on_deployment"])
-        self.assertEqual(reviewed_bundle["summary"]["intraday_judgment_verdict"], "mixed")
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["market_temperature"], "risk_on")
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["pm_gate_status"], "pass")
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["stocks_with_signal"], 48)
-        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["today_opened_count"], 0)
+        self.assertFalse(reviewed_bundle["intraday_judgment_review"]["available"])
+        self.assertEqual(reviewed_bundle["intraday_judgment_review"]["verdict"], "midday_logic_removed")
+        self.assertEqual(reviewed_bundle["summary"]["intraday_judgment_verdict"], "midday_logic_removed")
+        self.assertEqual(reviewed_bundle["summary"]["intraday_judgment_score"], 0)
 
     def test_regime_execution_review_does_not_reward_risk_on_zero_opening_day(self) -> None:
         bundle = {
@@ -1988,7 +3081,6 @@ class EvolutionAbsorptionTests(unittest.TestCase):
                 "trade_date": "2026-07-09",
                 "risk_bias": "defensive",
                 "market_temperature": "risk_on",
-                "pm_gate_status": "pass",
                 "verdict": "mixed",
                 "score": 70,
             },
@@ -2227,8 +3319,8 @@ class EvolutionAbsorptionTests(unittest.TestCase):
                 "\n".join(
                     [
                         "generated_at,run_id,task_name,trigger_slot,phase,step,attempt,status,exit_code,started_at,finished_at,duration_seconds,detail,command,learning_action,learning_note,decision_buffer_seconds,root,data_dir",
-                        "2026-06-24 13:00:31,r1,TLFZ-WorkBuddy-MiddayGate,13:00,midday-gate,v10_moni_trader.py,1,failed,11,2026-06-24 13:00:00,2026-06-24 13:00:31,31,step failed: v10_moni_trader.py,C:\\Python314\\python.exe v10_moni_trader.py --midday-gate,,,,C:\\skills,C:\\data",
-                        "2026-06-25 13:00:32,r2,TLFZ-WorkBuddy-MiddayGate,13:00,midday-gate,v10_moni_trader.py,1,failed,11,2026-06-25 13:00:01,2026-06-25 13:00:32,31,step failed: v10_moni_trader.py,C:\\Python314\\python.exe v10_moni_trader.py --midday-gate,,,,C:\\skills,C:\\data",
+                        "2026-06-24 14:49:31,r1,TLFZ-WorkBuddy-Decision,14:49,decision,v10_moni_trader.py,1,failed,11,2026-06-24 14:49:00,2026-06-24 14:49:31,31,step failed: v10_moni_trader.py,C:\\Python314\\python.exe v10_moni_trader.py --decision,,,,C:\\skills,C:\\data",
+                        "2026-06-25 14:49:32,r2,TLFZ-WorkBuddy-Decision,14:49,decision,v10_moni_trader.py,1,failed,11,2026-06-25 14:49:01,2026-06-25 14:49:32,31,step failed: v10_moni_trader.py,C:\\Python314\\python.exe v10_moni_trader.py --decision,,,,C:\\skills,C:\\data",
                     ]
                 ),
                 encoding="utf-8",
@@ -2269,7 +3361,7 @@ class EvolutionAbsorptionTests(unittest.TestCase):
         self.assertEqual(engineering_review["incident_count"], 1)
         self.assertEqual(engineering_review["recurring_incident_count"], 1)
         self.assertEqual(engineering_review["verdict"], "needs_hardening")
-        self.assertEqual(engineering_review["incidents"][0]["phase"], "midday-gate")
+        self.assertEqual(engineering_review["incidents"][0]["phase"], "decision")
         self.assertEqual(engineering_review["incidents"][0]["recurrence_count"], 2)
         self.assertEqual(payload["learning_gate_basis"]["engineering_incident_count"], 1)
         self.assertEqual(payload["learning_gate_basis"]["engineering_verdict"], "needs_hardening")
@@ -2426,8 +3518,8 @@ class EvolutionAbsorptionTests(unittest.TestCase):
                         "recurring_incident_count": 1,
                         "high_severity_count": 1,
                         "category_counts": {"runtime_failure": 2},
-                        "incident_codes": ["midday_gate_v10_moni_trader_runtime_failure"],
-                        "hardening_actions": ["midday-gate 改动后必须先跑同阶段定向回归，严禁未定义 helper/常量直接上线。"],
+                        "incident_codes": ["decision_v10_moni_trader_runtime_failure"],
+                        "hardening_actions": ["decision 改动后必须先跑同阶段定向回归，严禁未定义 helper/常量直接上线。"],
                         "summary": "当日识别到 2 个代码能力事件。",
                     },
                     ensure_ascii=False,
@@ -2454,10 +3546,10 @@ class EvolutionAbsorptionTests(unittest.TestCase):
         self.assertEqual(engineering["recurring_incident_count"], 1)
         self.assertEqual(engineering["high_severity_count"], 1)
         self.assertEqual(engineering["category_counts"], {"runtime_failure": 2})
-        self.assertEqual(engineering["incident_codes"], ["midday_gate_v10_moni_trader_runtime_failure"])
+        self.assertEqual(engineering["incident_codes"], ["decision_v10_moni_trader_runtime_failure"])
         self.assertEqual(
             engineering["hardening_actions"],
-            ["midday-gate 改动后必须先跑同阶段定向回归，严禁未定义 helper/常量直接上线。"],
+            ["decision 改动后必须先跑同阶段定向回归，严禁未定义 helper/常量直接上线。"],
         )
 
 
@@ -2592,6 +3684,7 @@ class ChallengerExecutionTests(unittest.TestCase):
             patch.object(challenger, "_expected_source_trade_date", return_value="2026-06-24"),
             patch.object(challenger, "_load_source_payload", return_value=stale_payload),
             patch.object(challenger, "_refresh_source_payload", return_value=(fresh_payload, "ok")) as refresh_mock,
+            patch.object(challenger, "validate_candidate_pool_artifact"),
         ):
             payload = challenger._ensure_fresh_source_payload()
 
@@ -2604,11 +3697,26 @@ class ChallengerExecutionTests(unittest.TestCase):
             patch.object(challenger, "_expected_source_trade_date", return_value="2026-06-25"),
             patch.object(challenger, "_load_source_payload", return_value=fresh_payload),
             patch.object(challenger, "_refresh_source_payload") as refresh_mock,
+            patch.object(challenger, "validate_candidate_pool_artifact"),
         ):
             payload = challenger._ensure_fresh_source_payload()
 
         refresh_mock.assert_not_called()
         self.assertEqual(payload["trade_date"], "2026-06-26")
+
+    def test_challenger_do_buy_degrades_to_no_action_when_source_unavailable(self) -> None:
+        with (
+            patch.object(challenger, "_ensure_trade_window", return_value=True),
+            patch.object(challenger, "_resolve_buy_window", return_value={"key": "10:00", "label": "opening_probe"}),
+            patch.object(
+                challenger,
+                "build_buy_plan",
+                side_effect=challenger.ChallengerSourceUnavailable("source unavailable"),
+            ),
+        ):
+            code = challenger.do_buy(dry_run=False, force=False, trigger_slot="10:00")
+
+        self.assertEqual(code, challenger.base.EXIT_NO_ACTION)
 
     def test_challenger_do_buy_writes_local_fill(self) -> None:
         buy_list = [
@@ -2694,6 +3802,24 @@ class ChallengerExecutionTests(unittest.TestCase):
 
         self.assertEqual(buy_list, [])
         self.assertEqual(skipped, [{"code": "300001", "name": "Alpha", "reason": "quote_unavailable"}])
+
+    def test_challenger_build_buy_plan_allows_empty_selected_records(self) -> None:
+        payload = {"status": "ok", "selected_records": []}
+        with (
+            patch.object(challenger, "validate_opening_tradability_artifact"),
+            patch.object(challenger, "_ensure_fresh_source_payload", return_value=payload),
+            patch.object(challenger, "_resolve_buy_window", return_value={"key": "10:00", "label": "opening_probe"}),
+            patch.object(challenger, "load_track_record", return_value=[]),
+            patch.object(challenger, "_prune_execution_state", return_value={"positions": {}, "history": []}),
+            patch.object(challenger, "_build_account_snapshot", return_value=({"cash_balance": 100000.0, "total_assets": 100000.0}, [], {})),
+            patch.object(challenger, "_load_today_tradability_exclusions", return_value={}),
+            patch.object(challenger, "load_quote_map", return_value={}),
+        ):
+            plan_payload, buy_list, skipped, _execution_state = challenger.build_buy_plan(trigger_slot="10:00", persist_plan=False)
+
+        self.assertEqual(plan_payload["source_file"], str(challenger.SOURCE_FILE))
+        self.assertEqual(buy_list, [])
+        self.assertEqual(skipped, [])
 
     def test_challenger_build_buy_plan_can_skip_plan_persist_for_tests(self) -> None:
         payload = {
@@ -2919,6 +4045,7 @@ class ChallengerExecutionTests(unittest.TestCase):
                 },
             ),
             patch.object(challenger_review, "_expected_source_trade_date", return_value="2026-06-24"),
+            patch.object(Path, "exists", return_value=True),
         ):
             review = challenger_review.build_review()
 
@@ -2962,6 +4089,7 @@ class ChallengerExecutionTests(unittest.TestCase):
                 },
             ),
             patch.object(challenger_review, "_expected_source_trade_date", side_effect=expected_trade_date),
+            patch.object(Path, "exists", return_value=True),
         ):
             review = challenger_review.build_review()
 
@@ -3086,6 +4214,287 @@ class ChallengerExecutionTests(unittest.TestCase):
 
         self.assertEqual(code, challenger.base.EXIT_OK)
         summary_mock.assert_called_once_with("status", [], fast=True)
+
+
+class VerifiedMxFillLedgerTests(unittest.TestCase):
+    def test_verified_mx_fills_override_reference_prices_during_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            trade_log_file = tmp / "trades.jsonl"
+            verified_fills_file = tmp / "verified_fills.json"
+            events = [
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B1", "quantity": 2000, "ref_price": 14.39, "logged_at": "2026-08-10 17:54:28"},
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B2", "quantity": 2100, "ref_price": 14.39, "logged_at": "2026-08-10 19:30:40"},
+                {"event_type": "trade_result", "ok": True, "action": "sell", "code": "002487", "order_id": "S1", "quantity": 4100, "ref_price": 43.38, "logged_at": "2026-08-13 10:45:38"},
+            ]
+            trade_log_file.write_text(
+                "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in events),
+                encoding="utf-8",
+            )
+            verified_fills_file.write_text(json.dumps({
+                "version": 1,
+                "fills": {
+                    "B1": {"order_id": "B1", "code": "002487", "action": "buy", "trade_price": 41.0, "trade_count": 2000, "trade_date": "2026-08-10", "trade_time": "17:54:28"},
+                    "B2": {"order_id": "B2", "code": "002487", "action": "buy", "trade_price": 42.0, "trade_count": 2100, "trade_date": "2026-08-10", "trade_time": "19:30:40"},
+                    "S1": {"order_id": "S1", "code": "002487", "action": "sell", "trade_price": 43.38, "trade_count": 4100, "trade_date": "2026-08-13", "trade_time": "10:45:38"},
+                },
+            }, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                patch.object(trader, "TRADE_API_LOG_FILE", str(trade_log_file)),
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", str(verified_fills_file)),
+            ):
+                closed, _open = trader._build_runtime_trade_records(decision_reference={})
+
+        self.assertEqual(len(closed), 1)
+        record = closed[0]
+        expected_entry = round((41.0 * 2000 + 42.0 * 2100) / 4100, 4)
+        self.assertAlmostEqual(float(record["entry_price"]), expected_entry, places=4)
+        self.assertAlmostEqual(float(record["sell_price"]), 43.38, places=2)
+        self.assertAlmostEqual(float(record["pnl"]), round((43.38 - expected_entry) * 4100, 2), places=2)
+        self.assertNotEqual(float(record["entry_price"]), 14.39)
+
+    def test_verified_mx_unfilled_order_is_excluded_during_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            trade_log_file = tmp / "trades.jsonl"
+            verified_fills_file = tmp / "verified_fills.json"
+            events = [
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B-CANCELLED", "quantity": 16300, "ref_price": 14.39, "logged_at": "2026-08-10 17:54:28"},
+                {"event_type": "trade_result", "ok": True, "action": "buy", "code": "002487", "order_id": "B-FILLED", "quantity": 4100, "ref_price": 14.39, "logged_at": "2026-08-10 19:30:40"},
+                {"event_type": "trade_result", "ok": True, "action": "sell", "code": "002487", "order_id": "S1", "quantity": 4100, "ref_price": 43.38, "logged_at": "2026-08-13 10:45:38"},
+            ]
+            trade_log_file.write_text(
+                "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in events),
+                encoding="utf-8",
+            )
+            verified_fills_file.write_text(json.dumps({
+                "version": 1,
+                "fills": {
+                    "B-CANCELLED": {"order_id": "B-CANCELLED", "code": "002487", "action": "buy", "trade_price": 0, "trade_count": 0, "fill_state": "not_filled"},
+                    "B-FILLED": {"order_id": "B-FILLED", "code": "002487", "action": "buy", "trade_price": 42.1, "trade_count": 4100, "trade_date": "2026-08-10", "trade_time": "19:30:40"},
+                    "S1": {"order_id": "S1", "code": "002487", "action": "sell", "trade_price": 43.4, "trade_count": 4100, "trade_date": "2026-08-13", "trade_time": "10:45:38"},
+                },
+            }, ensure_ascii=False), encoding="utf-8")
+
+            with (
+                patch.object(trader, "TRADE_API_LOG_FILE", str(trade_log_file)),
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", str(verified_fills_file)),
+            ):
+                closed, _open = trader._build_runtime_trade_records(decision_reference={})
+
+        self.assertEqual(len(closed), 1)
+        record = closed[0]
+        self.assertEqual(int(record["quantity"]), 4100)
+        self.assertAlmostEqual(float(record["entry_price"]), 42.1, places=4)
+        self.assertAlmostEqual(float(record["sell_price"]), 43.4, places=4)
+        self.assertAlmostEqual(float(record["pnl"]), 5330.0, places=2)
+        self.assertAlmostEqual(float(record["pnl_pct"]), 3.09, places=2)
+
+    def test_repair_closed_episode_records_unfilled_buy_and_matches_rebuild(self) -> None:
+        source_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-CANCELLED|B-FILLED",
+            "sell_order_id": "S1",
+        }
+        rebuilt_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-FILLED",
+            "sell_order_id": "S1",
+            "entry_price": 42.1,
+            "sell_price": 43.4,
+            "quantity": 4100,
+            "pnl": 5330.0,
+            "pnl_pct": 3.09,
+        }
+        buy_orders = [
+            {
+                "id": "B-CANCELLED",
+                "code": "002487",
+                "direction": 1,
+                "status": 5,
+                "trade_count": 0,
+                "actual_trade_price": 0,
+            },
+            {
+                "id": "B-FILLED",
+                "code": "002487",
+                "direction": 1,
+                "status": 4,
+                "trade_count": 4100,
+                "actual_trade_price": 42.1,
+            },
+        ]
+        sell_orders = [{
+            "id": "S1",
+            "code": "002487",
+            "direction": 2,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 43.4,
+        }]
+        writes = []
+
+        def capture_write(path, payload):
+            writes.append((path, payload))
+
+        def repair_orders(direction):
+            orders = buy_orders if direction == 1 else sell_orders
+            return orders, {"has_snapshot": True, "live_error": "", "snapshot_age_seconds": 60}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            verified_fills_file = str(tmp / "verified_fills.json")
+            with (
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", verified_fills_file),
+                patch.object(trader, "MX_FILL_REPAIR_FILE", str(tmp / "repair.json")),
+                patch.object(trader, "TRADE_EPISODE_HISTORY_FILE", str(tmp / "episodes.json")),
+                patch.object(trader, "_get_repair_orders_from_mx", side_effect=repair_orders),
+                patch.object(trader, "load_track_record", side_effect=[[source_record], [rebuilt_record]]),
+                patch.object(trader, "_read_json", return_value={"version": 1, "fills": {}}),
+                patch.object(trader, "_write_json_atomic", side_effect=capture_write),
+                patch.object(trader, "_build_trade_episode_history", return_value=[]),
+                patch.object(trader, "_summarize_trade_episode_history", return_value={}),
+                patch.object(trader, "get_balance", return_value={}),
+                patch.object(trader, "get_positions", return_value=[]),
+                patch.object(trader, "get_orders", return_value=[]),
+                patch.object(trader, "refresh_pending_orders", return_value=[]),
+                patch.object(trader, "write_account_artifacts", return_value={"generated_at": "2026-08-13 11:00:00"}),
+            ):
+                report = trader.repair_closed_episode_from_mx_orders(
+                    "002487",
+                    buy_order_ids=["B-CANCELLED", "B-FILLED"],
+                    sell_order_id="S1",
+                )
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["corrected_record"]["quantity"], 4100)
+        self.assertEqual([fill["order_id"] for fill in report["verified_buy_fills"]], ["B-FILLED"])
+        self.assertEqual(len(report["verified_unfilled_buy_orders"]), 1)
+        unfilled_buy = report["verified_unfilled_buy_orders"][0]
+        self.assertEqual(unfilled_buy["order_id"], "B-CANCELLED")
+        self.assertEqual(unfilled_buy["trade_count"], 0)
+        self.assertEqual(unfilled_buy["fill_state"], "not_filled")
+        persisted_fills = next(payload["fills"] for path, payload in writes if path == verified_fills_file)
+        self.assertEqual(persisted_fills["B-CANCELLED"]["fill_state"], "not_filled")
+        self.assertIn("B-FILLED", persisted_fills)
+        self.assertIn("S1", persisted_fills)
+
+    def test_repair_closed_episode_tolerates_buy_order_absent_from_mx(self) -> None:
+        """A cancelled order never appears in MX filled-order history at all.
+
+        The 2026-08-14 repair of 002487 aborted here: the gate treated "not
+        returned by MX" as a hard failure, so the record could never be fixed.
+        Absent orders must be handled like returned-but-unfilled ones.
+        """
+        source_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-CANCELLED|B-FILLED",
+            "sell_order_id": "S1",
+        }
+        rebuilt_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-FILLED",
+            "sell_order_id": "S1",
+            "entry_price": 42.1,
+            "sell_price": 43.4,
+            "quantity": 4100,
+            "pnl": 5330.0,
+            "pnl_pct": 3.09,
+        }
+        # B-CANCELLED is deliberately absent from what MX returns.
+        buy_orders = [{
+            "id": "B-FILLED",
+            "code": "002487",
+            "direction": 1,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 42.1,
+        }]
+        sell_orders = [{
+            "id": "S1",
+            "code": "002487",
+            "direction": 2,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 43.4,
+        }]
+
+        def repair_orders(direction):
+            orders = buy_orders if direction == 1 else sell_orders
+            return orders, {"has_snapshot": True, "live_error": "", "snapshot_age_seconds": 60}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            with (
+                patch.object(trader, "MX_VERIFIED_FILLS_FILE", str(tmp / "verified_fills.json")),
+                patch.object(trader, "MX_FILL_REPAIR_FILE", str(tmp / "repair.json")),
+                patch.object(trader, "TRADE_EPISODE_HISTORY_FILE", str(tmp / "episodes.json")),
+                patch.object(trader, "_get_repair_orders_from_mx", side_effect=repair_orders),
+                patch.object(trader, "load_track_record", side_effect=[[source_record], [rebuilt_record]]),
+                patch.object(trader, "_read_json", return_value={"version": 1, "fills": {}}),
+                patch.object(trader, "_write_json_atomic"),
+                patch.object(trader, "_build_trade_episode_history", return_value=[]),
+                patch.object(trader, "_summarize_trade_episode_history", return_value={}),
+                patch.object(trader, "get_balance", return_value={}),
+                patch.object(trader, "get_positions", return_value=[]),
+                patch.object(trader, "get_orders", return_value=[]),
+                patch.object(trader, "refresh_pending_orders", return_value=[]),
+                patch.object(trader, "write_account_artifacts", return_value={"generated_at": "2026-08-13 11:00:00"}),
+            ):
+                report = trader.repair_closed_episode_from_mx_orders(
+                    "002487",
+                    buy_order_ids=["B-CANCELLED", "B-FILLED"],
+                    sell_order_id="S1",
+                )
+
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["missing_buy_order_ids"], ["B-CANCELLED"])
+        self.assertEqual([fill["order_id"] for fill in report["verified_buy_fills"]], ["B-FILLED"])
+        self.assertEqual(report["corrected_record"]["quantity"], 4100)
+
+    def test_repair_closed_episode_fails_when_no_buy_order_returned(self) -> None:
+        """Tolerating absent orders must not extend to every buy going missing."""
+        source_record = {
+            "status": "closed",
+            "code": "002487",
+            "buy_order_ids": "B-CANCELLED",
+            "sell_order_id": "S1",
+        }
+        sell_orders = [{
+            "id": "S1",
+            "code": "002487",
+            "direction": 2,
+            "status": 4,
+            "trade_count": 4100,
+            "actual_trade_price": 43.4,
+        }]
+
+        def repair_orders(direction):
+            orders = [{"id": "OTHER", "code": "000001", "direction": 1}] if direction == 1 else sell_orders
+            return orders, {"has_snapshot": True, "live_error": "", "snapshot_age_seconds": 60}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            with (
+                patch.object(trader, "MX_FILL_REPAIR_FILE", str(tmp / "repair.json")),
+                patch.object(trader, "_get_repair_orders_from_mx", side_effect=repair_orders),
+                patch.object(trader, "load_track_record", return_value=[source_record]),
+                patch.object(trader, "_write_json_atomic"),
+            ):
+                report = trader.repair_closed_episode_from_mx_orders(
+                    "002487",
+                    buy_order_ids=["B-CANCELLED"],
+                    sell_order_id="S1",
+                )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("未返回任何指定买入订单", report["error"])
+
 
 
 if __name__ == "__main__":

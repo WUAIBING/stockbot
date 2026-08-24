@@ -476,6 +476,24 @@ def compute_signal_tier(row):
     if consec_down >= 3 and ma20_pull and weekly_a and ls_ratio > 0.2:
         return (2, "dip_buy", 0.5, f"down{consec_down}d+MA20({ma20_off:+.1f}%)+weekly+ls={ls_ratio:.2f}")
 
+    # ── MODE 4b: 大肉预判 pre_breakout (T-1 低位缩量企稳，埋伏次日爆发) ──
+    # 2026-08-12 与 scanner_v10.py 对齐：pre_breakout+ 强档(缩量贴均线)优先，
+    # 基础档保留原条件但 position 降至 0.4(广撒网弱票)。
+    if (
+        -1.0 <= ma20_off <= 4.0
+        and amt_r < 1.2
+        and -3.0 <= weekly_sl <= 5.0
+        and rsi < 70
+    ):
+        return (2, "pre_breakout+", 0.6, f"缩量贴MA20 slope={weekly_sl:.1f}%")
+    if (
+        weekly_sl > -3.0
+        and -8.0 <= ma20_off <= 12.0
+        and 0.8 <= amt_r <= 3.0
+        and rsi < 70
+    ):
+        return (2, "pre_breakout", 0.4, f"slope={weekly_sl:.1f}%+MA20+缩量企稳")
+
     # ── TIER 3: One strong condition ──
     # 3a: Just bz_kill (even without other conditions)
     if bz_kill:

@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from mx_api_env import ensure_mx_runtime_env
 from package_paths import DATA_DIR
 from workbuddy_runtime import WORKBUDDY_CANDIDATE_POOL_FILE
 
@@ -867,11 +868,109 @@ def _build_impact_summary(*, a_share_bias: str, risk_level: str, negative_sector
     return f"{left}，风险等级 {risk_level}。{neg_text}；{neutral_text}；{pos_text}；{flag_text}。{short_summary}".strip()
 
 
+def _persist_review_outputs(payload: dict, scenario_summaries: list[dict]) -> None:
+    snapshot = {
+        "generated_at": payload["generated_at"],
+        "trade_date": payload["trade_date"],
+        "window_tag": payload["window_tag"],
+        "risk_level": payload["risk_level"],
+        "a_share_bias": payload["a_share_bias"],
+        "negative_sectors": payload.get("negative_sectors", []),
+        "neutral_sectors": payload.get("neutral_sectors", []),
+        "positive_sectors": payload.get("positive_sectors", []),
+        "confidence": payload.get("confidence", 0.0),
+        "impact_summary": payload["impact_summary"],
+    }
+    _write_json_atomic(OUTPUT_JSON, payload)
+    _append_jsonl(OUTPUT_HISTORY, snapshot)
+    _write_csv(
+        OUTPUT_CSV,
+        [
+            {
+                "scenario": item.get("scenario", ""),
+                "label": item.get("label", ""),
+                "query": item.get("query", ""),
+                "item_count": item.get("item_count", 0),
+                "negative_score": item.get("negative_score", 0.0),
+                "positive_score": item.get("positive_score", 0.0),
+                "negative_sectors": ",".join(item.get("negative_sectors", [])),
+                "positive_sectors": ",".join(item.get("positive_sectors", [])),
+                "top_title": (item.get("top_titles", []) or [""])[0],
+            }
+            for item in scenario_summaries
+        ],
+    )
+
+
+def _build_degraded_external_market_review(*, run_id: str, task_name: str, trigger_slot: str, reason: str) -> dict:
+    horizon_assessment = {
+        "short_term": {"label": "短期", "bias": "neutral", "summary": "外部资讯源当前不可用，短期先按中性观察。"},
+        "mid_term": {"label": "中期", "bias": "neutral", "summary": "缺少可靠外部资讯增量，中期不主动放大风险偏好。"},
+        "long_term": {"label": "长期", "bias": "neutral", "summary": "长期维持原策略框架，不因资讯源缺失修改结构判断。"},
+    }
+    recommended_actions = {
+        "bias_label": "neutral",
+        "allow_only_selective_rebound": False,
+        "broad_rebound_allowed": False,
+        "avoid_sectors": [],
+        "focus_sectors": [],
+        "suggested_response": "外部资讯源缺失，先按中性保守处理，不放大风险暴露。",
+        "opening_priority": "先观察，不脑补普反，只做结构性验证。",
+    }
+    return {
+        "generated_at": _now_str(),
+        "trade_date": _today_str(),
+        "run_id": run_id,
+        "task_name": task_name,
+        "trigger_slot": trigger_slot,
+        "window_tag": _derive_window_tag(trigger_slot),
+        "source": "mx-search",
+        "available": False,
+        "review_status": "degraded",
+        "risk_level": "unknown",
+        "a_share_bias": "neutral",
+        "confidence": 0.0,
+        "headline": "",
+        "impact_summary": f"外部资讯复核降级：{reason}。当前仅保留中性观察，不放大风险偏好。",
+        "negative_flags": [],
+        "neutral_flags": [],
+        "positive_flags": [],
+        "negative_sectors": [],
+        "neutral_sectors": [],
+        "positive_sectors": [],
+        "horizon_assessment": horizon_assessment,
+        "short_flow_monitor": {"pressure_level": "unknown", "targeted_sectors": [], "summary": "外部资讯源缺失，做空资金动向未完成复核。"},
+        "opening_anchor_break_monitor": _build_opening_anchor_break_monitor(),
+        "weekend_digest_monitor": {"active": False, "bias": "neutral", "summary": "周末汇总未启用或外部资讯源不可用。"},
+        "recommended_actions": recommended_actions,
+        "scenario_summaries": [],
+        "raw_query_count": 0,
+        "success_query_count": 0,
+        "error_count": 1,
+        "errors": [{"stage": "bootstrap", "error": reason}],
+        "notes": [
+            "外部资讯源缺失时改为降级落盘，避免 opening-data 因环境问题整相失败。",
+            "该结果仅作为中性占位，不可替代真实资讯复核。",
+        ],
+    }
+
+
 def build_external_market_review(*, run_id: str = "", task_name: str = "", trigger_slot: str = "") -> dict:
+    ensure_mx_runtime_env()
+    degraded_reason = ""
     if not os.environ.get("MX_APIKEY", "").strip():
-        raise RuntimeError("MX_APIKEY 未配置")
-    if not MX_SEARCH_SKILL.exists():
-        raise RuntimeError(f"mx-search skill 缺失: {MX_SEARCH_SKILL}")
+        degraded_reason = "MX_APIKEY 未配置"
+    elif not MX_SEARCH_SKILL.exists():
+        degraded_reason = f"mx-search skill 缺失: {MX_SEARCH_SKILL}"
+    if degraded_reason:
+        payload = _build_degraded_external_market_review(
+            run_id=run_id,
+            task_name=task_name,
+            trigger_slot=trigger_slot,
+            reason=degraded_reason,
+        )
+        _persist_review_outputs(payload, [])
+        return payload
 
     mx_search_mod = _load_module(MX_SEARCH_SKILL, "mx_search_runtime")
     client = mx_search_mod.MXSearch()
@@ -1048,37 +1147,7 @@ def build_external_market_review(*, run_id: str = "", task_name: str = "", trigg
             "每周一早盘额外启用周末汇总块，单独评估周末政策、联播、地缘与产业催化对周一开盘的影响。",
         ],
     }
-    snapshot = {
-        "generated_at": payload["generated_at"],
-        "trade_date": payload["trade_date"],
-        "window_tag": payload["window_tag"],
-        "risk_level": risk_level,
-        "a_share_bias": a_share_bias,
-        "negative_sectors": negative_sectors,
-        "neutral_sectors": neutral_sectors,
-        "positive_sectors": positive_sectors,
-        "confidence": confidence,
-        "impact_summary": impact_summary,
-    }
-    _write_json_atomic(OUTPUT_JSON, payload)
-    _append_jsonl(OUTPUT_HISTORY, snapshot)
-    _write_csv(
-        OUTPUT_CSV,
-        [
-            {
-                "scenario": item.get("scenario", ""),
-                "label": item.get("label", ""),
-                "query": item.get("query", ""),
-                "item_count": item.get("item_count", 0),
-                "negative_score": item.get("negative_score", 0.0),
-                "positive_score": item.get("positive_score", 0.0),
-                "negative_sectors": ",".join(item.get("negative_sectors", [])),
-                "positive_sectors": ",".join(item.get("positive_sectors", [])),
-                "top_title": (item.get("top_titles", []) or [""])[0],
-            }
-            for item in scenario_summaries
-        ],
-    )
+    _persist_review_outputs(payload, scenario_summaries)
     return payload
 
 

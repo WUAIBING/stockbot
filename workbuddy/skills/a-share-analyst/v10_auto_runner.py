@@ -15,10 +15,10 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from package_paths import DATA_DIR
+from package_paths import DATA_DIR, assert_runtime_write_identity
 from trading_calendar import CALENDAR_SOURCE, is_trading_day
 from workbuddy_runtime import (
     BUILD_WORKBUDDY_DISTILL_DAILY_REVIEW_SCRIPT,
@@ -38,26 +38,30 @@ STATUS_DIR = DATA_DIR / 'automation_status'
 STATUS_LATEST = STATUS_DIR / 'latest_phase_status.json'
 STATUS_HISTORY = STATUS_DIR / 'phase_history.csv'
 STATUS_HISTORY_DETAILED = STATUS_DIR / 'phase_history_detailed.csv'
+STATUS_WRITE_LOCK = STATUS_DIR / '.status_write.lock'
+STATUS_FALLBACK_DIR = STATUS_DIR / 'status_fallback_events'
 PREWARM_TIMING_SIGNAL = STATUS_DIR / 'prewarm_timing_signal.json'
 OPENING_NODE_FILE = DATA_DIR / 'v10_opening_node_latest.json'
-MIDDAY_INSPECTION_FILE = DATA_DIR / 'v10_midday_inspection_latest.json'
 CLOSE_NODE_FILE = DATA_DIR / 'v10_close_node_latest.json'
 CLOSE_NODE_MX_REVIEW_FILE = DATA_DIR / 'v10_close_node_mx_review_latest.json'
 SECURITY_MASTER_FILE = DATA_DIR / 'security_master_latest.json'
 OPENING_TRADABILITY_FILE = DATA_DIR / 'opening_tradability_latest.json'
 EXTERNAL_MARKET_REVIEW_FILE = DATA_DIR / 'v10_external_market_review_latest.json'
-MIDDAY_REVIEW_FILE = DATA_DIR / 'v10_midday_review_latest.json'
-MIDDAY_NODE_FILE = DATA_DIR / 'v10_midday_node_latest.json'
-MIDDAY_GATE_FILE = DATA_DIR / 'v10_midday_gate_latest.json'
-PM_GATE_FILE = DATA_DIR / 'v10_pm_gate_status.json'
 WORKBUDDY_LOCAL_REVIEW_FILE = DATA_DIR / 'workbuddy_local_review_latest.json'
 WORKBUDDY_LEARNING_ADVICE_FILE = DATA_DIR / 'workbuddy_learning_advice_latest.json'
 ACCOUNT_SUMMARY_FILE = DATA_DIR / 'v10_account_summary_latest.json'
+BUY_DIAGNOSTIC_FILE = DATA_DIR / 'v10_buy_diagnostic_latest.json'
+DECISION_POINTER_FILE = DATA_DIR / 'v10_decision_latest.json'
 DISTILL_DAILY_REVIEW_SCRIPT = BUILD_WORKBUDDY_DISTILL_DAILY_REVIEW_SCRIPT
 DISTILL_DAILY_REVIEW_FILE = WORKBUDDY_DISTILL_DAILY_REVIEW_FILE
-WATCH_RETRYABLE_CODES = {2, 3, 4, 124}
+MARKET_TZ = timezone(timedelta(hours=8), name='UTC+08')
+BUY_WATCH_RETRYABLE_CODES = {4, 5}
 STEP_TIMEOUT_DEFAULT = 600
+EXIT_CONFIG_ERROR = 1
 EXIT_WINDOW_SKIPPED = 2
+EXIT_RUNTIME_ERROR = 3
+EXIT_STALE_DECISION = 4
+EXIT_DECISION_NOT_READY = 5
 EXIT_NO_SIGNAL = 10
 EXIT_NO_ACTION = 11
 LEGACY_HISTORY_FIELDS = [
@@ -78,30 +82,29 @@ DECISION_TRIGGER_SLOT = '14:49'
 STEP_TIMEOUTS = {
     ('opening-data', 'security_master_refresh.py'): 480,
     ('opening-data', 'external_market_review.py'): 360,
-    ('workbuddy-refresh', 'refresh_distill_pipeline.py'): 900,
-    ('workbuddy-refresh', 'mx_enrich_candidates.py'): 300,
-    ('workbuddy-refresh', 'mx_event_review.py'): 300,
-    ('workbuddy-refresh', 'mx_challenger_pool.py'): 300,
-    ('workbuddy-refresh', 'mx_workbuddy_portfolio.py'): 300,
-    ('workbuddy-buy', 'refresh_distill_pipeline.py'): 900,
-    ('workbuddy-buy', 'workbuddy_local_challenger.py'): 900,
-    ('workbuddy-sell', 'workbuddy_local_challenger.py'): 240,
-    ('workbuddy-smart-sell', 'workbuddy_local_challenger.py'): 300,
-    ('workbuddy-status', 'workbuddy_local_challenger.py'): 120,
+    ('workbuddy-refresh', 'refresh_distill_pipeline.py'): 180,
+    ('workbuddy-refresh', 'mx_enrich_candidates.py'): 120,
+    ('workbuddy-refresh', 'mx_event_review.py'): 120,
+    ('workbuddy-refresh', 'mx_challenger_pool.py'): 120,
+    ('workbuddy-refresh', 'mx_workbuddy_portfolio.py'): 120,
+    ('workbuddy-buy', 'refresh_distill_pipeline.py'): 180,
+    ('workbuddy-buy', 'workbuddy_local_challenger.py'): 180,
+    ('workbuddy-sell', 'workbuddy_local_challenger.py'): 120,
+    ('workbuddy-smart-sell', 'workbuddy_local_challenger.py'): 180,
+    ('workbuddy-status', 'workbuddy_local_challenger.py'): 45,
     ('smart-sell', 'data_freshness_probe.py'): 20,
     ('prewarm', 'scanner_v10.py'): 900,
     ('prewarm', 'data_freshness_probe.py'): 20,
     ('decision', 'scanner_v10.py'): 300,
     ('decision', 'data_freshness_probe.py'): 20,
     ('buy', 'data_freshness_probe.py'): 20,
-    ('buy', 'v10_moni_trader.py'): 180,
+    ('buy', 'v10_moni_trader.py'): 420,
     ('add-position', 'v10_moni_trader.py'): 240,
     ('smart-sell', 'v10_moni_trader.py'): 300,
     ('sell', 'v10_moni_trader.py'): 240,
+    ('repair-mx-002487', 'v10_moni_trader.py'): 180,
     ('status', 'v10_moni_trader.py'): 180,
-    ('midday-node', 'v10_moni_trader.py'): 240,
-    ('midday-gate', 'v10_moni_trader.py'): 300,
-    ('close-node', 'v10_moni_trader.py'): 180,
+    ('close-node', 'v10_moni_trader.py'): 420,
     ('close-node', 'external_market_review.py'): 360,
     ('close-node', 'mx_enrich_candidates.py'): 300,
     ('close-node', 'mx_event_review.py'): 300,
@@ -128,13 +131,9 @@ TRADING_DAY_ONLY_PHASES = {
     'add-position',
     'smart-sell',
     'sell',
-    'midday-node',
-    'midday-gate',
     'close-node',
 }
-PHASE_HARD_DEADLINES = {
-    'midday-gate': (13, 5),
-}
+PHASE_HARD_DEADLINES = {}
 CLOSE_NODE_OPTIONAL_STEPS = {
     'mx_enrich_candidates.py',
     'mx_event_review.py',
@@ -153,6 +152,7 @@ OBSERVE_ONLY_OPTIONAL_STEPS = {
 }
 RUN_META_ARG_STEPS = {
     'data_freshness_probe.py',
+    'scanner_v10.py',
     'workbuddy_local_challenger.py',
     'workbuddy_local_review.py',
     'workbuddy_learning_bridge.py',
@@ -163,10 +163,16 @@ RUN_META_ARG_STEPS = {
 
 def write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + '.tmp')
-    with tmp_path.open('w', encoding='utf-8') as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f'.{path.name}.{os.getpid()}.{time.time_ns()}.tmp')
+    try:
+        with tmp_path.open('w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def read_json(path: Path) -> dict:
@@ -178,6 +184,33 @@ def read_json(path: Path) -> dict:
         return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
+
+
+def market_now() -> datetime:
+    return datetime.now(MARKET_TZ)
+
+
+def publish_decision_running_marker(run_meta: dict[str, str]) -> dict:
+    now = market_now()
+    trade_date = now.date().isoformat()
+    producer_run_id = str(run_meta.get('run_id', '')).strip()
+    if not producer_run_id:
+        raise RuntimeValidationError('decision producer run_id is required')
+    payload = {
+        'schema_version': 1,
+        'artifact_id': f'{trade_date}:decision:{producer_run_id}',
+        'producer_run_id': producer_run_id,
+        'phase': 'decision',
+        'trade_date': trade_date,
+        'complete': False,
+        'state': 'running',
+        'decision_cutoff_at': f'{trade_date} 14:50:00',
+        'started_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'published_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'market_timezone': 'UTC+08',
+    }
+    write_json_atomic(DECISION_POINTER_FILE, payload)
+    return payload
 
 
 def normalize_step_name(step_path: str) -> str:
@@ -296,85 +329,6 @@ def build_opening_node_snapshot(
     }
 
 
-def build_midday_inspection_snapshot(
-    *,
-    run_meta: dict[str, str],
-    phase: str,
-    phase_status: str,
-    phase_exit_code: int,
-) -> dict[str, object]:
-    midday_review = summarize_detail_file(
-        MIDDAY_REVIEW_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('market_temperature',),
-    )
-    midday_node = summarize_detail_file(
-        MIDDAY_NODE_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes'),
-    )
-    midday_gate = summarize_detail_file(
-        MIDDAY_GATE_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes'),
-    )
-    pm_gate = summarize_detail_file(
-        PM_GATE_FILE,
-        date_keys=('trade_date', 'date'),
-        extra_keys=('stage', 'review_status', 'pm_gate_status', 'blocked_buy_codes', 'reason_codes'),
-    )
-    account_summary_payload = read_json(ACCOUNT_SUMMARY_FILE)
-    latest_execution_result = account_summary_payload.get('latest_execution_result', {}) if isinstance(account_summary_payload, dict) else {}
-    account_summary = summarize_detail_file(
-        ACCOUNT_SUMMARY_FILE,
-        date_keys=('trade_date', 'date'),
-    )
-    account_summary['latest_execution_action'] = str(latest_execution_result.get('action', '')).strip() if isinstance(latest_execution_result, dict) else ''
-    account_summary['latest_execution_status'] = str(latest_execution_result.get('status', '')).strip() if isinstance(latest_execution_result, dict) else ''
-    current_stage_ready = bool(midday_node['is_today']) if phase == 'midday-node' else bool(midday_gate['is_today'] and pm_gate['is_today'])
-    checklist = {
-        'midday_review_today': bool(midday_review['is_today']),
-        'midday_node_today': bool(midday_node['is_today']),
-        'midday_gate_today': bool(midday_gate['is_today']),
-        'pm_gate_today': bool(pm_gate['is_today']),
-        'current_stage_ready': current_stage_ready,
-    }
-    notes: list[str] = []
-    if phase == 'midday-node':
-        notes.append('11:35 午间节点已落盘，当前巡检用于事实复核与下午放行建议。')
-    else:
-        notes.append('13:00 午盘闸门已落盘，当前巡检用于最终下午放行确认。')
-    if not checklist['midday_review_today']:
-        notes.append('v10_midday_review_latest.json 未确认是今日版本。')
-    if phase == 'midday-gate' and not checklist['pm_gate_today']:
-        notes.append('v10_pm_gate_status.json 未确认是今日版本。')
-    if phase_status == 'ok' and current_stage_ready:
-        inspection_status = 'ok'
-    elif phase_status in {'ok', 'no_action', 'no_signal', 'skipped'}:
-        inspection_status = 'warning'
-    else:
-        inspection_status = 'failed'
-    return {
-        'generated_at': format_timestamp(datetime.now()),
-        'trade_date': datetime.now().strftime('%Y-%m-%d'),
-        'node': 'midday_inspection',
-        'stage': phase,
-        'run_id': run_meta['run_id'],
-        'task_name': run_meta['task_name'],
-        'trigger_slot': run_meta['trigger_slot'],
-        'phase_status': phase_status,
-        'phase_exit_code': phase_exit_code,
-        'inspection_status': inspection_status,
-        'checklist': checklist,
-        'midday_review': midday_review,
-        'midday_node': midday_node,
-        'midday_gate': midday_gate,
-        'pm_gate': pm_gate,
-        'account_summary': account_summary,
-        'notes': notes,
-    }
-
-
 def write_phase_inspection_snapshot(
     *,
     run_meta: dict[str, str],
@@ -390,15 +344,6 @@ def write_phase_inspection_snapshot(
         )
         write_json_atomic(OPENING_NODE_FILE, payload)
         return OPENING_NODE_FILE
-    if phase in {'midday-node', 'midday-gate'}:
-        payload = build_midday_inspection_snapshot(
-            run_meta=run_meta,
-            phase=phase,
-            phase_status=phase_status,
-            phase_exit_code=phase_exit_code,
-        )
-        write_json_atomic(MIDDAY_INSPECTION_FILE, payload)
-        return MIDDAY_INSPECTION_FILE
     return None
 
 
@@ -685,13 +630,12 @@ def build_run_id(*, phase: str, task_name: str, trigger_slot: str) -> str:
     slot_part = sanitize_token(trigger_slot.replace(':', '') if trigger_slot else datetime.now().strftime('%H%M%S'))
     task_part = sanitize_token(task_name or 'manual-task')
     phase_part = sanitize_token(phase)
-    return f'{date_part}-{slot_part}-{task_part}-{phase_part}'
+    return f'{date_part}-{slot_part}-{task_part}-{phase_part}-{os.getpid()}-{time.time_ns()}'
 
 
 def canonical_phase_name(phase: str) -> str:
     mapping = {
         'buy-watch': 'buy',
-        'midday-review': 'midday-node',
         'report': 'close-node',
     }
     return mapping.get(phase, phase)
@@ -734,7 +678,7 @@ def evaluate_prewarm_timing(
     elif should_move_earlier:
         note = (
             f'prewarm completed too close to decision or ran too long; '
-            f'suggest moving start from {run_meta["trigger_slot"] or "14:30"} to {PREWARM_RECOMMENDED_START_SLOT}'
+            f'suggest moving start from {run_meta["trigger_slot"] or PREWARM_RECOMMENDED_START_SLOT} to {PREWARM_RECOMMENDED_START_SLOT}'
         )
         action = 'suggest_move_to_14_25'
     else:
@@ -747,7 +691,7 @@ def evaluate_prewarm_timing(
         'phase': 'prewarm',
         'status': status,
         'current_trigger_slot': run_meta['trigger_slot'],
-        'recommended_trigger_slot': PREWARM_RECOMMENDED_START_SLOT if should_move_earlier else (run_meta['trigger_slot'] or '14:30'),
+        'recommended_trigger_slot': PREWARM_RECOMMENDED_START_SLOT if should_move_earlier else (run_meta['trigger_slot'] or PREWARM_RECOMMENDED_START_SLOT),
         'started_at': format_timestamp(started_at),
         'finished_at': format_timestamp(finished_at),
         'duration_seconds': duration_seconds if duration_seconds is not None else '',
@@ -780,6 +724,55 @@ def append_history(path: Path, fieldnames: list[str], row: dict) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _status_lock_snapshot():
+    try:
+        stat = STATUS_WRITE_LOCK.stat()
+    except FileNotFoundError:
+        return None
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+def _acquire_status_write_lock(*, timeout_seconds=6.0, stale_seconds=5.0):
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+    while True:
+        try:
+            fd = os.open(str(STATUS_WRITE_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                age_seconds = max(0.0, time.time() - STATUS_WRITE_LOCK.stat().st_mtime)
+            except OSError:
+                age_seconds = 0.0
+            if age_seconds > stale_seconds:
+                snapshot = _status_lock_snapshot()
+                if snapshot is None:
+                    continue
+                if _status_lock_snapshot() != snapshot:
+                    continue
+                try:
+                    STATUS_WRITE_LOCK.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return None
+                continue
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+            continue
+        os.close(fd)
+        return STATUS_WRITE_LOCK
+
+
+def _release_status_write_lock(lock_path) -> None:
+    if lock_path is None:
+        return
+    try:
+        Path(lock_path).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def record_status(
@@ -820,10 +813,23 @@ def record_status(
         'root': str(ROOT),
         'data_dir': str(DATA_DIR),
     }
-    write_json_atomic(STATUS_LATEST, payload)
-    write_json_atomic(latest_phase_path(phase), payload)
-    append_history(STATUS_HISTORY, LEGACY_HISTORY_FIELDS, {key: payload.get(key, '') for key in LEGACY_HISTORY_FIELDS})
-    append_history(STATUS_HISTORY_DETAILED, DETAILED_HISTORY_FIELDS, {key: payload.get(key, '') for key in DETAILED_HISTORY_FIELDS})
+    lock_path = _acquire_status_write_lock()
+    payload['generated_at'] = format_timestamp(datetime.now())
+    if lock_path is None:
+        fallback_path = STATUS_FALLBACK_DIR / (
+            f'{sanitize_token(payload["run_id"])}.{sanitize_token(phase)}.'
+            f'{sanitize_token(step)}.{attempt}.{os.getpid()}.{time.time_ns()}.json'
+        )
+        write_json_atomic(fallback_path, payload)
+        print(f'[WARN] status write lock unavailable; wrote fallback event: {fallback_path}')
+        return
+    try:
+        write_json_atomic(STATUS_LATEST, payload)
+        write_json_atomic(latest_phase_path(phase), payload)
+        append_history(STATUS_HISTORY, LEGACY_HISTORY_FIELDS, {key: payload.get(key, '') for key in LEGACY_HISTORY_FIELDS})
+        append_history(STATUS_HISTORY_DETAILED, DETAILED_HISTORY_FIELDS, {key: payload.get(key, '') for key in DETAILED_HISTORY_FIELDS})
+    finally:
+        _release_status_write_lock(lock_path)
 
 
 def get_step_timeout(phase: str, step_name: str) -> int:
@@ -836,6 +842,8 @@ def classify_step_status(phase: str, step_name: str, exit_code: int) -> str:
     semantic_map = {
         'v10_moni_trader.py': {
             EXIT_WINDOW_SKIPPED: 'skipped',
+            EXIT_STALE_DECISION: 'stale_decision' if phase == 'buy' else 'failed',
+            EXIT_DECISION_NOT_READY: 'decision_not_ready' if phase == 'buy' else 'failed',
             EXIT_NO_SIGNAL: 'no_signal',
             EXIT_NO_ACTION: 'no_action',
         },
@@ -851,7 +859,7 @@ def classify_step_status(phase: str, step_name: str, exit_code: int) -> str:
 
 
 def is_nonfatal_step_status(phase: str, step_name: str, status: str) -> bool:
-    if status in {'ok', 'no_action', 'no_signal', 'skipped'}:
+    if status in {'ok', 'no_action', 'no_signal', 'skipped', 'decision_not_ready', 'stale_decision'}:
         return True
     return status == 'warning' and is_soft_fail_step(phase, step_name)
 
@@ -862,8 +870,22 @@ def phase_completion_detail(status: str) -> str:
         'no_action': 'phase finished with no action',
         'no_signal': 'phase finished with no signal',
         'skipped': 'phase finished with window skipped',
+        'decision_not_ready': 'phase waiting for dedicated decision artifact',
+        'stale_decision': 'phase waiting for current decision artifact',
     }
     return detail_map.get(status, 'phase finished')
+
+
+def enrich_buy_detail(phase: str, step_name: str, detail: str) -> str:
+    if phase != 'buy' or step_name != 'v10_moni_trader.py':
+        return detail
+    diagnostic = read_json(BUY_DIAGNOSTIC_FILE)
+    if str(diagnostic.get('action', '')).strip() != 'buy':
+        return detail
+    reason = str(diagnostic.get('reason', '')).strip()
+    if not reason:
+        return detail
+    return f"{detail} | buy_no_action_reason={reason}"
 
 
 def enrich_add_position_detail(phase: str, step_name: str, detail: str) -> str:
@@ -911,6 +933,8 @@ def run_step(phase: str, args: list[str]) -> tuple[int, str, datetime, datetime]
             'no_action': f'step finished with no action: {args[0]}',
             'no_signal': f'step finished with no signal: {args[0]}',
             'skipped': f'step finished with window skipped: {args[0]}',
+            'decision_not_ready': f'dedicated decision artifact not ready: {args[0]}',
+            'stale_decision': f'current decision artifact not ready: {args[0]}',
         }
         return result.returncode, semantic_detail_map.get(semantic_status, f'step failed: {args[0]}'), started_at, finished_at
     except subprocess.TimeoutExpired:
@@ -985,7 +1009,7 @@ def build_steps(phase: str, *, with_email: bool) -> list[list[str] | None]:
     elif phase == 'prewarm':
         return [
             ['data_freshness_probe.py'],
-            ['scanner_v10.py'],
+            ['scanner_v10.py', '--prewarm-fast'],
             ['send_email.py', '--type', 'prewarm'] if with_email else None,
         ]
     elif phase == 'decision':
@@ -1010,10 +1034,14 @@ def build_steps(phase: str, *, with_email: bool) -> list[list[str] | None]:
         return [['v10_moni_trader.py', '--sell']]
     elif phase == 'status':
         return [['v10_moni_trader.py', '--status']]
-    elif phase == 'midday-node':
-        return [['v10_moni_trader.py', '--midday-node']]
-    elif phase == 'midday-gate':
-        return [['v10_moni_trader.py', '--midday-gate']]
+    elif phase == 'repair-mx-002487':
+        return [[
+            'v10_moni_trader.py',
+            '--repair-closed-episode', '002487',
+            '--repair-buy-order-id', '262214600000064468',
+            '--repair-buy-order-id', '262214500000070240',
+            '--repair-sell-order-id', '262244500000038738',
+        ]]
     elif phase == 'close-node':
         return [
             ['v10_moni_trader.py', '--close-node'],
@@ -1111,8 +1139,11 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
         print(f"[STOP] {deadline_detail}")
         return 2
     try:
-        preflight_reports = preflight_phase(phase, expected_trade_date=datetime.now().strftime('%Y-%m-%d'))
-    except RuntimeValidationError as exc:
+        if phase == 'decision':
+            publish_decision_running_marker(run_meta)
+        expected_trade_date = market_now().strftime('%Y-%m-%d')
+        preflight_reports = preflight_phase(phase, expected_trade_date=expected_trade_date)
+    except (RuntimeValidationError, OSError) as exc:
         preflight_finished_at = datetime.now()
         record_status(
             run_meta=run_meta,
@@ -1176,6 +1207,7 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
                 except RuntimeValidationError as exc:
                     code = 3
                     step_detail = f"step output validation failed: {exc}"
+            step_detail = enrich_buy_detail(phase, step_name, step_detail)
             step_detail = enrich_add_position_detail(phase, step_name, step_detail)
             step_status = classify_step_status(phase, step_name, code)
             record_status(
@@ -1201,7 +1233,7 @@ def run_phase_once(phase: str, *, run_meta: dict[str, str], with_email: bool, at
                     'duration_seconds': seconds_between(step_started_at, step_finished_at) or 0,
                 })
             if code != 0:
-                if step_status in {'no_action', 'no_signal', 'skipped'}:
+                if step_status in {'no_action', 'no_signal', 'skipped', 'decision_not_ready', 'stale_decision'}:
                     phase_status = step_status
                     phase_exit_code = code
                     print(f"[INFO] semantic non-fatal step: {step_name} -> {step_detail} ({step_status})")
@@ -1322,14 +1354,11 @@ def run_phase_watch(
     max_attempts: int,
     interval_seconds: int,
 ) -> int:
-    deadline = datetime.now().replace(hour=14, minute=57, second=0, microsecond=0)
-    last_code = 11
-    retryable_codes = set(WATCH_RETRYABLE_CODES)
-    # buy-watch exists specifically to wait for scanner/decision artifacts to become ready.
-    if phase == 'buy':
-        retryable_codes.add(1)
+    deadline = market_now().replace(hour=14, minute=57, second=0, microsecond=0)
+    last_code = EXIT_DECISION_NOT_READY if phase == 'buy' else EXIT_NO_ACTION
+    retryable_codes = set(BUY_WATCH_RETRYABLE_CODES if phase == 'buy' else ())
     for attempt in range(1, max_attempts + 1):
-        now = datetime.now()
+        now = market_now()
         if now > deadline:
             detail = f'watch deadline reached at {deadline:%H:%M:%S}'
             record_status(
@@ -1337,7 +1366,7 @@ def run_phase_watch(
                 phase=phase,
                 step='phase',
                 attempt=attempt,
-                status='deadline',
+                status='failed',
                 exit_code=last_code,
                 detail=detail,
                 started_at=now,
@@ -1349,11 +1378,27 @@ def run_phase_watch(
         last_code = code
         if code == 0:
             return 0
-        if code not in retryable_codes or attempt == max_attempts:
+        if code not in retryable_codes:
             return code
-        sleep_seconds = min(interval_seconds, max(1, int((deadline - datetime.now()).total_seconds())))
+        if attempt == max_attempts:
+            terminal_at = market_now()
+            detail = f'buy watch exhausted {max_attempts} attempts; final exit code {code}'
+            record_status(
+                run_meta=run_meta,
+                phase=phase,
+                step='watch_terminal',
+                attempt=attempt,
+                status='failed',
+                exit_code=code,
+                detail=detail,
+                started_at=terminal_at,
+                finished_at=terminal_at,
+            )
+            print(f'[STOP] {detail}')
+            return code
+        sleep_seconds = min(interval_seconds, max(1, int((deadline - market_now()).total_seconds())))
         detail = f'retry in {sleep_seconds}s after exit code {code}'
-        retry_at = datetime.now()
+        retry_at = market_now()
         record_status(
             run_meta=run_meta,
             phase=phase,
@@ -1371,11 +1416,12 @@ def run_phase_watch(
 
 
 def main() -> int:
+    assert_runtime_write_identity(STATUS_DIR)
     parser = argparse.ArgumentParser(description='V10 自动化阶段执行器')
     parser.add_argument(
         '--phase',
         required=True,
-        choices=['opening-data', 'workbuddy-refresh', 'workbuddy-buy', 'workbuddy-sell', 'workbuddy-smart-sell', 'workbuddy-status', 'prewarm', 'decision', 'buy', 'buy-watch', 'add-position', 'smart-sell', 'sell', 'status', 'midday-node', 'midday-gate', 'midday-review', 'close-node', 'report'],
+        choices=['opening-data', 'workbuddy-refresh', 'workbuddy-buy', 'workbuddy-sell', 'workbuddy-smart-sell', 'workbuddy-status', 'prewarm', 'decision', 'buy', 'buy-watch', 'add-position', 'smart-sell', 'sell', 'repair-mx-002487', 'status', 'close-node', 'report'],
         help='要执行的自动化阶段',
     )
     parser.add_argument('--with-email', action='store_true', help='阶段完成后发送对应邮件')
