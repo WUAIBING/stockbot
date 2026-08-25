@@ -23,22 +23,51 @@ sys.path.insert(0, str(SKILL))
 import workbuddy_local_challenger as ch  # noqa: E402
 
 
-class RawRankingsReadyTests(unittest.TestCase):
-    def test_true_when_full_rank_present(self):
-        with patch.object(ch, "_raw_rankings_ready", wraps=ch._raw_rankings_ready):
-            pass  # sanity: symbol exists and is callable
-        self.assertTrue(callable(ch._raw_rankings_ready))
+class RawTop100RootTests(unittest.TestCase):
+    """The location must resolve without importing workbuddy_distill.
 
-    def test_detects_a_present_ranking(self):
+    The first version of this guard did `from workbuddy_distill.scripts...
+    import RAW_TOP100_ROOT`. The challenger runs with the skill directory as
+    cwd, so that raises ModuleNotFoundError in production - the guard fell
+    through, returned True, and the 75s timeout stayed exactly as it was. The
+    original tests missed it because they patched sys.modules, so the real
+    import was never exercised. These tests do not mock the import at all.
+    """
+
+    def test_resolves_without_importing_workbuddy_distill(self):
+        import builtins
+        real_import = builtins.__import__
+
+        def refuse(name, *a, **k):
+            if name.startswith("workbuddy_distill"):
+                raise ModuleNotFoundError(name)
+            return real_import(name, *a, **k)
+
+        with patch.object(builtins, "__import__", side_effect=refuse):
+            root = ch._raw_top100_root()
+        self.assertIsNotNone(root, "must resolve even when the import fails")
+        self.assertEqual(root.name, "raw_top100")
+        self.assertEqual(root.parent.name, "workbuddy_distill")
+
+    def test_root_is_anchored_under_arkclaw_root(self):
+        root = ch._raw_top100_root()
+        self.assertIsNotNone(root)
+        self.assertEqual(root, Path(ch.ARKCLAW_ROOT) / "workbuddy_distill" / "raw_top100")
+
+    def test_returns_none_when_the_layout_is_unexpected(self):
+        with patch.object(ch, "ARKCLAW_ROOT", Path("/nonexistent-xyz")):
+            self.assertIsNone(ch._raw_top100_root())
+
+
+class RawRankingsReadyTests(unittest.TestCase):
+    def test_detects_present_and_absent_dates(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "2026-08-21").mkdir(parents=True)
-            (root / "2026-08-21" / "full_rank.csv").write_text("code\n", encoding="utf-8")
-            mod = type(sys)("build_tdx_rankings")
-            mod.RAW_TOP100_ROOT = root
-            with patch.dict(sys.modules,
-                            {"workbuddy_distill.scripts.build_tdx_rankings": mod}):
+            (root / "workbuddy_distill" / "raw_top100" / "2026-08-21").mkdir(parents=True)
+            (root / "workbuddy_distill" / "raw_top100" / "2026-08-21"
+             / "full_rank.csv").write_text("code\n", encoding="utf-8")
+            with patch.object(ch, "ARKCLAW_ROOT", root):
                 self.assertTrue(ch._raw_rankings_ready("2026-08-21"))
                 self.assertFalse(ch._raw_rankings_ready("2026-08-24"))
 
@@ -47,24 +76,24 @@ class RawRankingsReadyTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "2026-08-24").mkdir(parents=True)
-            mod = type(sys)("build_tdx_rankings")
-            mod.RAW_TOP100_ROOT = root
-            with patch.dict(sys.modules,
-                            {"workbuddy_distill.scripts.build_tdx_rankings": mod}):
+            (root / "workbuddy_distill" / "raw_top100" / "2026-08-24").mkdir(parents=True)
+            with patch.object(ch, "ARKCLAW_ROOT", root):
                 self.assertFalse(ch._raw_rankings_ready("2026-08-24"))
 
-    def test_falls_through_when_the_module_cannot_be_imported(self):
-        """Unable to tell -> do not block; let the subprocess decide."""
-        def boom(name, *a, **k):
-            if "build_tdx_rankings" in name:
-                raise ImportError(name)
-            return real_import(name, *a, **k)
-
-        import builtins
-        real_import = builtins.__import__
-        with patch.object(builtins, "__import__", side_effect=boom):
+    def test_unresolvable_layout_falls_through_rather_than_blocking(self):
+        with patch.object(ch, "ARKCLAW_ROOT", Path("/nonexistent-xyz")):
             self.assertTrue(ch._raw_rankings_ready("2026-08-24"))
+
+    def test_against_the_real_repo_layout(self):
+        """End-to-end: no patching at all, real ARKCLAW_ROOT on disk."""
+        root = ch._raw_top100_root()
+        if root is None or not root.is_dir():
+            self.skipTest("raw_top100 not present in this checkout")
+        present = sorted(p.name for p in root.iterdir()
+                         if (p / "full_rank.csv").exists())
+        for date in present:
+            self.assertTrue(ch._raw_rankings_ready(date), date)
+        self.assertFalse(ch._raw_rankings_ready("1999-01-01"))
 
 
 class RefreshGuardTests(unittest.TestCase):

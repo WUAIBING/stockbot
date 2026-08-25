@@ -936,6 +936,18 @@ def _load_source_payload() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _raw_top100_root() -> Path | None:
+    """Where build_tdx_rankings writes its per-date ranking directories.
+
+    Derived from ARKCLAW_ROOT rather than imported. The challenger runs with the
+    skill directory as cwd, so `import workbuddy_distill...` raises
+    ModuleNotFoundError there - an earlier version of this guard did exactly
+    that, silently fell through, and left the 75s timeout in place.
+    """
+    root = Path(ARKCLAW_ROOT) / "workbuddy_distill" / "raw_top100"
+    return root if root.parent.is_dir() else None
+
+
 def _raw_rankings_ready(trade_date: str) -> bool:
     """True when raw_top100/<trade_date>/full_rank.csv already exists.
 
@@ -945,12 +957,14 @@ def _raw_rankings_ready(trade_date: str) -> bool:
     call has never once succeeded intraday; it just burns the budget at every
     buy slot and logs a warning. Checking first turns 75 wasted seconds into an
     immediate, explicit failure naming the missing path.
+
+    Returns True when the location cannot be resolved at all, so an unexpected
+    layout falls through to the subprocess rather than blocking every buy.
     """
-    try:
-        from workbuddy_distill.scripts.build_tdx_rankings import RAW_TOP100_ROOT
-    except Exception:
-        return True  # cannot tell - fall through to the subprocess
-    return (RAW_TOP100_ROOT / str(trade_date) / "full_rank.csv").exists()
+    root = _raw_top100_root()
+    if root is None:
+        return True
+    return (root / str(trade_date) / "full_rank.csv").exists()
 
 
 def _refresh_source_payload(expected_trade_date: str) -> tuple[dict[str, Any], str]:
