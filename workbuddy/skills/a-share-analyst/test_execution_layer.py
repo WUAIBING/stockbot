@@ -4578,25 +4578,45 @@ class BuyRefPriceSanityTests(unittest.TestCase):
         self.assertFalse(bad)
 
     def test_buy_stock_blocks_the_order_and_logs_it(self) -> None:
+        """Runs the REAL _write_buy_diagnostic, not a Mock.
+
+        The first version of this test patched it out. A Mock accepts any
+        signature, so it never caught that splatting the sanity dict collides
+        with the positional `reason` parameter - which raised TypeError in
+        production and killed the whole buy round after the block. 688596 on
+        2026-08-25.
+        """
         logged = {}
 
         def capture(action, code, quantity, ref_price, result, extra=None):
             logged.update({"code": code, "qty": quantity, "result": result, "extra": extra or {}})
 
-        with (
-            patch.object(trader, "_load_opening_tradability_payload",
-                         return_value=self._payload("688205", 159.36)),
-            patch.object(trader, "_market_today", return_value="2026-08-24"),
-            patch.object(trader, "_log_trade_api", side_effect=capture),
-            patch.object(trader, "_write_buy_diagnostic"),
-            patch.object(trader, "api_request") as api_mock,
-        ):
-            out = trader.buy_stock("688205", 400, ref_price=22.92)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            diag = str(Path(tmpdir) / "buy_diagnostic.json")
+            with (
+                patch.object(trader, "_load_opening_tradability_payload",
+                             return_value=self._payload("688205", 159.36)),
+                patch.object(trader, "_market_today", return_value="2026-08-24"),
+                patch.object(trader, "_log_trade_api", side_effect=capture),
+                patch.object(trader, "BUY_DIAGNOSTIC_FILE", diag),
+                patch.object(trader, "api_request") as api_mock,
+            ):
+                out = trader.buy_stock("688205", 400, ref_price=22.92)
 
-        api_mock.assert_not_called()
-        self.assertFalse(out["success"])
-        self.assertEqual(out["result_code"], "PRICE_SANITY")
-        self.assertEqual(logged["extra"]["final_outcome"], "price_sanity_rejected")
+            api_mock.assert_not_called()
+            self.assertFalse(out["success"])
+            self.assertEqual(out["result_code"], "PRICE_SANITY")
+            self.assertEqual(logged["extra"]["final_outcome"], "price_sanity_rejected")
+
+            # the diagnostic must actually have been written, with the sanity
+            # detail intact and no argument collision
+            with open(diag, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.assertEqual(payload["reason"], "ref_price_out_of_range")
+            sanity = payload["details"]["price_sanity"]
+            self.assertEqual(sanity["code"], "688205")
+            self.assertAlmostEqual(sanity["reference_price"], 159.36)
+            self.assertGreater(sanity["deviation_pct"], 40.0)
 
 if __name__ == "__main__":
     unittest.main()

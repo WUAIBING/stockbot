@@ -3860,7 +3860,9 @@ def buy_stock(code, quantity, ref_price=None, order_context=None):
             "buy", code, quantity, p, result,
             extra={**order_context, "final_outcome": "price_sanity_rejected", "price_sanity": sanity},
         )
-        _write_buy_diagnostic("ref_price_out_of_range", **sanity)
+        # nest it: sanity carries its own "reason" key, which collides with
+        # _write_buy_diagnostic(reason, **details) when splatted
+        _write_buy_diagnostic("ref_price_out_of_range", price_sanity=sanity)
         return {
             "success": False,
             "result": result,
