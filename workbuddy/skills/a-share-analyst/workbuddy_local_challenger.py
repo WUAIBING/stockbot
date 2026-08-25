@@ -936,10 +936,33 @@ def _load_source_payload() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _raw_rankings_ready(trade_date: str) -> bool:
+    """True when raw_top100/<trade_date>/full_rank.csv already exists.
+
+    refresh_distill_pipeline only short-circuits when this file is present.
+    Without it, ensure_trade_date_rankings() calls build_rankings(), which pulls
+    the whole ~1000-stock universe - minutes of work against a 75s budget. That
+    call has never once succeeded intraday; it just burns the budget at every
+    buy slot and logs a warning. Checking first turns 75 wasted seconds into an
+    immediate, explicit failure naming the missing path.
+    """
+    try:
+        from workbuddy_distill.scripts.build_tdx_rankings import RAW_TOP100_ROOT
+    except Exception:
+        return True  # cannot tell - fall through to the subprocess
+    return (RAW_TOP100_ROOT / str(trade_date) / "full_rank.csv").exists()
+
+
 def _refresh_source_payload(expected_trade_date: str) -> tuple[dict[str, Any], str]:
     if not REFRESH_DISTILL_PIPELINE_SCRIPT.exists():
         raise ChallengerSourceUnavailable(
             f"refresh_distill_pipeline.py 不存在: {REFRESH_DISTILL_PIPELINE_SCRIPT}"
+        )
+    if not _raw_rankings_ready(expected_trade_date):
+        raise ChallengerSourceUnavailable(
+            "raw_top100 数据缺失，盘中无法重建（全市场抓取需数分钟，预算仅 "
+            f"{SOURCE_REFRESH_TIMEOUT_SECONDS}s）: trade_date={expected_trade_date}。"
+            "请确认收盘后的 stockbot-distill-refresh.timer 已安装并成功运行。"
         )
     cmd = [
         sys.executable,
