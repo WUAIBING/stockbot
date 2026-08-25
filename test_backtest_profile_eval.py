@@ -166,5 +166,71 @@ class ReportTests(unittest.TestCase):
         self.assertIn("baseline", text.lower())
 
 
+
+
+class ExitStudyTests(unittest.TestCase):
+    """Measures what the take-profit caps cost, instead of guessing.
+
+    The live policy caps gains at 8/15% and defines no stop. Episodes carry a
+    "profit_truncation" verdict, but nothing had ever measured whether the peak
+    was actually reachable. gap% answers that: large means the caps truncate,
+    small means the peak was never holdable and letting winners run is wrong.
+    """
+
+    def test_empty_input_reports_nothing_not_zero(self):
+        self.assertEqual(ev.exit_study([]), {"n": 0})
+
+    def test_rows_missing_forward_data_are_skipped(self):
+        """A NaN horizon must not be counted as a 0% outcome."""
+        self.assertEqual(ev.exit_study([(None, None, None), (1.0, None, -1.0)]), {"n": 0})
+
+    def test_truncation_gap_is_peak_minus_held(self):
+        # held +2%, but +10% was available along the way
+        out = ev.exit_study([(2.0, 10.0, -1.0)])
+        self.assertAlmostEqual(out["avg_return_pct"], 2.0)
+        self.assertAlmostEqual(out["avg_mfe_pct"], 10.0)
+        self.assertAlmostEqual(out["truncation_gap_pct"], 8.0)
+
+    def test_no_gap_when_the_peak_is_where_it_closed(self):
+        out = ev.exit_study([(5.0, 5.0, -2.0)])
+        self.assertAlmostEqual(out["truncation_gap_pct"], 0.0)
+
+    def test_cap_helps_when_price_peaks_then_gives_it_back(self):
+        """Peak +12%, closed -3%: capping at +8% would have banked the move."""
+        out = ev.exit_study([(-3.0, 12.0, -5.0)], take_profit_pct=8.0)
+        self.assertAlmostEqual(out["avg_return_if_capped_pct"], 8.0)
+        self.assertAlmostEqual(out["cap_vs_hold_pct"], 11.0)
+        self.assertAlmostEqual(out["reached_take_profit_pct"], 100.0)
+
+    def test_cap_hurts_when_the_move_keeps_going(self):
+        """Peak +30%, closed +25%: the cap exits at 8 and forfeits 17."""
+        out = ev.exit_study([(25.0, 30.0, -1.0)], take_profit_pct=8.0)
+        self.assertAlmostEqual(out["avg_return_if_capped_pct"], 8.0)
+        self.assertAlmostEqual(out["cap_vs_hold_pct"], -17.0)
+
+    def test_cap_is_inert_when_the_peak_never_reaches_it(self):
+        out = ev.exit_study([(3.0, 6.0, -2.0)], take_profit_pct=8.0)
+        self.assertAlmostEqual(out["avg_return_if_capped_pct"], 3.0)
+        self.assertAlmostEqual(out["cap_vs_hold_pct"], 0.0)
+        self.assertAlmostEqual(out["reached_take_profit_pct"], 0.0)
+
+    def test_mae_tracks_the_worst_drawdown(self):
+        out = ev.exit_study([(1.0, 2.0, -9.0), (1.0, 2.0, -1.0)])
+        self.assertAlmostEqual(out["avg_mae_pct"], -5.0)
+
+    def test_evaluate_attaches_an_exit_study_per_rule(self):
+        rows = [{
+            "date": "2026-02-01", "ret_5d": 2.0, "mfe_5d": 9.0, "mae_5d": -3.0,
+            "bz_direction": -0.5, "bz_rt_direction": -0.5, "close_vs_ma20": 0.0,
+            "weekly_slope": 6.0, "weekly_align": True, "rsi14": 50.0,
+            "amt_ratio": 1.0, "vol_expand": True, "is_green": True,
+        }]
+        out = ev.evaluate(rows, split_date="2026-01-01")
+        study = out["rules"]["v9_full"]["exit_study"]
+        self.assertEqual(study["n"], 1)
+        self.assertAlmostEqual(study["truncation_gap_pct"], 7.0)
+        self.assertEqual(out["baseline_exit_study"]["n"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

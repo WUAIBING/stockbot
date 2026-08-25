@@ -77,6 +77,17 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return default if math.isnan(result) else result
 
 
+def _opt_float(value: Any) -> float | None:
+    """None when the value is missing - a NaN horizon must not read as 0.0."""
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(result) else result
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -148,6 +159,8 @@ def evaluate(records: Iterable[dict[str, Any]], *, split_date: str,
     buckets: dict[str, dict[str, list[float]]] = {
         name: {"train": [], "holdout": []} for name in rules
     }
+    exits: dict[str, list[tuple[Any, Any, Any]]] = {name: [] for name in rules}
+    baseline_exits: list[tuple[Any, Any, Any]] = []
     baseline: dict[str, list[float]] = {"train": [], "holdout": []}
 
     total = 0
@@ -157,9 +170,14 @@ def evaluate(records: Iterable[dict[str, Any]], *, split_date: str,
         period = "holdout" if date >= split_date else "train"
         ret = _as_float(record.get("ret_5d"))
         baseline[period].append(ret)
+        excursion = (_opt_float(record.get("ret_5d")),
+                     _opt_float(record.get("mfe_5d")),
+                     _opt_float(record.get("mae_5d")))
+        baseline_exits.append(excursion)
         for name, rule in rules.items():
             if rule_matches(rule, record):
                 buckets[name][period].append(ret)
+                exits[name].append(excursion)
 
     per_rule = {}
     for name, rule in rules.items():
@@ -169,6 +187,7 @@ def evaluate(records: Iterable[dict[str, Any]], *, split_date: str,
             "train": summarize(buckets[name]["train"]),
             "holdout": summarize(buckets[name]["holdout"]),
             "unsupported_conditions": unsupported_conditions(rule),
+            "exit_study": exit_study(exits[name]),
         }
 
     return {
@@ -180,8 +199,56 @@ def evaluate(records: Iterable[dict[str, Any]], *, split_date: str,
             "holdout": summarize(baseline["holdout"]),
         },
         "rules": per_rule,
+        "baseline_exit_study": exit_study(baseline_exits),
     }
 
+
+
+# Live exit policy, from v10_moni_trader:
+#   HIGH_PROFIT_TAKE_PROFIT_PCT   = 15.0
+#   MEDIUM_PROFIT_TAKE_PROFIT_PCT = 8.0
+#   holding_sessions              = 5   (time exit)
+#   stop loss                     = none defined
+LIVE_TAKE_PROFIT_PCT = 8.0
+LIVE_HOLD_SESSIONS = 5
+
+
+def exit_study(returns_and_excursions: list[tuple[float, float, float]],
+               *, take_profit_pct: float = LIVE_TAKE_PROFIT_PCT) -> dict[str, Any]:
+    """How much the take-profit cap left on the table, and what a stop would cost.
+
+    Each item is (ret_5d, mfe_5d, mae_5d) for one entry: what holding to the
+    horizon returned, the best unrealised gain along the way, and the worst.
+
+    truncation_gap is the honest version of the profit_truncation label - the
+    average distance between the peak available and what holding actually
+    returned. A large gap means the caps are leaving money behind; a small one
+    means "let winners run" is wrong and the peak was never holdable.
+    """
+    rows = [(r, f, a) for r, f, a in returns_and_excursions
+            if r is not None and f is not None and a is not None]
+    if not rows:
+        return {"n": 0}
+    n = len(rows)
+    rets = [r for r, _, _ in rows]
+    mfes = [f for _, f, _ in rows]
+    maes = [a for _, _, a in rows]
+
+    # what capping at take_profit_pct would have produced: if the peak reached
+    # the cap the trade exits there, otherwise it rides to the horizon
+    capped = [take_profit_pct if f >= take_profit_pct else r for r, f, _ in rows]
+    reached_cap = sum(1 for _, f, _ in rows if f >= take_profit_pct)
+
+    return {
+        "n": n,
+        "avg_return_pct": round(sum(rets) / n, 3),
+        "avg_mfe_pct": round(sum(mfes) / n, 3),
+        "avg_mae_pct": round(sum(maes) / n, 3),
+        "truncation_gap_pct": round((sum(mfes) - sum(rets)) / n, 3),
+        "reached_take_profit_pct": round(reached_cap / n * 100, 1),
+        "avg_return_if_capped_pct": round(sum(capped) / n, 3),
+        "cap_vs_hold_pct": round((sum(capped) - sum(rets)) / n, 3),
+    }
 
 def load_signal_records(path: str | Path) -> list[dict[str, Any]]:
     import csv
@@ -224,6 +291,29 @@ def format_report(result: dict[str, Any]) -> str:
     lines.append("A rule only beats the baseline if its holdout avg% exceeds the baseline "
                  "holdout avg%.")
     lines.append("Train columns are shown to expose overfit, not to be believed.")
+    lines.append("")
+    lines.append("EXIT STUDY  (5-session window, all records)")
+    lines.append("{:<24}{:>7}{:>9}{:>9}{:>9}{:>9}{:>10}".format(
+        "rule", "n", "hold%", "peak%", "worst%", "gap%", "cap8-hold"))
+    lines.append("-" * 84)
+
+    def exit_row(label, study):
+        if not study or not study.get("n"):
+            return "{:<24}{:>7}".format(label[:24], 0)
+        return "{:<24}{:>7}{:>9.2f}{:>9.2f}{:>9.2f}{:>9.2f}{:>10.2f}".format(
+            label[:24], study["n"], study["avg_return_pct"], study["avg_mfe_pct"],
+            study["avg_mae_pct"], study["truncation_gap_pct"], study["cap_vs_hold_pct"])
+
+    lines.append(exit_row("ALL RECORDS (baseline)", result.get("baseline_exit_study", {})))
+    lines.append("-" * 84)
+    for name, stats in ordered:
+        lines.append(exit_row(stats["mode"], stats.get("exit_study", {})))
+    lines.append("-" * 84)
+    lines.append("gap% = peak available minus what holding to the horizon returned.")
+    lines.append("       Large gap => the 8/15% take-profit caps leave money behind.")
+    lines.append("       Small gap => the peak was never holdable; let-winners-run is wrong.")
+    lines.append("cap8-hold = what capping at +8% adds (+) or costs (-) versus holding.")
+    lines.append("worst% = deepest drawdown before the horizon; what a stop would have hit.")
     return "\n".join(lines)
 
 

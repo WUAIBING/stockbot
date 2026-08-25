@@ -356,6 +356,27 @@ class BacktestEngine:
         d["vol_shrink"] = d["amt_ratio"] < cfg.amt_ratio_low
         d["ret_5d"] = (d["close"].shift(-5) / d["close"] - 1) * 100
 
+        # Forward horizons and excursions, for studying the EXIT policy.
+        # ret_5d alone can only score entries. The live strategy caps gains at
+        # HIGH/MEDIUM_PROFIT_TAKE_PROFIT_PCT (15/8) and has no explicit stop, and
+        # its own episodes carry a "profit_truncation" verdict - but nothing has
+        # ever measured how much was actually left on the table.
+        #
+        # mfe = highest unrealised gain during the window -> upside available
+        # mae = deepest unrealised loss during the window -> what a stop would hit
+        #
+        # forward_skip stays at 6, so rows near the end keep NaN for the longer
+        # horizons rather than being dropped. Dropping them would delete exactly
+        # the recent window where 5-minute (bz) data exists.
+        for horizon in (10, 20):
+            d[f"ret_{horizon}d"] = (d["close"].shift(-horizon) / d["close"] - 1) * 100
+
+        for horizon in (5, 10, 20):
+            fwd_high = d["high"].shift(-horizon).rolling(horizon, min_periods=horizon).max()
+            fwd_low = d["low"].shift(-horizon).rolling(horizon, min_periods=horizon).min()
+            d[f"mfe_{horizon}d"] = (fwd_high / d["close"] - 1) * 100
+            d[f"mae_{horizon}d"] = (fwd_low / d["close"] - 1) * 100
+
         wframe = wfeats.get("_frame") if isinstance(wfeats, dict) else None
         if isinstance(wframe, pd.DataFrame) and not wframe.empty:
             # as-of join on the last COMPLETED week strictly before each day,
@@ -449,6 +470,10 @@ class BacktestEngine:
                 "date": str(row["datetime"])[:10],
                 "close": float(row["close"]),
                 "ret_5d": float(row["ret_5d"]),
+                **{col: (None if pd.isna(row.get(col)) else round(float(row[col]), 4))
+                   for col in ("ret_10d", "ret_20d",
+                               "mfe_5d", "mae_5d", "mfe_10d", "mae_10d",
+                               "mfe_20d", "mae_20d")},
                 "label": "winner" if row["ret_5d"] >= cfg.winner_thresh else
                          ("loser" if row["ret_5d"] <= cfg.loser_thresh else "neutral"),
                 "close_vs_ma20": float(row["close_vs_ma20"]) if pd.notna(row["close_vs_ma20"]) else 0.0,
