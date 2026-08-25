@@ -232,5 +232,71 @@ class ExitStudyTests(unittest.TestCase):
         self.assertEqual(out["baseline_exit_study"]["n"], 1)
 
 
+
+
+class MissingFieldTests(unittest.TestCase):
+    """A condition cannot be met by data that does not exist.
+
+    bz is absent for ~99.7% of a multi-year run - pytdx serves only about 25
+    sessions of 5-minute history. The extractor used to emit 0.0 for those, and
+    the evaluator used to default missing numerics to 0.0, so:
+
+        bz_rt_min: -0.2   ->  0.0 >= -0.2  ->  PASSES on a value never observed
+
+    pre_breakout appeared to match 6,070 holdout records on that basis, and the
+    resulting per-rule table was used to claim its win rate underperformed the
+    baseline. It was measuring a default.
+
+    The mirror case is just as wrong in the other direction: bz_lt: -0.3 fails
+    against 0.0, so V9_full looked vanishingly rare rather than unevaluable.
+    """
+
+    def _rec(self, **over):
+        base = {
+            "date": "2026-03-02", "ret_5d": 1.0,
+            "close_vs_ma20": 0.0, "weekly_slope": 6.0, "weekly_align": True,
+            "rsi14": 50.0, "amt_ratio": 1.0, "vol_expand": True, "is_green": True,
+        }
+        base.update(over)
+        return base
+
+    def test_absent_bz_does_not_satisfy_bz_rt_min(self):
+        rule = ev.load_profile()["rules"]["pre_breakout"]
+        self.assertFalse(ev.rule_matches(rule, self._rec()))
+
+    def test_empty_string_bz_does_not_satisfy_bz_rt_min(self):
+        """CSV round-trips a None as an empty field."""
+        rule = ev.load_profile()["rules"]["pre_breakout"]
+        self.assertFalse(ev.rule_matches(rule, self._rec(bz_rt_direction="")))
+
+    def test_present_bz_is_evaluated_normally(self):
+        rule = ev.load_profile()["rules"]["pre_breakout"]
+        ok = self._rec(bz_rt_direction=-0.1, weekly_slope=0.0, close_vs_ma20=0.0,
+                       amt_ratio=1.0, rsi14=50.0)
+        self.assertTrue(ev.rule_matches(rule, ok))
+        bad = dict(ok, bz_rt_direction=-0.9)   # below bz_rt_min
+        self.assertFalse(ev.rule_matches(bad and rule, bad))
+
+    def test_absent_bz_also_fails_bz_lt(self):
+        rule = ev.load_profile()["rules"]["v9_full"]
+        self.assertFalse(ev.rule_matches(rule, self._rec()))
+        self.assertTrue(ev.rule_matches(rule, self._rec(bz_direction=-0.5)))
+
+    def test_rules_without_bz_are_unaffected(self):
+        """vol_breakout has no bz condition and must still match."""
+        rule = ev.load_profile()["rules"]["vol_breakout"]
+        self.assertTrue(ev.rule_matches(rule, self._rec(
+            vol_expand=True, is_green=True, weekly_align=True,
+            rsi14=60.0, close_vs_ma20=5.0)))
+
+    def test_missing_non_bz_field_also_fails(self):
+        """The rule is general: any absent field fails its condition."""
+        rule = ev.load_profile()["rules"]["vol_breakout"]
+        rec = self._rec(vol_expand=True, is_green=True, weekly_align=True,
+                        close_vs_ma20=5.0)
+        rec.pop("rsi14")
+        self.assertFalse(ev.rule_matches(rule, rec))
+
+
 if __name__ == "__main__":
     unittest.main()
