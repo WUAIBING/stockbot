@@ -527,6 +527,36 @@ ADD_POSITION_RESERVE_CASH_MIN_RATIO = 0.08
 ADD_POSITION_NON_AGGRESSIVE_MAX_ITEMS = 2
 ADD_POSITION_UNDERPERFORMING_MODE_SKIP_EDGE = -0.5
 
+# Above this much open profit, stop treating profit as a reason to add. Measured
+# over 9.1M liquid A-share stock-days, forward 10-day return by open profit:
+#
+#     up 3-6%    +0.03 train  +0.16 holdout   <- first add, positive in both
+#     up 6-12%   -0.09        +0.29           <- second add, sign flips
+#     up >12%    -0.94        -0.27           <- consistently bad
+#
+# Previously unbounded: a position up 30% scored exactly the same +2 as one up
+# 6%, so nothing stopped an add at the top. This caps WHEN we add, not how long
+# we hold or how large a position may ultimately become - a winner still runs.
+ADD_POSITION_MAX_PROFIT_PCT = 12.0
+
+# Do not add while the book is nearly empty; open a new name instead.
+#
+# Adds deliberately bypass MAX_POSITION_PCT_NAV and run to 1.70x target, so a
+# big-meat position reaches ~3.4% NAV against 2% for every new one. That is
+# intended - big meat earns more. But the breadth cost of that skew depends
+# entirely on how full the book is, because noise scales as 1/sqrt(effective N)
+# and effective N is 1/sum(w^2):
+#
+#     book                          positions  effective N  lost  noise x
+#     2 held, one big meat                  2          1.6   18%     1.10
+#     25 full, 5 big meat                  25         23.6    6%     1.03
+#
+# The same add costs 18% of breadth on an empty book and 3% on a full one. The
+# existing brake reserves cash for new opportunities, but cash is not scarce
+# here - the account sits ~96% idle - so it never binds. Breadth is the scarce
+# resource, so this gate measures that instead.
+ADD_POSITION_MIN_BOOK_FILL_RATIO = 0.70
+
 EXIT_OK = 0
 EXIT_CONFIG_ERROR = 1
 EXIT_WINDOW_SKIPPED = 2
@@ -10061,12 +10091,18 @@ def _build_big_meat_identity_profile(record=None, *, profit_pct=0.0):
         'score': 0,
         'notes': [],
     }
-    if profit_pct >= ADD_POSITION_BIG_MEAT_EARLY_PROFIT_PCT:
-        profile['score'] += 1
-        profile['notes'].append(f"浮盈起势{profit_pct:+.1f}%")
-    if profit_pct >= ADD_POSITION_BIG_MEAT_PROFIT_PCT:
-        profile['score'] += 1
-        profile['notes'].append(f"浮盈{profit_pct:+.1f}%")
+    if profit_pct > ADD_POSITION_MAX_PROFIT_PCT:
+        # Past the ceiling: keep holding, stop buying more. Forward returns from
+        # here were -0.94 vs baseline on train and -0.27 on holdout.
+        profile['notes'].append(
+            f"浮盈{profit_pct:+.1f}%超加仓上限{ADD_POSITION_MAX_PROFIT_PCT:.0f}%，不再加仓")
+    else:
+        if profit_pct >= ADD_POSITION_BIG_MEAT_EARLY_PROFIT_PCT:
+            profile['score'] += 1
+            profile['notes'].append(f"浮盈起势{profit_pct:+.1f}%")
+        if profit_pct >= ADD_POSITION_BIG_MEAT_PROFIT_PCT:
+            profile['score'] += 1
+            profile['notes'].append(f"浮盈{profit_pct:+.1f}%")
     record = record if isinstance(record, dict) else {}
     tier = _inum(record.get('tier', 0), 0)
     mode = str(record.get('mode', '')).strip()
@@ -11943,6 +11979,18 @@ def do_add_position(dry_run=False):
         round(total_assets * ADD_POSITION_RESERVE_CASH_MIN_RATIO, 2),
     )
     print(f" 新机会预留现金: ¥{reserve_cash:,.0f}")
+
+    total_slots = sum(
+        _inum(cfg.get('max_stocks', 0), 0) for cfg in TIER_CONFIG.values()
+    )
+    fill_ratio = (len(holding) / total_slots) if total_slots > 0 else 1.0
+    if fill_ratio < ADD_POSITION_MIN_BOOK_FILL_RATIO:
+        print(
+            f" [SKIP] 全部加仓跳过: 持仓{len(holding)}/{total_slots}只"
+            f"（{fill_ratio:.0%} < {ADD_POSITION_MIN_BOOK_FILL_RATIO:.0%}），"
+            f"空仓位优先开新票 —— 加仓在满仓时才划算"
+        )
+        return EXIT_NO_ACTION
     # #region debug-point C:add-position-holding-ready
     _dbg_emit(
         'C',
