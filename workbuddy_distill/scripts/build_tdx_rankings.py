@@ -134,10 +134,57 @@ def market_label(market: int) -> str:
     return "SH" if market == 1 else "SZ"
 
 
+RESYNC_LOG: list[dict[str, str]] = []
+
+
+def resync_after_protocol_error(api: TdxHq_API, code: str = "") -> bool:
+    """Rebuild the connection after a failed pytdx call.
+
+    pytdx writes a request then reads a header and a body over one socket. When
+    that read raises, the bytes for the response are still buffered, so the NEXT
+    request reads them as its own - code N+1 receives code N's data and every
+    code after it is shifted by one. Nothing raises again, so the corruption is
+    silent and permanent for the rest of the run.
+
+    This routine walks ~5,200 stocks per trade date, far more requests than any
+    other caller, and its output is the input to the template search, the distill
+    pool and every backtest built on them. The damage is visible in the artifacts:
+    the 2026-08-25 ranking carries 002396 at 7.03 against a real 30.84 and 300083
+    at 3.45 against 13.78, and 002396 reads 29.60 on 08-07 before trading at
+    30.36 on 08-26 - a fall and recovery that never happened.
+
+    A reconnect costs a round trip and loses one stock. Continuing costs every
+    stock after it.
+    """
+    RESYNC_LOG.append({"code": str(code or "")})
+    print(f"[WARN] pytdx protocol error"
+          f"{f' at {code}' if code else ''} - reconnecting to avoid "
+          f"desynchronised responses (resync #{len(RESYNC_LOG)})", flush=True)
+    try:
+        api.disconnect()
+    except Exception:
+        pass
+    for host, port in TDX_HOSTS:
+        try:
+            if api.connect(host, port, time_out=3.0):
+                return True
+        except Exception:
+            pass
+        try:
+            api.disconnect()
+        except Exception:
+            pass
+    print("[ERROR] pytdx reconnect failed on every host - remaining rows "
+          "this run cannot be trusted", flush=True)
+    return False
+
+
 def fetch_daily_frame(api: TdxHq_API, market: int, code: str, bar_count: int) -> pd.DataFrame | None:
     try:
         bars = api.get_security_bars(DAILY_BAR_CATEGORY, market, code, 0, bar_count)
     except Exception:
+        # socket-level failure: the connection is unsafe to reuse
+        resync_after_protocol_error(api, code)
         return None
     if not bars:
         return None
