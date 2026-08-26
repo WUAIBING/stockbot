@@ -458,6 +458,12 @@ ADD_POSITION_PENDING_CLEANUP_BUDGET_SECONDS = 15.0
 ADD_POSITION_PENDING_CANCEL_TIMEOUT_SECONDS = 5.0
 HIGH_PROFIT_TAKE_PROFIT_PCT = 15.0
 MEDIUM_PROFIT_TAKE_PROFIT_PCT = 8.0
+# Take-profit thresholds above are calibrated on the +/-10% main boards. STAR
+# and ChiNext run a +/-20% limit and realise roughly 1.45x / 1.30x the 10-day
+# move, so the same absolute number cuts far deeper into their winners. These
+# factors restore the main board's leash; see _board_take_profit_scale.
+BOARD_TAKE_PROFIT_SCALE_STAR = 1.45
+BOARD_TAKE_PROFIT_SCALE_CHINEXT = 1.30
 ADD_POSITION_BIG_MEAT_EARLY_PROFIT_PCT = 3.0
 ADD_POSITION_BIG_MEAT_PROFIT_PCT = 6.0
 HOLDING_BIG_MEAT_PROMOTE_PROFIT_PCT = 12.0
@@ -2871,6 +2877,33 @@ def _pause_record(record, reason):
         record['build_note'] = f"{note}; {pause_note}" if note else pause_note
     record['last_synced_at'] = _now_str()
     return record
+
+
+def _board_take_profit_scale(code=''):
+    """Volatility scale factor for take-profit thresholds, by board.
+
+    Derived from 10-day forward moves across 9,567 TDX daily files (2023-01
+    onward, turnover >= 20M). Among winning moves, +8% sits at the 73rd
+    percentile on SH main but only the 59th on STAR - the same number is a
+    tighter leash exactly where the moves are largest.
+    """
+    c = str(code or '').strip().zfill(6)
+    if c.startswith('688'):
+        return BOARD_TAKE_PROFIT_SCALE_STAR
+    if c.startswith(('300', '301')):
+        return BOARD_TAKE_PROFIT_SCALE_CHINEXT
+    return 1.0
+
+
+def _take_profit_levels(code=''):
+    """(high, medium) take-profit thresholds scaled to the board.
+
+    An unknown or empty code scales by 1.0, so any caller that cannot supply a
+    code keeps the previous main-board behaviour exactly.
+    """
+    scale = _board_take_profit_scale(code)
+    return (HIGH_PROFIT_TAKE_PROFIT_PCT * scale,
+            MEDIUM_PROFIT_TAKE_PROFIT_PCT * scale)
 
 
 def _uses_single_share_increment(code=''):
@@ -9820,10 +9853,11 @@ def evaluate_signal_decay_detail(api, code, entry_price, buy_mode, *, profit_pct
             except Exception:
                 pass
 
-    if not should_sell and profit_pct >= HIGH_PROFIT_TAKE_PROFIT_PCT and decay_score >= 1:
+    high_tp, medium_tp = _take_profit_levels(code)
+    if not should_sell and profit_pct >= high_tp and decay_score >= 1:
         should_sell = True
         reasons.append(f"高盈利{profit_pct:+.1f}%转弱优先兑现")
-    elif not should_sell and profit_pct >= MEDIUM_PROFIT_TAKE_PROFIT_PCT and decay_score >= 2:
+    elif not should_sell and profit_pct >= medium_tp and decay_score >= 2:
         should_sell = True
         reasons.append(f"中高盈利{profit_pct:+.1f}%且信号转弱")
 
