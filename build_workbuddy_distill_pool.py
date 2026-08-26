@@ -253,7 +253,7 @@ def _fallback_registry_from_search() -> dict[str, Any] | None:
     payload = _read_json_if_exists(TEMPLATE_SEARCH_FILE)
     if not isinstance(payload, dict) or not payload:
         return None
-    eligible = {"priority", "pass", "profit_pass", "prototype"}
+    eligible = {"priority", "pass", "prototype"}
     candidates: list[dict[str, Any]] = []
     for pool_key in ("passed_templates", "prototype_templates", "top_templates"):
         pool = payload.get(pool_key)

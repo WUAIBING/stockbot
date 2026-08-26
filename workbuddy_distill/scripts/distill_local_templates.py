@@ -19,13 +19,13 @@ CORE_WINDOW_DAYS = 20
 BUFFER_WINDOW_DAYS = 5
 VERSION = "workbuddy_distill_v2"
 
-# A template may also be promoted on profitability alone. The hit-rate gates
-# below measure agreement with a separately-computed top-100 ranking - a PROXY
-# for profitability. When the objective itself is directly measured, properly
-# lagged, and clears the highest profit bar in this table, the proxy is
-# redundant. Promotion still requires the prototype top30 bar, so a template
-# with no ranking signal at all cannot qualify on profit alone.
-PROFIT_PASS_MIN_EVALUATION_DAYS = 20
+# A profit-only promotion path (profit_pass) was added on 2026-08-26 to explain
+# "873 trials, 0 pass" and removed the same day. The premise was wrong: 13 of the
+# 25 dates in that window carried prices fabricated by a pytdx socket desync, and
+# 36.8% of all ranking rows were bad. Rebuilt from TDX vipdoc, the same search
+# passes 4 templates on these gates untouched - hit_day_rate went 0.483 -> 0.960
+# and top100_hit_rate 0.045 -> 0.152. The thresholds were never the problem.
+# The template that path promoted still fails these gates on clean data.
 THRESHOLDS = {
     "priority": {"top100_hit_rate_min": 0.18, "top30_hit_rate_min": 0.06, "hit_day_rate_min": 0.70},
     "pass": {"top100_hit_rate_min": 0.15, "top30_hit_rate_min": 0.05, "hit_day_rate_min": 0.70},
@@ -145,7 +145,6 @@ def classify_verdict(
     candidate_avg_return: float = 0.0,
     portfolio_positive_day_rate: float = 0.0,
     profit_priority_score: float = 0.0,
-    evaluation_days: int = 0,
 ) -> tuple[str, str]:
     priority_profit_ok = (
         candidate_win_rate >= 0.58
@@ -182,15 +181,6 @@ def classify_verdict(
         and prototype_profit_ok
     ):
         return "prototype", "observe"
-    if (
-        priority_profit_ok
-        and evaluation_days >= PROFIT_PASS_MIN_EVALUATION_DAYS
-        and top30_hit_rate >= THRESHOLDS["prototype"]["top30_hit_rate_min"]
-    ):
-        # Clears the highest profit bar on a sufficient sample, and is not
-        # ranking-blind. Distinct from "pass" so it stays visible in artifacts
-        # and can be tracked or reverted on its own.
-        return "profit_pass", "promote"
     return "fail", "downgrade"
 
 
@@ -732,7 +722,6 @@ def evaluate_params(
         candidate_avg_return=candidate_avg_return,
         portfolio_positive_day_rate=portfolio_positive_day_rate,
         profit_priority_score=profit_priority_score,
-        evaluation_days=total_days,
     )
     quality_score = round(
         top100_hit_rate * 90
@@ -798,9 +787,7 @@ def evaluate_params(
 
 
 def tier_rank(verdict: str) -> int:
-    # profit_pass sits below a conventional pass - if a template clears both the
-    # ranking and profit gates it is preferred - but above prototype.
-    return {"priority": 5, "pass": 4, "profit_pass": 3, "prototype": 2, "fail": 1}.get(verdict, 0)
+    return {"priority": 4, "pass": 3, "prototype": 2, "fail": 1}.get(verdict, 0)
 
 
 def build_param_grid() -> list[dict[str, Any]]:
@@ -1432,10 +1419,7 @@ def run_distill(*, core_days: int = CORE_WINDOW_DAYS, buffer_days: int = BUFFER_
     )
 
     unique_trials = dedupe_trials(trials)
-    passed_templates = [
-        item for item in unique_trials
-        if item["verdict"] in {"pass", "priority", "profit_pass"}
-    ][:12]
+    passed_templates = [item for item in unique_trials if item["verdict"] in {"pass", "priority"}][:12]
     prototype_templates = [item for item in unique_trials if item["verdict"] == "prototype"][:12]
     top_templates = unique_trials[:12]
 
@@ -1448,7 +1432,6 @@ def run_distill(*, core_days: int = CORE_WINDOW_DAYS, buffer_days: int = BUFFER_
             "unique_template_count": len(unique_trials),
             "passed_template_count": len(passed_templates),
             "priority_template_count": sum(1 for item in unique_trials if item["verdict"] == "priority"),
-            "profit_pass_template_count": sum(1 for item in unique_trials if item["verdict"] == "profit_pass"),
             "window_mode": window_profile["mode"],
             "core_trade_date_count": window_profile["core_trade_date_count"],
             "buffer_trade_date_count": window_profile["buffer_trade_date_count"],

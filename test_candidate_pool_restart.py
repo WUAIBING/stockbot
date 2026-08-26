@@ -1,19 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""The candidate pool froze on 2026-07-17 and stayed frozen.
+"""The candidate pool froze on 2026-07-17. The cause was bad data, not bad gates.
 
 Chain: the template search passed 0 of 873 trials -> the registry's templates
 list was empty -> load_registry() raised -> the pool never rebuilt -> every buy
 round skipped. The fallback that exists precisely for this could not fire: it
-read two evolution artifacts that have never been written on the host.
+read two evolution artifacts that have never been written on the host. Every skip
+printed a routine-looking [WARN] and returned EXIT_NO_ACTION, so nothing
+escalated for 37 days.
 
-Every skip printed a routine-looking [WARN] and returned EXIT_NO_ACTION, which
-the schedule treats as success, so nothing ever escalated.
+A profit-only promotion path was added on 2026-08-26 to explain the "0 of 873",
+on the reasoning that the hit-rate gates must be miscalibrated against
+profitability. That reasoning was wrong, and these tests now pin why.
 
-BEST below holds the real metrics of the best of those 873 trials. It clears the
-highest profit bar in the table (profit_priority_score 108.9 >= 108) at a 58.3%
-win rate and +1.68% one-day forward return, and was discarded for not matching a
-top-100 ranking often enough.
+13 of the 25 dates in that window carried prices fabricated by a pytdx socket
+desync; 36.8% of all ranking rows were bad (58,619 of 159,415). Rebuilt from TDX
+vipdoc, the SAME search on the SAME gates passes 4 templates:
+
+    metric            corrupt   clean    gate
+    top100_hit_rate     0.045   0.152    0.15 (pass)
+    top30_hit_rate      0.033   0.098    0.05
+    hit_day_rate        0.483   0.960    0.70
+    passed_templates        0       5
+
+The thresholds were never the problem. The template the profit path promoted,
+gapmix_head5_skip35_end40, still fails these gates on clean data (top100 0.080,
+hit_day 0.812), so that path promoted something the corrected evidence rejects.
+
+What survives from that change and is still needed: the fallback repointed at an
+artifact that actually exists, and the staleness alarm.
 """
 
 from __future__ import annotations
@@ -30,8 +45,19 @@ sys.path.insert(0, str(ROOT / "workbuddy_distill" / "scripts"))
 
 import distill_local_templates as dlt  # noqa: E402
 
-# the actual best trial: gapmix_head5_skip35_end4
-BEST = dict(
+# the best trial as measured on CLEAN data: gapmix_head10_skip20_end35
+CLEAN_BEST = dict(
+    top100_hit_rate=0.152,
+    top30_hit_rate=0.098,
+    hit_day_rate=0.960,
+    candidate_win_rate=0.560,
+    candidate_avg_return=1.400,
+    portfolio_positive_day_rate=0.740,
+    profit_priority_score=95.9,
+)
+
+# the same window measured on CORRUPT data, which produced "0 of 873"
+CORRUPT_BEST = dict(
     top100_hit_rate=0.0451,
     top30_hit_rate=0.0332,
     hit_day_rate=0.4830,
@@ -39,12 +65,11 @@ BEST = dict(
     candidate_avg_return=1.6819,
     portfolio_positive_day_rate=0.7784,
     profit_priority_score=108.9016,
-    evaluation_days=24,
 )
 
 
-def verdict(**over):
-    kw = dict(BEST)
+def verdict(metrics, **over):
+    kw = dict(metrics)
     kw.update(over)
     return dlt.classify_verdict(
         kw.pop("top100_hit_rate"),
@@ -54,83 +79,64 @@ def verdict(**over):
     )
 
 
-class ProfitPassTests(unittest.TestCase):
-    def test_the_blocked_template_is_now_promoted(self):
-        self.assertEqual(verdict(), ("profit_pass", "promote"))
+class CleanDataPassesTheOriginalGates(unittest.TestCase):
+    def test_the_best_clean_template_passes(self):
+        """4 templates reached 'pass' on clean data with no gate change."""
+        self.assertEqual(verdict(CLEAN_BEST), ("pass", "promote"))
 
-    def test_it_still_fails_every_ranking_gate(self):
-        """Promotion is on profit; the ranking gates genuinely are not met."""
-        self.assertLess(
-            BEST["top100_hit_rate"],
-            dlt.THRESHOLDS["prototype"]["top100_hit_rate_min"],
-        )
-        self.assertLess(
-            BEST["hit_day_rate"],
-            dlt.THRESHOLDS["prototype"]["hit_day_rate_min"],
-        )
+    def test_the_same_window_failed_on_corrupt_data(self):
+        """Why the outage looked like a threshold problem."""
+        self.assertEqual(verdict(CORRUPT_BEST)[0], "fail")
 
-    def test_a_small_sample_cannot_promote(self):
-        """A lucky short window must not restart trading."""
-        self.assertEqual(verdict(evaluation_days=5)[0], "fail")
+    def test_corrupt_data_failed_on_ranking_not_profit(self):
+        """Its profit score was the HIGHEST in the table - hence the wrong turn."""
+        self.assertGreaterEqual(CORRUPT_BEST["profit_priority_score"], 108)
+        self.assertLess(CORRUPT_BEST["top100_hit_rate"],
+                        dlt.THRESHOLDS["prototype"]["top100_hit_rate_min"])
+        self.assertLess(CORRUPT_BEST["hit_day_rate"],
+                        dlt.THRESHOLDS["prototype"]["hit_day_rate_min"])
+
+
+class ProfitOnlyPromotionIsGone(unittest.TestCase):
+    def test_no_verdict_can_be_profit_pass(self):
+        """A high profit score alone must not promote anything."""
+        self.assertEqual(verdict(CORRUPT_BEST)[0], "fail")
         self.assertEqual(
-            verdict(evaluation_days=dlt.PROFIT_PASS_MIN_EVALUATION_DAYS - 1)[0], "fail"
-        )
+            verdict(CORRUPT_BEST, profit_priority_score=200.0)[0], "fail")
+
+    def test_tier_rank_has_no_profit_pass(self):
+        self.assertEqual(dlt.tier_rank("profit_pass"), 0)
+        self.assertEqual(dlt.tier_rank("priority"), 4)
+        self.assertEqual(dlt.tier_rank("pass"), 3)
+        self.assertEqual(dlt.tier_rank("prototype"), 2)
+        self.assertEqual(dlt.tier_rank("fail"), 1)
+
+    def test_the_promoted_template_still_fails_on_clean_data(self):
+        """gapmix_head5_skip35_end40, measured clean: top100 0.080, hit_day 0.812."""
         self.assertEqual(
-            verdict(evaluation_days=dlt.PROFIT_PASS_MIN_EVALUATION_DAYS)[0],
-            "profit_pass",
-        )
+            verdict(CLEAN_BEST, top100_hit_rate=0.080, top30_hit_rate=0.049,
+                    hit_day_rate=0.812, profit_priority_score=108.0)[0],
+            "fail")
 
-    def test_ranking_blind_templates_cannot_promote(self):
-        """Profit-first is not ranking-blind: the prototype top30 bar applies."""
-        self.assertEqual(verdict(top30_hit_rate=0.0)[0], "fail")
-        self.assertEqual(verdict(top30_hit_rate=0.02)[0], "fail")
+    def test_the_constant_is_removed(self):
+        self.assertFalse(hasattr(dlt, "PROFIT_PASS_MIN_EVALUATION_DAYS"))
 
-    def test_merely_good_profit_is_not_enough(self):
-        """The bar is the PRIORITY profit gate, not a lowered one.
-
-        Second place in the real search scored 93.3 - it must not promote.
-        """
+    def test_conventional_verdicts_still_work(self):
         self.assertEqual(
-            verdict(
-                profit_priority_score=93.3,
-                candidate_win_rate=0.557,
-                candidate_avg_return=0.850,
-                portfolio_positive_day_rate=0.739,
-            )[0],
-            "fail",
-        )
-
-    def test_conventional_verdicts_are_unchanged(self):
-        """A template meeting the ranking gates classifies exactly as before."""
+            verdict(CLEAN_BEST, top100_hit_rate=0.20, top30_hit_rate=0.07,
+                    hit_day_rate=0.75, candidate_win_rate=0.60,
+                    candidate_avg_return=2.5, portfolio_positive_day_rate=0.60)[0],
+            "priority")
         self.assertEqual(
-            verdict(top100_hit_rate=0.20, top30_hit_rate=0.07, hit_day_rate=0.75)[0],
-            "priority",
-        )
-        self.assertEqual(
-            verdict(top100_hit_rate=0.16, top30_hit_rate=0.055, hit_day_rate=0.72)[0],
-            "pass",
-        )
-
-    def test_weak_profit_and_weak_ranking_still_fails(self):
-        self.assertEqual(
-            verdict(
-                candidate_win_rate=0.30,
-                candidate_avg_return=-1.0,
-                portfolio_positive_day_rate=0.20,
-                profit_priority_score=40.0,
-            )[0],
-            "fail",
-        )
-
-    def test_tier_ordering(self):
-        r = dlt.tier_rank
-        self.assertGreater(r("priority"), r("pass"))
-        self.assertGreater(r("pass"), r("profit_pass"))
-        self.assertGreater(r("profit_pass"), r("prototype"))
-        self.assertGreater(r("prototype"), r("fail"))
+            verdict(CLEAN_BEST, top100_hit_rate=0.11, top30_hit_rate=0.04,
+                    hit_day_rate=0.62, candidate_win_rate=0.48,
+                    candidate_avg_return=1.2, profit_priority_score=80.0)[0],
+            "prototype")
 
 
 class SearchFallbackTests(unittest.TestCase):
+    """Repointed at an artifact that exists. This half of the change stands."""
+
     def setUp(self):
         import build_workbuddy_distill_pool as b
 
@@ -155,22 +161,26 @@ class SearchFallbackTests(unittest.TestCase):
             "verdict": verdict_value,
         }
 
-    def test_promoted_template_is_recovered(self):
+    def test_a_passing_template_is_recovered(self):
         self.write(
             {
-                "passed_templates": [self.entry("gapmix_head5_skip35_end4", "profit_pass")],
+                "passed_templates": [self.entry("gapmix_head10_skip20_end35", "pass")],
                 "top_templates": [],
                 "window_profile": {"mode": "core_plus_buffer"},
             }
         )
         reg = self.b._fallback_registry_from_search()
         self.assertIsNotNone(reg)
-        self.assertEqual(reg["champion_template_name"], "gapmix_head5_skip35_end4")
-        self.assertEqual(len(reg["templates"]), 1)
+        self.assertEqual(reg["champion_template_name"], "gapmix_head10_skip20_end35")
         self.assertEqual(reg["window"], {"mode": "core_plus_buffer"})
 
+    def test_profit_pass_is_no_longer_eligible(self):
+        """That verdict cannot be produced; it must not be honoured either."""
+        self.write({"passed_templates": [self.entry("stale", "profit_pass")],
+                    "top_templates": []})
+        self.assertIsNone(self.b._fallback_registry_from_search())
+
     def test_a_search_that_rejected_everything_still_fails(self):
-        """The fallback must not trade on a template the search called fail."""
         self.write(
             {
                 "passed_templates": [],
@@ -196,7 +206,7 @@ class SearchFallbackTests(unittest.TestCase):
         self.assertEqual(reg["champion_template_name"], "proto")
 
     def test_entries_without_params_or_metrics_are_skipped(self):
-        bad = {"template_name": "bad", "verdict": "profit_pass"}
+        bad = {"template_name": "bad", "verdict": "pass"}
         self.write({"passed_templates": [bad], "top_templates": []})
         self.assertIsNone(self.b._fallback_registry_from_search())
 
@@ -215,6 +225,8 @@ class SearchFallbackTests(unittest.TestCase):
 
 
 class StalenessTests(unittest.TestCase):
+    """The alarm. This half of the change stands too."""
+
     def setUp(self):
         sys.path.insert(0, str(ROOT / "workbuddy" / "skills" / "a-share-analyst"))
         import workbuddy_local_challenger as c
