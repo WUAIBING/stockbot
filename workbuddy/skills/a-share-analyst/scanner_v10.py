@@ -479,6 +479,40 @@ def get_stock_list():
     cons = cons.drop_duplicates(subset=["market", "code"]).reset_index(drop=True)
     return cons[["code", "name", "market"]].copy()
 
+_PRICE_MISMATCH_LOG = []
+
+
+def _board_daily_limit_pct(code):
+    """Daily price-limit ceiling per board, used to bound a plausible gap."""
+    c = str(code or "").zfill(6)
+    if c.startswith(("688", "300", "301")):
+        return 20.0
+    if c.startswith(("43", "83", "87", "920")):
+        return 30.0
+    return 10.0
+
+
+def _price_pair_agrees(code, quote_price, bar_close):
+    """True when two independent price sources are close enough to trust.
+
+    The realtime quote and the last daily bar can legitimately differ - the bar
+    may be the previous session's close while the quote is live - so the bound
+    is the board's daily limit with headroom, not equality. What it catches is
+    an order-of-magnitude disagreement, which means one source is describing a
+    different security.
+
+    Missing or non-positive values return True: this is a mismatch detector,
+    not a completeness check, and it must not silently drop the whole universe
+    if a field is absent.
+    """
+    q = _to_float(quote_price, 0.0)
+    b = _to_float(bar_close, 0.0)
+    if q <= 0 or b <= 0:
+        return True
+    tolerance = max(_board_daily_limit_pct(code) * 2.0, 25.0)
+    return abs(q - b) / b * 100.0 <= tolerance
+
+
 def fetch_daily_bars(api, market, code, count=250):
     try:
         bars = api.get_security_bars(9, market, code, 0, count)
@@ -1515,6 +1549,19 @@ def main(argv=None):
                 bz_dir, bz_rt, weekly_align, weekly_slope, ma20_off,
                 vol_exp, rsi, is_green, amt_r
             )
+            # entry_price comes from the realtime quote; d.iloc[-1] comes from a
+            # separate daily-bar request. Two independent round trips - if they
+            # disagree by more than the board can move in a day, one is wrong and
+            # this row must not become a tradable candidate.
+            bar_close = _to_float(last.get("close"), 0.0)
+            if not _price_pair_agrees(code, last_close, bar_close):
+                _PRICE_MISMATCH_LOG.append({
+                    "code": code, "name": name,
+                    "quote_price": round(_to_float(last_close, 0.0), 4),
+                    "bar_close": round(bar_close, 4),
+                })
+                continue
+
             results.append({
                 "code": code,
                 "name": name,

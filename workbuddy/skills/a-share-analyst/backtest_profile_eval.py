@@ -114,7 +114,14 @@ def rule_matches(rule: dict[str, Any], record: dict[str, Any]) -> bool:
             if _as_bool(record.get(field)) != bool(threshold):
                 return False
             continue
-        value = _as_float(record.get(field))
+        value = _opt_float(record.get(field))
+        if value is None:
+            # A condition cannot be satisfied by a field the data does not have.
+            # bz is absent for ~99.7% of records (pytdx serves ~25 sessions of
+            # 5-minute history), and treating that as 0.0 made bz_rt_min: -0.2
+            # pass trivially - pre_breakout appeared to match 6,070 holdout rows
+            # it had never actually seen a buy-zone reading for.
+            return False
         limit = _as_float(threshold)
         if op == "lt" and not value < limit:
             return False

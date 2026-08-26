@@ -408,7 +408,11 @@ class BacktestEngine:
         eleven v10 rules gate on these, and without them those rules cannot be
         evaluated at all.
         """
-        feats: dict[str, Any] = {"bz_direction": 0.0, "bz_rt_direction": 0.0, "bz_vol_ratio": 1.0}
+        # None, not 0.0. pytdx serves only ~25 sessions of 5-minute history, so
+        # bz is absent for ~99.7% of a multi-year daily run. Defaulting to 0.0
+        # silently satisfies conditions like bz_rt_min: -0.2 (0.0 >= -0.2), so a
+        # rule gating on bz appears to match thousands of rows it never saw.
+        feats: dict[str, Any] = {"bz_direction": None, "bz_rt_direction": None, "bz_vol_ratio": None}
         if day_bars is None or len(day_bars) == 0:
             return feats
         d = day_bars

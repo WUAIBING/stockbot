@@ -267,10 +267,24 @@ class IntradayBuyZoneTests(unittest.TestCase):
             "open": closes, "close": closes, "vol": [100.0] * len(closes),
         })
 
-    def test_empty_input_is_neutral_not_missing(self):
+    def test_empty_input_is_missing_not_neutral(self):
+        """Absent 5-minute data must be None, never 0.0.
+
+        This test previously asserted 0.0 - encoding the bug. A 0.0 default
+        silently satisfies bz_rt_min: -0.2 (0.0 >= -0.2), so rules gating on
+        the buy zone matched thousands of records where it was never observed.
+        pytdx serves ~25 sessions of 5-minute history against 3+ years of daily
+        bars, so this is the common case, not an edge case.
+        """
         feats = BacktestEngine.compute_intraday_buy_zone(None)
-        self.assertEqual(feats["bz_direction"], 0.0)
-        self.assertEqual(feats["bz_rt_direction"], 0.0)
+        self.assertIsNone(feats["bz_direction"])
+        self.assertIsNone(feats["bz_rt_direction"])
+
+    def test_too_few_bars_is_also_missing(self):
+        """One bar in the window is not enough to compute a direction."""
+        bars = self._bars([100.0], [14], [30])
+        feats = BacktestEngine.compute_intraday_buy_zone(bars)
+        self.assertIsNone(feats["bz_direction"])
 
     def test_rising_buy_zone_is_positive(self):
         bars = self._bars([100.0, 101.0, 102.0, 103.0],
