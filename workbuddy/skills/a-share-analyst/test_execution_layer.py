@@ -2041,7 +2041,10 @@ class SmartSellApplyTests(unittest.TestCase):
         self.assertEqual(observed["family"], socket.AF_INET)
 
     def test_do_sell_core_refreshes_live_state_before_writing_artifacts(self) -> None:
-        old_date = (datetime.now() - timedelta(days=6)).strftime("%Y-%m-%d")
+        # Past MAX_HOLD_DAYS (10). Was 6, which tripped the old T+5 backstop; the
+        # point of this test is that crossing the backstop refreshes live state
+        # before artifacts are written, not the specific threshold.
+        old_date = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
         holding_record = {
             "code": "688206",
             "name": "概伦电子",

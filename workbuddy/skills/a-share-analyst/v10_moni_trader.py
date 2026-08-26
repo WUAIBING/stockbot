@@ -617,7 +617,28 @@ MIN_POSITION_PCT_NAV = 0.5  # prevent dust trades below this
 # === TUNED ENTRY STOPS (added 2026-07-22) ===
 # Tighten intraday stop-loss so losers don't run to -8% (worst observed).
 # 002174 lost -8.13% with no stop; tightening to -3% would have saved ¥622 on that one trade.
-INTRADAY_HARD_STOP_PCT = -3.0  # was effectively unlimited
+# Was defined at -3.0 on 2026-07-22 and never referenced anywhere, so nothing
+# has ever stopped a loser. Measured over 9.1M liquid stock-days on a 10-day
+# hold, net of cost:
+#
+#     stop    mean   vs no stop   stopped out
+#     none   -0.04
+#      -3%   +0.06        +0.10          67%
+#      -5%   +0.05        +0.09          50%
+#      -8%   +0.02        +0.06          30%
+#     -12%   +0.00        +0.04          15%
+#
+# Every level tests positive, but -3% fires on two trades in three - that is a
+# primary exit, not a backstop, and the measurement charges the round trip only
+# once so it flatters a rule that forces constant redeployment. -8% fires on 30%
+# and still adds +0.06pp. Wired into do_smart_sell as the first rule checked.
+INTRADAY_HARD_STOP_PCT = -8.0
+
+# T+5 was the backstop while the decay rules did the real work. With those
+# silenced this becomes the primary exit, and the horizon curve is clear: net of
+# cost a 10-session hold returns +5.60pp/yr of excess against +3.80pp at 5 and
+# -0.75pp at 3, because a fixed cost amortises over the hold.
+MAX_HOLD_DAYS = 10
 
 # 仓位配置 — 分批建仓，不满仓！
 # position_pct: 每只股票满仓目标金额 = 总资产 × position_pct%
@@ -2544,10 +2565,15 @@ def _sync_big_meat_position_split(record, *, qty=None, desired_core_ratio=None, 
         return record
 
     existing_core = _inum(record.get('big_meat_core_qty', 0), 0)
+    # Hoisted out of the branch below: the else path reuses an existing core and
+    # never entered it, yet both are read again further down. That raised
+    # UnboundLocalError on every reused core - introduced when the sell path was
+    # made board-aware and missed because test_smart_sell_regressions was not in
+    # the sweep.
+    split_code = record.get('code', '')
+    split_lot = _sell_min_lot(split_code)
     if reset_core or existing_core <= 0:
         core_ratio = max(0.0, min(0.95, _fnum(desired_core_ratio, BIG_MEAT_CORE_HOLD_RATIO)))
-        split_code = record.get('code', '')
-        split_lot = _sell_min_lot(split_code)
         if total_qty < split_lot:
             core_qty = total_qty
         else:
@@ -9791,9 +9817,17 @@ def evaluate_signal_decay_detail(api, code, entry_price, buy_mode, *, profit_pct
                 if high > close * 1.01 and close < open_:
                     upper_shadow = (high - close) / close * 100
                     if upper_shadow > 1.0:
+                        # Weight 0: still recorded, no longer causes an exit.
+                        # This fired 97 times in 40 days, the single most common
+                        # reason for selling, yet forward returns after it fires
+                        # were +0.17 vs baseline on 2015-2023 and -0.03 on
+                        # 2024-2026 - no reliable signal in either direction.
+                        # Closing off the high is also the FAVOURABLE zone: by
+                        # range position, deciles 3-7 all beat baseline and only
+                        # the top decile (closing at the high) loses badly.
                         add_evidence(
                             'daily_candle_reversal',
-                            2,
+                            0,
                             f"冲高回落上影线{upper_shadow:.1f}%",
                             provisional=daily_provisional,
                         )
@@ -9823,12 +9857,23 @@ def evaluate_signal_decay_detail(api, code, entry_price, buy_mode, *, profit_pct
                     c1 = ddf.iloc[-2]['close']
                     c2 = ddf.iloc[-3]['close']
                     if c0 < c1 < c2:
+                        # Weight 0 AND structural False. The structural flag is
+                        # read independently of score - it sets
+                        # has_confirmed_structural_break, which drives a hard
+                        # exit regardless of weight - so zeroing the score alone
+                        # would not have silenced this.
+                        # Fired 45 times in 40 days; forward returns after it
+                        # were +0.23 vs baseline on train and -0.20 on holdout.
+                        # Sign flips, both inside the noise floor.
+                        # 周线slope转负...趋势终结 keeps its structural flag: a
+                        # broken weekly trend is a different claim from two down
+                        # days.
                         add_evidence(
                             'daily_decline_sequence',
-                            1,
+                            0,
                             "连跌2日",
                             provisional=daily_provisional,
-                            structural=True,
+                            structural=False,
                         )
         except Exception:
             pass
@@ -11193,9 +11238,16 @@ def _do_sell_core(smart=False, dry_run=False):
         sell_reason = None
         sell_action = ''
 
-        # ── 规则1: T+5兜底 ──
-        if hold_days >= 5:
-            sell_reason = f"T+5到期(持仓{hold_days}天)"
+        # ── 规则0: 硬止损 ──
+        # Checked before the time backstop: with the decay rules silenced this
+        # is the only thing that exits a losing position early.
+        if pnl_pct <= INTRADAY_HARD_STOP_PCT:
+            sell_reason = f"硬止损{pnl_pct:+.1f}%(上限{INTRADAY_HARD_STOP_PCT:.0f}%)"
+            sell_action = BIG_MEAT_ACTION_HARD_EXIT
+
+        # ── 规则1: T+N兜底 ──
+        elif hold_days >= MAX_HOLD_DAYS:
+            sell_reason = f"T+{MAX_HOLD_DAYS}到期(持仓{hold_days}天)"
             sell_action = BIG_MEAT_ACTION_HARD_EXIT
 
         # ── 规则2: 信号衰减 → 提前卖出（smart模式） ──
