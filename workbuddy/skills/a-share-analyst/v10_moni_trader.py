@@ -4200,10 +4200,21 @@ def sell_stock(code, quantity, ref_price=None, order_context=None, limit_fallbac
 
 
 def execute_trade_action(action, code, quantity, *, ref_price=None, execution_phase='primary', strategy_action='',
-                         limit_fallback_price=None, price_dec=2):
+                         limit_fallback_price=None, price_dec=2, exit_reason=''):
+    # exit_reason rides into the trade API log so an exit can be judged after the
+    # fact. Over 40 days the exits were 97x 冲高回落 and 45x 连跌2日 against 7
+    # T+5 expiries, yet neither of those two triggers shows a reliable forward
+    # signal: measured across 9.1M stock-days, returns AFTER they fire were
+    # +0.17/+0.23 versus baseline on the train window and -0.03/-0.20 on the
+    # holdout. Sign flips, magnitudes inside the noise floor - which means we
+    # cannot currently say whether these exits earn their keep.
+    #
+    # The missing half is the counterfactual: what the stock did after we sold.
+    # Logging the reason here is what makes evaluate_exit_rules.py possible.
     order_context = {
         'execution_phase': str(execution_phase or '').strip(),
         'strategy_action': str(strategy_action or action or '').strip(),
+        'exit_reason': str(exit_reason or '').strip()[:200],
     }
     trade_fn = buy_stock if str(action).strip() == 'buy' else sell_stock
     if str(action).strip() == 'buy':
@@ -11365,6 +11376,7 @@ def _do_sell_core(smart=False, dry_run=False):
                     strategy_action=action,
                     limit_fallback_price=cur_price,
                     price_dec=_inum((pos or {}).get('price_dec', 0), 2) or 2,
+                    exit_reason=sell_reason,
                 )
                 if trade_result['success']:
                     if sell_action == BIG_MEAT_ACTION_RISK_TRIM:
