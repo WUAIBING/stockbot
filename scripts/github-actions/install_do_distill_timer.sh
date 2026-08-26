@@ -39,6 +39,15 @@ User=$RUN_AS_USER
 Group=$RUN_AS_GROUP
 WorkingDirectory=$REPO_ROOT
 EnvironmentFile=-$ENV_FILE
+# trading_calendar.latest_workbuddy_source_trade_date compares a NAIVE
+# datetime.now() against WORKBUDDY_SOURCE_READY_TIME (15:20 China time). The
+# droplet runs in UTC, so at this timer's 07:30 UTC fire moment the comparison
+# saw 07:30 < 15:20 and resolved to the PREVIOUS trading day - which already
+# existed, so ensure_trade_date_rankings short-circuited on already_exists and
+# the run did nothing in 11 seconds. raw_top100/2026-08-25 was never built.
+# Pinning the process to market time makes the naive comparison mean what the
+# calendar module assumes throughout.
+Environment=TZ=Asia/Shanghai
 # A full-universe fetch takes minutes; give it room but never let it run into
 # the next session.
 TimeoutStartSec=3600
