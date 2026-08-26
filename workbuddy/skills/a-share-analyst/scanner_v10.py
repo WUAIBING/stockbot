@@ -480,6 +480,93 @@ def get_stock_list():
     return cons[["code", "name", "market"]].copy()
 
 _PRICE_MISMATCH_LOG = []
+_TRUSTED_MISMATCH_LOG = []
+
+# Written at the open by the tradability pass, which does not go through pytdx.
+TRUSTED_PRICE_FILE = DATA_DIR / "opening_tradability_latest.json"
+_TRUSTED_PRICE_CACHE = {"loaded": False, "prices": None, "trade_date": ""}
+
+
+def _load_trusted_reference_prices(expected_trade_date=None):
+    """last_close per code from the opening tradability snapshot.
+
+    _price_pair_agrees compares the realtime quote against the last daily bar,
+    but both arrive through the same pytdx session. When that session returns
+    wrong-but-consistent data for a security the two agree, the check passes,
+    and the row becomes a tradable candidate.
+
+    That is not hypothetical. On 2026-08-26 it let 69 of 116 scanned rows
+    through carrying prices up to 30x wrong - 300083 at 422.33 against a real
+    13.78, 688630 at 30.05 against a real 415.00 - while the mismatch log stayed
+    empty. Two independent sources agreed on the true prices for all 116 rows:
+    this snapshot, and TDX desktop's own vipdoc files.
+
+    Only a source outside pytdx can catch that class of fault, so this is
+    deliberately read from disk rather than fetched.
+
+    Returns None when the snapshot is unusable, which disables the check rather
+    than dropping the universe.
+    """
+    if _TRUSTED_PRICE_CACHE["loaded"]:
+        return _TRUSTED_PRICE_CACHE["prices"]
+    _TRUSTED_PRICE_CACHE["loaded"] = True
+    payload = _read_json_object(TRUSTED_PRICE_FILE)
+    if not isinstance(payload, dict) or not payload:
+        print(f"[WARN] trusted price snapshot unavailable: {TRUSTED_PRICE_FILE} "
+              "- scan price validation disabled this run")
+        return None
+    trade_date = str(payload.get("trade_date", "")).strip()
+    if expected_trade_date and trade_date != str(expected_trade_date):
+        # A previous session's closes are a legitimate reason to differ, so a
+        # stale snapshot must not be used to reject today's rows.
+        print(f"[WARN] trusted price snapshot is for {trade_date or 'unknown'}, "
+              f"expected {expected_trade_date} - scan price validation disabled")
+        return None
+    records = payload.get("records", [])
+    if not isinstance(records, list) or not records:
+        print("[WARN] trusted price snapshot has no records "
+              "- scan price validation disabled this run")
+        return None
+    prices = {}
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code", "")).strip().zfill(6)
+        if not code:
+            continue
+        for field in ("last_close", "last_price", "open_price"):
+            value = _to_float(item.get(field), 0.0)
+            if value > 0:
+                prices[code] = value
+                break
+    if not prices:
+        print("[WARN] trusted price snapshot carried no usable prices "
+              "- scan price validation disabled this run")
+        return None
+    _TRUSTED_PRICE_CACHE["prices"] = prices
+    _TRUSTED_PRICE_CACHE["trade_date"] = trade_date
+    print(f"[INFO] trusted price reference loaded: {len(prices)} codes "
+          f"(trade_date={trade_date})")
+    return prices
+
+
+def _trusted_price_disagrees(code, price, reference_prices):
+    """True when a scanned price is impossible against the trusted reference.
+
+    The bound is the board's daily limit with headroom - the same shape the
+    order layer uses - so an ordinary intraday move never trips it. A code the
+    snapshot does not cover is not judged.
+    """
+    if not reference_prices:
+        return False
+    px = _to_float(price, 0.0)
+    if px <= 0:
+        return False
+    reference = _to_float(reference_prices.get(str(code).strip().zfill(6)), 0.0)
+    if reference <= 0:
+        return False
+    tolerance = max(_board_daily_limit_pct(code) * 2.0, 25.0)
+    return abs(px - reference) / reference * 100.0 > tolerance
 
 
 def _board_daily_limit_pct(code):
@@ -1484,6 +1571,10 @@ def main(argv=None):
 
         stocks = get_stock_list()
         print(f"CSI1000: {len(stocks)} stocks, pytdx connected\n")
+        # Loaded once per run, from disk, before any pytdx data is trusted.
+        trusted_prices = _load_trusted_reference_prices(
+            _as_market_datetime(run_time).date().isoformat()
+        )
         print("Phase 1: Dynamic amount filter (市场冷热自适应)...")
         amt_list = _collect_amount_snapshot(api, stocks)
         filtered, total_amt_yi, market_regime, amount_threshold = _select_amount_candidates(amt_list)
@@ -1559,6 +1650,17 @@ def main(argv=None):
                     "code": code, "name": name,
                     "quote_price": round(_to_float(last_close, 0.0), 4),
                     "bar_close": round(bar_close, 4),
+                })
+                continue
+            # Both values above come from the same pytdx session, so they agree
+            # whenever that session is consistently wrong. This second check is
+            # against a source outside pytdx and is what actually catches it.
+            if _trusted_price_disagrees(code, last_close, trusted_prices):
+                _TRUSTED_MISMATCH_LOG.append({
+                    "code": code, "name": name,
+                    "scan_price": round(_to_float(last_close, 0.0), 4),
+                    "trusted_price": round(
+                        _to_float(trusted_prices.get(str(code).zfill(6)), 0.0), 4),
                 })
                 continue
 
