@@ -623,12 +623,41 @@ INTRADAY_HARD_STOP_PCT = -3.0  # was effectively unlimited
 # position_pct: 每只股票满仓目标金额 = 总资产 × position_pct%
 # initial_build_pct: 首次建仓比例（T+0买入时的比例，留子弹给T+1做反T或加仓）
 # 只有超级大行情（V9_full+板块共振+量价齐升）才允许100%首仓
+def _max_stocks_env(tier, default):
+    """Per-tier slot count, overridable without a deploy.
+
+    Breadth is the binding constraint on this book, not signal quality. With a
+    ~10.4pp spread on a single 10-day A-share hold, the noise on an annual
+    result is sd/sqrt(positions) - so the same edge that is invisible at 8
+    positions becomes legible at 50:
+
+        positions   annual SD   info ratio on a 5.6pp edge
+                2        36.8                        +0.15
+                8        18.4                        +0.30
+               25        10.4                        +0.54
+               50         7.4                        +0.76
+
+    Expected return is identical at every row. Only the noise changes. Staged
+    via env so the ramp to 50 needs no code change:
+    TLFZ_MAX_STOCKS_T1 / _T2 / _T3.
+    """
+    import os
+    try:
+        return max(0, int(os.environ.get(f'TLFZ_MAX_STOCKS_T{tier}', default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Stage 1 of the ramp to 50: 12 slots -> 25. At MAX_POSITION_PCT_NAV = 2.0 that
+# lifts maximum deployment from 24% to 50% of NAV. Deliberately not 50 slots in
+# one step - the price-corruption fix shipped today has not yet been observed
+# filling a full book, and the odd-lot rules were only corrected this morning.
 TIER_CONFIG = {
-    1: {'position_pct': 16, 'initial_build_pct': 70, 'label': 'T1大肉', 'max_stocks': 3},
+    1: {'position_pct': 16, 'initial_build_pct': 70, 'label': 'T1大肉', 'max_stocks': _max_stocks_env(1, 6)},
        # T1满仓16万/只（总资产16%），首次建仓70%=11.2万，国家托底行情下放大
-    2: {'position_pct': 10, 'initial_build_pct': 70, 'label': 'T2候选', 'max_stocks': 5},
+    2: {'position_pct': 10, 'initial_build_pct': 70, 'label': 'T2候选', 'max_stocks': _max_stocks_env(2, 11)},
        # T2=大肉候选培养池：满仓10万/只，首次建仓70%=7万
-    3: {'position_pct': 5,  'initial_build_pct': 60, 'label': 'T3观察', 'max_stocks': 4},
+    3: {'position_pct': 5,  'initial_build_pct': 60, 'label': 'T3观察', 'max_stocks': _max_stocks_env(3, 8)},
        # T3=观察试错池：满仓5万/只，首次建仓60%=3万
 }
 
