@@ -2504,18 +2504,21 @@ def _sync_big_meat_position_split(record, *, qty=None, desired_core_ratio=None, 
     existing_core = _inum(record.get('big_meat_core_qty', 0), 0)
     if reset_core or existing_core <= 0:
         core_ratio = max(0.0, min(0.95, _fnum(desired_core_ratio, BIG_MEAT_CORE_HOLD_RATIO)))
-        if total_qty < 100:
+        split_code = record.get('code', '')
+        split_lot = _sell_min_lot(split_code)
+        if total_qty < split_lot:
             core_qty = total_qty
         else:
-            core_qty = _normalize_sell_quantity(max(int(total_qty * core_ratio), 100))
-            if core_qty >= total_qty and total_qty >= 200:
-                core_qty = _normalize_sell_quantity(total_qty - 100)
+            core_qty = _normalize_sell_quantity(
+                max(int(total_qty * core_ratio), split_lot), code=split_code)
+            if core_qty >= total_qty and total_qty >= split_lot * 2:
+                core_qty = _normalize_sell_quantity(total_qty - split_lot, code=split_code)
             core_qty = max(0, min(core_qty, total_qty))
     else:
         core_qty = max(0, min(existing_core, total_qty))
     trade_qty = max(0, total_qty - core_qty)
-    if trade_qty > 0 and total_qty >= 200:
-        trade_qty = _normalize_sell_quantity(trade_qty)
+    if trade_qty > 0 and total_qty >= split_lot * 2:
+        trade_qty = _normalize_sell_quantity(trade_qty, code=split_code)
         core_qty = max(0, total_qty - trade_qty)
     record['big_meat_core_qty'] = str(core_qty)
     record['big_meat_trade_qty'] = str(trade_qty)
@@ -2538,7 +2541,7 @@ def _risk_trim_quantity_for_record(record, qty):
     trade_qty = _big_meat_trade_qty(record, qty=qty)
     if trade_qty <= 0:
         return 0
-    trimmed = _risk_trim_quantity(trade_qty)
+    trimmed = _risk_trim_quantity(trade_qty, code=record.get('code', ''))
     if trimmed <= 0:
         return min(trade_qty, qty)
     return min(trimmed, trade_qty, qty)
@@ -2829,15 +2832,16 @@ def _resolve_big_meat_state_action(
     }
 
 
-def _risk_trim_quantity(qty):
+def _risk_trim_quantity(qty, code=''):
     qty = _inum(qty, 0)
     if qty <= 0:
         return 0
-    trimmed = _normalize_sell_quantity(max(int(qty * BIG_MEAT_RISK_TRIM_RATIO), 100))
+    lot = _sell_min_lot(code)
+    trimmed = _normalize_sell_quantity(max(int(qty * BIG_MEAT_RISK_TRIM_RATIO), lot), code=code)
     if trimmed <= 0:
         return 0
-    if trimmed >= qty and qty >= 200:
-        return _normalize_sell_quantity(qty - 100)
+    if trimmed >= qty and qty >= lot * 2:
+        return _normalize_sell_quantity(qty - lot, code=code)
     return min(trimmed, qty)
 
 
@@ -2869,14 +2873,46 @@ def _pause_record(record, reason):
     return record
 
 
-def _normalize_sell_quantity(raw_qty):
+def _sell_min_lot(code=''):
+    """Minimum sellable lot by board, mirroring _buy_min_lot.
+
+    STAR (688) trades in 200-share lots. A 100-share sell order against a STAR
+    position is rejected by the broker as 碎股 unless it liquidates the position
+    outright. 688205 failed six exits on 2026-08-26 for exactly this reason.
+    """
+    return 200 if str(code or '').strip().zfill(6).startswith('688') else 100
+
+
+def _normalize_sell_quantity(raw_qty, code='', position_qty=None):
+    """Round a sell quantity down to the board's lot size.
+
+    code defaults to '' -> lot 100, so callers that have not been updated keep
+    their previous behaviour exactly.
+
+    position_qty, when supplied, enables true odd-lot liquidation: a remainder
+    below one lot can still be sold, but only as a complete exit. Without it a
+    sub-lot request returns 0 rather than placing an order the broker will
+    refuse - the call sites all treat 0 as "skip".
+    """
     qty = _inum(raw_qty, 0)
     if qty <= 0:
         return 0
-    if qty < 100:
-        # Allow true odd-lot liquidation when the remaining position itself is below one board lot.
-        return qty
-    return int(qty / 100) * 100
+    lot = _sell_min_lot(code)
+    if position_qty is None:
+        # No position context: cannot tell a true odd-lot remnant from an
+        # invalid partial, so keep the original pass-through. The callers that
+        # do know the position size supply position_qty and get the strict path.
+        if qty < lot:
+            return qty
+        return int(qty / lot) * lot
+    total = _inum(position_qty, 0)
+    if 0 < total < lot:
+        # whole remaining position is a legitimate odd lot - sell it entire
+        return min(qty, total)
+    if qty < lot:
+        # a sub-lot order that does not liquidate the position is rejected as 碎股
+        return 0
+    return int(qty / lot) * lot
 
 
 def _position_broker_sellable_cap(pos):
@@ -2893,7 +2929,11 @@ def _sellable_quantity(pos, tracked_qty=None):
     sellable = _position_broker_sellable_cap(pos)
     if tracked_qty is not None and tracked_qty > 0:
         sellable = min(sellable, tracked_qty)
-    return _normalize_sell_quantity(sellable)
+    return _normalize_sell_quantity(
+        sellable,
+        code=pos.get('code', ''),
+        position_qty=_inum(pos.get('count', 0), 0),
+    )
 
 
 def _effective_sellable_quantity(pos, tracked_qty=None, pending_reserved_qty=0):
@@ -2904,7 +2944,9 @@ def _effective_sellable_quantity(pos, tracked_qty=None, pending_reserved_qty=0):
     broker_cap = _position_broker_sellable_cap(pos)
     remaining_cap = max(0, tracked_cap - max(_inum(pending_reserved_qty, 0), 0))
     sellable = min(count, broker_cap, remaining_cap)
-    return _normalize_sell_quantity(sellable)
+    return _normalize_sell_quantity(
+        sellable, code=pos.get('code', ''), position_qty=count
+    )
 
 
 def _should_reprice_pending_sell(code, pending_ctx, *, smart, tdx_api, entry_price, mode, profit_pct, current_price):
