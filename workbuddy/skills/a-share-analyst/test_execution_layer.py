@@ -2323,11 +2323,29 @@ class AddPositionAggressiveTests(unittest.TestCase):
             "mode": "V9_full",
             "build_note": "超级大行情满仓首建",
         }
-        profile = trader._build_big_meat_identity_profile(record, profit_pct=20.0)
+        # Was profit_pct=20.0. Open profit above ADD_POSITION_MAX_PROFIT_PCT no
+        # longer scores: forward returns from there were -0.94 vs baseline on
+        # train and -0.27 on holdout. 8% sits inside the band that still pays.
+        profile = trader._build_big_meat_identity_profile(record, profit_pct=8.0)
         self.assertGreaterEqual(profile["score"], 5)
         self.assertIn("V9_full", profile["notes"])
 
+        # And the ceiling itself, pinned: the same record past the limit keeps
+        # its identity score but earns nothing from profit.
+        capped = trader._build_big_meat_identity_profile(record, profit_pct=20.0)
+        self.assertLess(capped["score"], profile["score"])
+        self.assertIn("超加仓上限", " ".join(capped["notes"]))
+
     def test_do_add_position_uses_extended_target_for_big_meat_candidate(self) -> None:
+        # This test is about the extended target for big meat, not about whether
+        # the book is full enough to justify adding at all - the breadth gate has
+        # its own tests in test_add_position_gates. Set outside the with-block
+        # below, which is already at Python's 20-block nesting limit.
+        original_fill = trader.ADD_POSITION_MIN_BOOK_FILL_RATIO
+        trader.ADD_POSITION_MIN_BOOK_FILL_RATIO = 0.0
+        self.addCleanup(
+            setattr, trader, "ADD_POSITION_MIN_BOOK_FILL_RATIO", original_fill
+        )
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         records = [
             {
