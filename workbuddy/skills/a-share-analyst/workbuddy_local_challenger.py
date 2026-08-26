@@ -936,6 +936,33 @@ def _load_source_payload() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+# A pool one day behind is ordinary - a holiday, a late refresh. Beyond this it
+# is an outage, and saying so in the log is the whole point: the 2026-07-17
+# freeze ran 37 days because every skip printed the same routine-looking [WARN]
+# and returned EXIT_NO_ACTION, which the schedule treats as success.
+POOL_STALENESS_ALARM_DAYS = 3
+
+
+def _pool_staleness_days(current_trade_date: str, expected_trade_date: str) -> int | None:
+    """Calendar days between the pool's trade date and the one required."""
+    try:
+        current = datetime.strptime(str(current_trade_date).strip(), "%Y-%m-%d")
+        expected = datetime.strptime(str(expected_trade_date).strip(), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    return max(0, (expected - current).days)
+
+
+def _describe_pool_staleness(current_trade_date: str, expected_trade_date: str) -> str:
+    """A phrase that reads as an outage once it is one."""
+    days = _pool_staleness_days(current_trade_date, expected_trade_date)
+    if days is None:
+        return "候选池交易日无法解析"
+    if days >= POOL_STALENESS_ALARM_DAYS:
+        return f"候选池已过期 {days} 天，买入已停止 {days} 天"
+    return f"候选池落后 {days} 天"
+
+
 def _raw_top100_root() -> Path | None:
     """Where build_tdx_rankings writes its per-date ranking directories.
 
@@ -1024,7 +1051,7 @@ def _ensure_fresh_source_payload() -> dict[str, Any]:
         payload, refresh_detail = _refresh_source_payload(expected_trade_date)
     except ChallengerSourceUnavailable as exc:
         raise ChallengerSourceUnavailable(
-            "候选池未就绪，跳过本轮买入: "
+            f"{_describe_pool_staleness(current_trade_date, expected_trade_date)}，跳过本轮买入: "
             f"expected={expected_trade_date}, current_trade_date={current_trade_date or 'missing'}, "
             f"current_status={current_status or 'missing'}, detail={exc}"
         ) from exc
@@ -1944,7 +1971,16 @@ def do_buy(*, dry_run: bool = False, force: bool = False, trigger_slot: str = ""
     try:
         plan_payload, buy_list, skipped, execution_state = build_buy_plan(trigger_slot=trigger_slot, force=force)
     except (ChallengerSourceUnavailable, RuntimeValidationError) as exc:
-        print(f" [WARN] Workbuddy 候选池未就绪，本轮跳过买入: {exc}")
+        # Escalate past the alarm threshold. The exit code stays EXIT_NO_ACTION
+        # so the schedule's retry behaviour is unchanged; what changes is that
+        # the line no longer looks like a transient skip.
+        text = str(exc)
+        if "已过期" in text:
+            print(f" [ERROR] Workbuddy 候选池长期过期，买入持续停止: {text}")
+            print(" [ERROR] 请检查 stockbot-distill-refresh.timer 与模板搜索结果"
+                  "（combined_template_registry.json / template_search_latest.json）")
+        else:
+            print(f" [WARN] Workbuddy 候选池未就绪，本轮跳过买入: {text}")
         return base.EXIT_NO_ACTION
     print(f"\n{'=' * 60}")
     print(f" Workbuddy 本地 Challenger 买入 {'[DRY RUN]' if dry_run else '[LOCAL FILL]'}")
