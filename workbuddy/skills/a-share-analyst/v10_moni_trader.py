@@ -2873,6 +2873,17 @@ def _pause_record(record, reason):
     return record
 
 
+def _uses_single_share_increment(code=''):
+    """True for boards where order size increments by 1 share above the minimum.
+
+    STAR (688) requires at least 200 shares and then increments by 1. The main
+    board increments by 100 throughout. Getting this wrong in the permissive
+    direction produces rejected orders, so it is keyed off the same board test
+    as the minimum lot rather than inferred.
+    """
+    return str(code or '').strip().zfill(6).startswith('688')
+
+
 def _sell_min_lot(code=''):
     """Minimum sellable lot by board, mirroring _buy_min_lot.
 
@@ -2898,13 +2909,14 @@ def _normalize_sell_quantity(raw_qty, code='', position_qty=None):
     if qty <= 0:
         return 0
     lot = _sell_min_lot(code)
+    fine = _uses_single_share_increment(code)
     if position_qty is None:
         # No position context: cannot tell a true odd-lot remnant from an
         # invalid partial, so keep the original pass-through. The callers that
         # do know the position size supply position_qty and get the strict path.
         if qty < lot:
             return qty
-        return int(qty / lot) * lot
+        return qty if fine else int(qty / lot) * lot
     total = _inum(position_qty, 0)
     if 0 < total < lot:
         # whole remaining position is a legitimate odd lot - sell it entire
@@ -2912,6 +2924,9 @@ def _normalize_sell_quantity(raw_qty, code='', position_qty=None):
     if qty < lot:
         # a sub-lot order that does not liquidate the position is rejected as 碎股
         return 0
+    if fine:
+        # STAR: any size at or above the minimum is placeable, 1-share steps
+        return min(qty, total) if total > 0 else qty
     return int(qty / lot) * lot
 
 
@@ -9409,8 +9424,16 @@ def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT, code=''):
     lot_dec = Decimal(str(min_lot))
     if price_dec <= 0 or amount_dec <= 0:
         return 0
-    raw_lots = (amount_dec / (price_dec * lot_dec)).to_integral_value(rounding=ROUND_DOWN)
-    qty = int(raw_lots) * min_lot
+    if _uses_single_share_increment(code):
+        # STAR: at least min_lot, then 1-share increments. Rounding to whole
+        # lots here would discard up to 199 shares of an intended position.
+        raw_shares = (amount_dec / price_dec).to_integral_value(rounding=ROUND_DOWN)
+        qty = int(raw_shares)
+        if qty < min_lot:
+            qty = 0
+    else:
+        raw_lots = (amount_dec / (price_dec * lot_dec)).to_integral_value(rounding=ROUND_DOWN)
+        qty = int(raw_lots) * min_lot
     #region debug-point H:buy-window-timeout-qty
     _debug_emit_event(
         'A',

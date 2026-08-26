@@ -64,9 +64,14 @@ class NormalizeSellQuantityTests(unittest.TestCase):
         self.assertEqual(t._normalize_sell_quantity(200, code="688205"), 200)
         self.assertEqual(t._normalize_sell_quantity(400, code="688205"), 400)
 
-    def test_star_rounds_down_to_200(self):
-        self.assertEqual(t._normalize_sell_quantity(300, code="688205"), 200)
-        self.assertEqual(t._normalize_sell_quantity(599, code="688205"), 400)
+    def test_star_keeps_sizes_at_or_above_the_minimum(self):
+        """Superseded an earlier assertion that these round to 200-multiples.
+
+        STAR increments by 1 share above its 200 minimum, so 300 and 599 are
+        both placeable orders and must not be rounded down.
+        """
+        self.assertEqual(t._normalize_sell_quantity(300, code="688205"), 300)
+        self.assertEqual(t._normalize_sell_quantity(599, code="688205"), 599)
 
     def test_main_board_unchanged(self):
         self.assertEqual(t._normalize_sell_quantity(100, code="600519"), 100)
@@ -101,9 +106,10 @@ class SellableQuantityTests(unittest.TestCase):
         pos = {"code": "688205", "count": 200, "avail_count": 200}
         self.assertEqual(t._sellable_quantity(pos), 200)
 
-    def test_star_position_of_300_rounds_to_200(self):
+    def test_star_position_of_300_is_fully_sellable(self):
+        """300 >= the 200 minimum, so the whole position is one legal order."""
         pos = {"code": "688205", "count": 300, "avail_count": 300}
-        self.assertEqual(t._sellable_quantity(pos), 200)
+        self.assertEqual(t._sellable_quantity(pos), 300)
 
     def test_star_remnant_below_a_lot_is_liquidatable(self):
         pos = {"code": "688205", "count": 100, "avail_count": 100}
@@ -150,6 +156,66 @@ class RiskTrimTests(unittest.TestCase):
     def test_zero_and_negative(self):
         self.assertEqual(t._risk_trim_quantity(0, code="688205"), 0)
         self.assertEqual(t._risk_trim_quantity(-10, code="688205"), 0)
+
+
+
+
+class StarIncrementTests(unittest.TestCase):
+    """STAR requires >=200 shares, then increments by 1 - not by 100 or 200.
+
+    The first version of this fix rounded STAR quantities down to multiples of
+    200. That never produced an illegal order, which is why it stopped the six
+    rejections, but it discarded granularity the exchange allows. The rounding
+    compounds with the 2% NAV cap, both pushing size downward, and it bites
+    hardest on STAR: at 150 a share one 200-lot is 30,000, already 2.8% of a
+    1.07M account.
+    """
+
+    def test_star_uses_single_share_increments(self):
+        self.assertTrue(t._uses_single_share_increment("688205"))
+        for code in ("600519", "002487", "000001", "300750", "301162"):
+            self.assertFalse(t._uses_single_share_increment(code), code)
+
+    def test_star_sell_keeps_odd_sizes_above_the_minimum(self):
+        """300 of 500 held is a legal STAR order and must not become 200."""
+        self.assertEqual(
+            t._normalize_sell_quantity(300, code="688205", position_qty=500), 300)
+        self.assertEqual(
+            t._normalize_sell_quantity(237, code="688205", position_qty=500), 237)
+        self.assertEqual(
+            t._normalize_sell_quantity(499, code="688205", position_qty=500), 499)
+
+    def test_star_sell_still_refuses_below_the_minimum(self):
+        """The rule that caused the six rejections is unchanged."""
+        self.assertEqual(
+            t._normalize_sell_quantity(199, code="688205", position_qty=500), 0)
+        self.assertEqual(
+            t._normalize_sell_quantity(100, code="688205", position_qty=200), 0)
+
+    def test_star_sell_never_exceeds_the_position(self):
+        self.assertEqual(
+            t._normalize_sell_quantity(900, code="688205", position_qty=500), 500)
+
+    def test_main_board_still_rounds_to_100(self):
+        self.assertEqual(
+            t._normalize_sell_quantity(350, code="600519", position_qty=1000), 300)
+        self.assertEqual(
+            t._normalize_sell_quantity(237, code="002487", position_qty=1000), 200)
+
+    def test_star_buy_keeps_odd_sizes(self):
+        """30,000 at 137.5 is 218 shares - not 200."""
+        self.assertEqual(t.calc_buy_quantity(137.5, 30000, code="688205"), 218)
+
+    def test_star_buy_refuses_below_the_minimum(self):
+        """Under one lot's worth of cash buys nothing, rather than a bad order."""
+        self.assertEqual(t.calc_buy_quantity(150.0, 20000, code="688205"), 0)
+
+    def test_star_buy_at_exactly_the_minimum(self):
+        self.assertEqual(t.calc_buy_quantity(150.0, 30000, code="688205"), 200)
+
+    def test_main_board_buy_still_rounds_to_100(self):
+        self.assertEqual(t.calc_buy_quantity(10.0, 12500, code="600519"), 1200)
+        self.assertEqual(t.calc_buy_quantity(10.0, 1050, code="600519"), 100)
 
 
 if __name__ == "__main__":
