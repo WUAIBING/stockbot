@@ -22,6 +22,10 @@ REGISTRY_FILE = ROOT / "workbuddy_distill" / "templates" / "combined_template_re
 DAILY_REVIEW_FILE = OUTPUT_ROOT / "workbuddy_distill_daily_review_latest.json"
 CHAMPION_EVOLUTION_FILE = ROOT / "workbuddy_distill" / "artifacts" / "distill_champion_evolution_latest.json"
 STATE_AWARE_EVOLUTION_FILE = ROOT / "workbuddy_distill" / "artifacts" / "state_aware_template_evolution_latest.json"
+# Written by every search run, passing or not - unlike the two evolution
+# artifacts above, which are produced by evolve_distill_champion.py and
+# evolve_state_aware_templates.py and have never existed on this host.
+TEMPLATE_SEARCH_FILE = ROOT / "workbuddy_distill" / "artifacts" / "template_search_latest.json"
 OUTPUT_JSON = OUTPUT_ROOT / "workbuddy_distill_candidate_pool_latest.json"
 OUTPUT_MD = OUTPUT_ROOT / "workbuddy_distill_candidate_pool_latest.md"
 MAIN_OUTPUT_JSON = OUTPUT_ROOT / "workbuddy_candidate_pool_latest.json"
@@ -76,7 +80,7 @@ def load_registry() -> dict[str, Any]:
     payload = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
     templates = payload.get("templates", [])
     if not isinstance(templates, list) or not templates:
-        fallback = _fallback_registry_from_artifacts()
+        fallback = _fallback_registry_from_artifacts() or _fallback_registry_from_search()
         if fallback:
             return fallback
         raise RuntimeError("combined_template_registry.json 缺少可用模板")
@@ -202,6 +206,8 @@ def _fallback_registry_from_artifacts() -> dict[str, Any] | None:
         _read_json_if_exists(STATE_AWARE_EVOLUTION_FILE),
     ]
     for payload in sources:
+        if not isinstance(payload, dict):
+            continue
         incumbent = _normalize_template_entry(payload.get("incumbent"))
         if not incumbent:
             continue
@@ -228,6 +234,54 @@ def _fallback_registry_from_artifacts() -> dict[str, Any] | None:
             "templates": candidates,
         }
     return None
+
+
+def _fallback_registry_from_search() -> dict[str, Any] | None:
+    """Last-resort registry built from the most recent template search.
+
+    load_registry previously fell back only to distill_champion_evolution_latest
+    and state_aware_template_evolution_latest. Neither has ever been written on
+    this host, so the fallback could not fire, and a search that promoted nothing
+    became a hard failure: the candidate pool froze on 2026-07-17 and every buy
+    round skipped for 37 days.
+
+    The search artifact is written on every run regardless of outcome, so this
+    path is always available. It still refuses to hand back a template the
+    search rejected - a "fail" verdict is not eligible - so a genuinely empty
+    search continues to fail loudly rather than trading on nothing.
+    """
+    payload = _read_json_if_exists(TEMPLATE_SEARCH_FILE)
+    if not isinstance(payload, dict) or not payload:
+        return None
+    eligible = {"priority", "pass", "profit_pass", "prototype"}
+    candidates: list[dict[str, Any]] = []
+    for pool_key in ("passed_templates", "prototype_templates", "top_templates"):
+        pool = payload.get(pool_key)
+        if not isinstance(pool, list):
+            continue
+        for item in pool:
+            if not isinstance(item, dict) or item.get("verdict") not in eligible:
+                continue
+            entry = _normalize_template_entry(item)
+            if not entry:
+                continue
+            if any(e["template_name"] == entry["template_name"] for e in candidates):
+                continue
+            candidates.append(entry)
+            if len(candidates) >= 3:
+                break
+        if candidates:
+            break
+    if not candidates:
+        return None
+    window = payload.get("window_profile")
+    return {
+        "version": "workbuddy_distill_search_fallback_v1",
+        "window": window if isinstance(window, dict) else {},
+        "champion_template_name": candidates[0]["template_name"],
+        "champion_template": candidates[0],
+        "templates": candidates,
+    }
 
 
 def _normalize_security_name(name: Any) -> str:
