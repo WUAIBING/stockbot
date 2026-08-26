@@ -600,11 +600,62 @@ def _price_pair_agrees(code, quote_price, bar_close):
     return abs(q - b) / b * 100.0 <= tolerance
 
 
+_TDX_RESYNC_LOG = []
+
+
+def _resync_after_protocol_error(api, where, code=""):
+    """Rebuild the connection after a failed pytdx call.
+
+    pytdx speaks a request/response protocol over a single socket: write a
+    request, read a header, read a body. If the read raises - a timeout, a
+    short read, a parse error - the bytes for that response are still sitting
+    in the buffer. The next request then reads THOSE bytes as its own response,
+    so code N+1 receives code N's data, and every subsequent code is shifted by
+    one. Nothing raises again, so the corruption is silent and permanent for
+    the rest of the run.
+
+    That is not hypothetical. In the 2026-08-26 14:49 decision scan, rows 0-33
+    were correct and rows 34-115 were 91% wrong - 300083 written as 422.33
+    against a real 13.78, 688630 as 30.05 against a real 415.00. The 14:31
+    prewarm scan of the same session was clean, because prewarm passes
+    include_5min=False and therefore issues one fewer request per code.
+
+    Reconnecting costs a round trip and loses one row. Continuing costs every
+    row after it.
+    """
+    _TDX_RESYNC_LOG.append({"where": where, "code": str(code or "")})
+    print(f"[WARN] pytdx protocol error in {where}"
+          f"{f' at {code}' if code else ''} - reconnecting to avoid "
+          f"desynchronised responses (resync #{len(_TDX_RESYNC_LOG)})")
+    try:
+        api.disconnect()
+    except Exception:
+        pass
+    for host, port in TDX_HOSTS:
+        try:
+            if api.connect(host, port):
+                return True
+        except Exception:
+            continue
+        try:
+            api.disconnect()
+        except Exception:
+            pass
+    print("[ERROR] pytdx reconnect failed on every host - "
+          "remaining rows this run cannot be trusted")
+    return False
+
+
 def fetch_daily_bars(api, market, code, count=250):
     try:
         bars = api.get_security_bars(9, market, code, 0, count)
-        if not bars:
-            return None
+    except Exception:
+        # socket-level failure: the connection is now unsafe to reuse
+        _resync_after_protocol_error(api, "fetch_daily_bars", code)
+        return None
+    if not bars:
+        return None
+    try:
         df = api.to_df(bars)
         if df is None or df.empty:
             return None
@@ -612,13 +663,18 @@ def fetch_daily_bars(api, market, code, count=250):
         df = df.sort_values("datetime").reset_index(drop=True)
         return df
     except Exception:
+        # the response was read in full; only our own parsing failed
         return None
 
 def fetch_weekly_bars(api, market, code, count=100):
     try:
         bars = api.get_security_bars(5, market, code, 0, count)
-        if not bars:
-            return None
+    except Exception:
+        _resync_after_protocol_error(api, "fetch_weekly_bars", code)
+        return None
+    if not bars:
+        return None
+    try:
         df = api.to_df(bars)
         if df is None or df.empty:
             return None
@@ -632,8 +688,14 @@ def fetch_5min_bars_today(api, market, code, *, cutoff_at=None):
     """Get today's 5-min bars only"""
     try:
         bars = api.get_security_bars(0, market, code, 0, 50)  # last 50 bars
-        if not bars:
-            return None
+    except Exception:
+        # The decision scan is the only caller that reaches here, which is why
+        # it corrupts and the prewarm scan does not.
+        _resync_after_protocol_error(api, "fetch_5min_bars_today", code)
+        return None
+    if not bars:
+        return None
+    try:
         df = api.to_df(bars)
         if df is None or df.empty:
             return None
@@ -837,6 +899,7 @@ def _collect_amount_snapshot(api, stocks):
                 })
         except Exception as exc:
             print(f"[WARN] quote batch {batch_number} skipped: {exc}")
+            _resync_after_protocol_error(api, "quote_batch", f"batch{batch_number}")
             continue
         amt_list.extend(batch_snapshot)
     return amt_list
