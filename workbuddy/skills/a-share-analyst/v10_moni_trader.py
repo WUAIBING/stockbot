@@ -554,6 +554,13 @@ TRACK_FIELDNAMES = [
     'holding_big_meat_score', 'holding_big_meat_reason', 'holding_big_meat_promoted_at',
     'big_meat_hold_state', 'big_meat_core_qty', 'big_meat_trade_qty',
     'big_meat_hold_lock_until', 'big_meat_last_risk_trim_at',
+    # The model score selects ~4 stocks from the ~950 that match a profile rule,
+    # so it does virtually all of the stock picking - and it has never been
+    # written to the trade record, which makes it the one component of this
+    # system that cannot be evaluated after the fact. Persisted here so realised
+    # 10-day returns can be regressed against it.
+    'model_score', 'score_market', 'score_sector', 'score_stock', 'score_flow',
+    'industry',
     'last_synced_at',
 ]
 
@@ -4708,6 +4715,12 @@ def _make_record_from_context(code, pos=None, ctx=None):
         'decision_id': str(ctx.get('decision_id', '')).strip(),
         'decision_run_slot': str(ctx.get('decision_run_slot', '')).strip(),
         'selected_reason_hash': str(ctx.get('selected_reason_hash', '')).strip(),
+        'model_score': str(ctx.get('model_score', '')).strip(),
+        'score_market': str(ctx.get('score_market', '')).strip(),
+        'score_sector': str(ctx.get('score_sector', '')).strip(),
+        'score_stock': str(ctx.get('score_stock', '')).strip(),
+        'score_flow': str(ctx.get('score_flow', '')).strip(),
+        'industry': str(ctx.get('industry', '')).strip(),
         'close_reason': '',
         'big_meat_state': str(ctx.get('big_meat_state', '')).strip(),
         'big_meat_score': str(ctx.get('big_meat_score', '')).strip(),
@@ -5379,8 +5392,30 @@ def _build_runtime_record_context(code, *, fill_event=None, decision_row=None, b
         )
         or (f"{price * quantity:.0f}" if price > 0 and quantity > 0 else '')
     )
+    # decision_row is authoritative when present; base_record keeps the value
+    # pinned afterwards, because this context is rebuilt on every holdings sync
+    # and the decision row is not always resolvable later.
+    components = decision_row.get('components', {})
+    components = components if isinstance(components, dict) else {}
+
+    def _score_field(record_key, source):
+        existing = str(base_record.get(record_key, '')).strip()
+        if existing:
+            return existing
+        value = _fnum(source, 0.0)
+        return f"{value:.4f}" if value != 0.0 else ''
+
     ctx = {
         'date': trade_date,
+        'model_score': _score_field('model_score', decision_row.get('score', 0.0)),
+        'score_market': _score_field('score_market', components.get('market', 0.0)),
+        'score_sector': _score_field('score_sector', components.get('sector', 0.0)),
+        'score_stock': _score_field('score_stock', components.get('stock', 0.0)),
+        'score_flow': _score_field('score_flow', components.get('flow', 0.0)),
+        'industry': (
+            str(base_record.get('industry', '')).strip()
+            or str(decision_row.get('industry', '')).strip()
+        ),
         'buy_time': (
             str(state_entry.get('buy_time', '')).strip()
             or str(base_record.get('buy_time', '')).strip()
