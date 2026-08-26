@@ -38,6 +38,12 @@ RSYNC_ARGS=(
   --exclude=workbuddy_distill/raw_top100/**
   --exclude=workbuddy_distill/evaluations/**
   --exclude=workbuddy_distill/artifacts/**
+  # Generated registries, same category as artifacts/ and raw_top100/ above but
+  # missed when those were excluded. Both files are tracked, both repo copies are
+  # empty, and --delete meant every deploy overwrote the live registry with them:
+  # on 2026-08-26 a search that had just promoted 12 combinations was reset to 0
+  # by the next sync. That silently reset the distill chain on every deploy.
+  --exclude=workbuddy_distill/templates/**
 )
 
 if [[ "$DRY_RUN" == "1" ]]; then
