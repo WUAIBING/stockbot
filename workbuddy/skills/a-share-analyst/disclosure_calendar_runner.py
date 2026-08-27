@@ -85,6 +85,18 @@ SCREENER_ATTEMPTS = 3
 SCREENER_RETRY_DELAY_SEC = 4.0
 SECTOR_QUERY_PAUSE_SEC = 0.7      # ~80 sector calls in a row will be throttled
 
+# The 妙想 account allows 500 screener calls a day and answers 状态码 113 once
+# that is spent. A run costs one calendar call plus one per sector - about 84 -
+# so the budget is real but not tight, PROVIDED nothing retries into it: three
+# blind attempts against an exhausted quota burn three calls to learn nothing.
+QUOTA_MARKERS = ("调用次数已达上线", "状态码 113", '"code": 113')
+
+# Sector rankings are cached because the measurement ranked on a TRAILING
+# 20-SESSION MEAN turnover, not on one day. A single-day snapshot is noisier
+# than the construct that was validated, so reusing a recent ranking is both
+# cheaper and closer to what was measured. Beyond this age it is refetched.
+SECTOR_CACHE_MAX_AGE_DAYS = 5
+
 
 def _expand(ranges) -> set:
     out = set()
@@ -129,6 +141,10 @@ def _shift_days(d: int, days: int) -> int:
     return _to_int(_to_date(d) + _dt.timedelta(days=days))
 
 
+class ScreenerQuotaExhausted(RuntimeError):
+    """The daily call budget is gone; every further call is wasted."""
+
+
 def _screener_once(query: str, skill_dir: str, python_exe: str,
                    timeout: int) -> list[dict]:
     """One screener call, into a private directory so the CSV is unambiguous.
@@ -142,12 +158,17 @@ def _screener_once(query: str, skill_dir: str, python_exe: str,
         raise RuntimeError("screener not found at %s" % script)
     with tempfile.TemporaryDirectory(prefix="disc_cal_") as tmp:
         try:
-            subprocess.run([python_exe, script, query, "--output-dir", tmp],
-                           cwd=skill_dir, timeout=timeout,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           check=False)
+            proc = subprocess.run([python_exe, script, query, "--output-dir", tmp],
+                                  cwd=skill_dir, timeout=timeout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  check=False)
         except subprocess.TimeoutExpired:
             return []
+        blob = (proc.stdout or b"").decode("utf-8", "ignore") +                (proc.stderr or b"").decode("utf-8", "ignore")
+        if any(m in blob for m in QUOTA_MARKERS):
+            raise ScreenerQuotaExhausted(
+                "妙想 daily call budget spent; the remaining sectors cannot be "
+                "ranked today")
         files = glob.glob(os.path.join(tmp, "*.csv"))
         if not files:
             return []
@@ -170,6 +191,8 @@ def run_screener(query: str, skill_dir: str, python_exe: str,
     """
     delay = SCREENER_RETRY_DELAY_SEC
     for attempt in range(attempts):
+        # A quota error propagates immediately: retrying it spends real calls to
+        # be told the same thing, and the caller needs to stop the whole run.
         rows = _screener_once(query, skill_dir, python_exe, timeout)
         if rows:
             return rows
@@ -214,6 +237,29 @@ def fetch_calendar(start: int, end: int, skill_dir: str, python_exe: str):
         parsed["sector"] = sectors.get(parsed["code"])
         entries.append(parsed)
     return entries
+
+
+def load_sector_cache(path: str, today: int) -> dict:
+    """Cached rankings still inside SECTOR_CACHE_MAX_AGE_DAYS."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    cutoff = _shift_days(today, -SECTOR_CACHE_MAX_AGE_DAYS)
+    out = {}
+    for sector, entry in (raw.get("sectors") or {}).items():
+        if int(entry.get("as_of", 0)) >= cutoff and entry.get("ranks"):
+            out[sector] = {"ranks": {str(k): int(v) for k, v in entry["ranks"].items()},
+                           "as_of": int(entry["as_of"])}
+    return out
+
+
+def save_sector_cache(path: str, cache: dict) -> None:
+    try:
+        Path(path).write_text(
+            json.dumps({"sectors": cache}, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def fetch_sector_ranking(sector: str, skill_dir: str, python_exe: str):
@@ -283,6 +329,10 @@ def main(argv=None):
                     help="directory holding mx_xuangu.py")
     ap.add_argument("--python", dest="python_exe", default=sys.executable)
     ap.add_argument("--out", default="disclosure_candidates_latest.json")
+    ap.add_argument("--sector-cache", default="disclosure_sector_ranks.json",
+                    help="reused for %d days; the measurement ranked on a "
+                         "trailing 20-session mean, not one day"
+                         % SECTOR_CACHE_MAX_AGE_DAYS)
     args = ap.parse_args(argv)
 
     today = args.today or _to_int(_dt.date.today())
@@ -307,15 +357,32 @@ def main(argv=None):
 
     sectors = sorted(sectors_worth_ranking(entries))
     skipped = len({e["sector"] for e in entries if e.get("sector")}) - len(sectors)
+    cache = load_sector_cache(args.sector_cache, today)
     sector_ranks = {}
     failed_sectors = []
+    quota_spent = False
+    reused = 0
     for i, s in enumerate(sectors):
-        ranks, ok = fetch_sector_ranking(s, args.skill_dir, args.python_exe)
+        hit = cache.get(s)
+        if hit:
+            sector_ranks[s] = hit["ranks"]
+            reused += 1
+            continue
+        try:
+            ranks, ok = fetch_sector_ranking(s, args.skill_dir, args.python_exe)
+        except ScreenerQuotaExhausted as exc:
+            print("[ERROR] %s (%d of %d sectors done)"
+                  % (exc, i, len(sectors)), file=sys.stderr)
+            quota_spent = True
+            break
         sector_ranks[s] = ranks
-        if not ok:
+        if ok:
+            cache[s] = {"ranks": ranks, "as_of": today}
+        else:
             failed_sectors.append(s)
         if i < len(sectors) - 1:
             time.sleep(SECTOR_QUERY_PAUSE_SEC)
+    save_sector_cache(args.sector_cache, cache)
 
     scored = build_candidates(today, entries, sector_ranks, args.horizon_days)
     selected = dc.rank(scored)
@@ -329,14 +396,21 @@ def main(argv=None):
         "sectors_skipped_illiquid": skipped,
         "unranked": sum(1 for c in scored if c.get("sector_rank") is None),
         "sectors_failed": failed_sectors,
+        "sectors_from_cache": reused,
+        "quota_exhausted": quota_spent,
         "selected": selected,
         "rejected": [c for c in scored if not c.get("selected")],
     }
     Path(args.out).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print("scored %d over %d sectors (%d skipped as illiquid); %d selected -> %s"
-          % (len(scored), len(sectors), skipped, len(selected), args.out))
+    print("scored %d over %d sectors (%d skipped as illiquid, %d from cache); "
+          "%d selected -> %s"
+          % (len(scored), len(sectors), skipped, reused, len(selected), args.out))
+    if quota_spent:
+        print("[WARN] the daily screener budget ran out mid-run; sectors after "
+              "that point are unranked and their names fall back to the weaker "
+              "pooled evidence", file=sys.stderr)
     if failed_sectors:
         unranked = sum(1 for c in scored if c.get("sector_rank") is None)
         print("[WARN] %d sector queries returned nothing after %d attempts, "

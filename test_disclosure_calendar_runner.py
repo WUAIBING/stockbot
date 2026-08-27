@@ -266,6 +266,84 @@ class SectorSkipTests(unittest.TestCase):
         self.assertEqual(r.sectors_worth_ranking(entries), set())
 
 
+class QuotaTests(unittest.TestCase):
+    """The account allows 500 screener calls a day and then answers 状态码 113.
+
+    A run costs about 84 calls, so the budget is workable - but only if nothing
+    retries into an exhausted quota, and only if the run stops rather than
+    silently unranking every remaining sector.
+    """
+
+    class _Proc:
+        def __init__(self, out):
+            self.stdout = out.encode("utf-8")
+            self.stderr = b""
+
+    def stub_subprocess(self, output):
+        import subprocess as sp
+        self.addCleanup(setattr, r.subprocess, "run", r.subprocess.run)
+        self.addCleanup(setattr, r.os.path, "exists", r.os.path.exists)
+        r.os.path.exists = lambda *_: True
+        r.subprocess.run = lambda *a, **k: self._Proc(output)
+
+    def test_the_real_quota_message_is_detected(self):
+        self.stub_subprocess(
+            "错误: 顶层错误: 状态码 113 - 您为妙想skils进阶版用户，"
+            "今日调用次数已达上线500次，可以明日再来，感谢您的认可。")
+        with self.assertRaises(r.ScreenerQuotaExhausted):
+            r._screener_once("q", "/x", "python", 10)
+
+    def test_quota_is_not_retried(self):
+        """Three blind attempts spend three real calls to learn the same thing."""
+        self.addCleanup(setattr, r, "_screener_once", r._screener_once)
+        calls = []
+
+        def _once(*a, **k):
+            calls.append(1)
+            raise r.ScreenerQuotaExhausted("spent")
+
+        r._screener_once = _once
+        with self.assertRaises(r.ScreenerQuotaExhausted):
+            r.run_screener("q", "/x", "python")
+        self.assertEqual(len(calls), 1)
+
+    def test_an_ordinary_empty_reply_is_not_mistaken_for_quota(self):
+        self.stub_subprocess("📊 行数: 0")
+        self.assertEqual(r._screener_once("q", "/x", "python", 10), [])
+
+
+class SectorCacheTests(unittest.TestCase):
+    """Rankings are reused because the measurement used a trailing 20-session
+    mean turnover: one day snapshot is noisier than the validated construct."""
+
+    def setUp(self):
+        import tempfile, os
+        self.path = os.path.join(tempfile.mkdtemp(), "ranks.json")
+
+    def test_a_fresh_entry_is_reused(self):
+        r.save_sector_cache(self.path,
+                            {"半导体": {"ranks": {"688825": 1}, "as_of": 20260826}})
+        got = r.load_sector_cache(self.path, 20260827)
+        self.assertEqual(got["半导体"]["ranks"]["688825"], 1)
+
+    def test_a_stale_entry_is_dropped(self):
+        r.save_sector_cache(self.path,
+                            {"半导体": {"ranks": {"688825": 1}, "as_of": 20260101}})
+        self.assertEqual(r.load_sector_cache(self.path, 20260827), {})
+
+    def test_a_missing_file_is_not_an_error(self):
+        self.assertEqual(r.load_sector_cache("/nonexistent/x.json", 20260827), {})
+
+    def test_a_corrupt_file_is_not_an_error(self):
+        Path(self.path).write_text("not json", encoding="utf-8")
+        self.assertEqual(r.load_sector_cache(self.path, 20260827), {})
+
+    def test_an_empty_ranking_is_never_cached_as_valid(self):
+        """A throttled call produced {}; caching it would freeze the failure in."""
+        r.save_sector_cache(self.path, {"电力": {"ranks": {}, "as_of": 20260827}})
+        self.assertEqual(r.load_sector_cache(self.path, 20260827), {})
+
+
 class SafetyTests(unittest.TestCase):
     def test_runner_holds_no_execution_path(self):
         src = Path(r.__file__).read_text(encoding="utf-8")
