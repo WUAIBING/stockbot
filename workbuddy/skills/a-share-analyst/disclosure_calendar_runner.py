@@ -47,6 +47,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -80,6 +81,9 @@ HOLIDAY_COVERAGE_YEARS = (2026,)
 
 DEFAULT_HORIZON_DAYS = 12         # calendar days of forward calendar to request
 SCREENER_TIMEOUT_SEC = 240
+SCREENER_ATTEMPTS = 3
+SCREENER_RETRY_DELAY_SEC = 4.0
+SECTOR_QUERY_PAUSE_SEC = 0.7      # ~80 sector calls in a row will be throttled
 
 
 def _expand(ranges) -> set:
@@ -125,8 +129,8 @@ def _shift_days(d: int, days: int) -> int:
     return _to_int(_to_date(d) + _dt.timedelta(days=days))
 
 
-def run_screener(query: str, skill_dir: str, python_exe: str,
-                 timeout: int = SCREENER_TIMEOUT_SEC) -> list[dict]:
+def _screener_once(query: str, skill_dir: str, python_exe: str,
+                   timeout: int) -> list[dict]:
     """One screener call, into a private directory so the CSV is unambiguous.
 
     mx_xuangu names its output after the query, so a shared directory turns
@@ -144,11 +148,35 @@ def run_screener(query: str, skill_dir: str, python_exe: str,
                            check=False)
         except subprocess.TimeoutExpired:
             return []
-        files = [f for f in glob.glob(os.path.join(tmp, "*.csv"))]
+        files = glob.glob(os.path.join(tmp, "*.csv"))
         if not files:
             return []
         with open(files[0], encoding="utf-8-sig") as fh:
             return list(csv.DictReader(fh))
+
+
+def run_screener(query: str, skill_dir: str, python_exe: str,
+                 timeout: int = SCREENER_TIMEOUT_SEC,
+                 attempts: int = SCREENER_ATTEMPTS) -> list[dict]:
+    """Screener call with retries, because a swallowed failure is not empty.
+
+    A day of calendar needs one call per sector - about 80 of them back to back
+    - and the service throttles under that. The first live run lost whole
+    sectors that way: 房地产开发 11 of 11, 电力 10 of 10, 化学制药 9 of 9 came
+    back with no rows, while the identical query run by hand returned 81, 109
+    and 158. Nothing errored. Those names simply became "unranked" and were then
+    selected on the weaker pooled evidence, which is the failure mode this whole
+    file is supposed to prevent.
+    """
+    delay = SCREENER_RETRY_DELAY_SEC
+    for attempt in range(attempts):
+        rows = _screener_once(query, skill_dir, python_exe, timeout)
+        if rows:
+            return rows
+        if attempt < attempts - 1:
+            time.sleep(delay)
+            delay *= 2
+    return []
 
 
 def _col(row, *fragments):
@@ -188,8 +216,14 @@ def fetch_calendar(start: int, end: int, skill_dir: str, python_exe: str):
     return entries
 
 
-def fetch_sector_ranking(sector: str, skill_dir: str, python_exe: str) -> dict:
-    """{code: 1-based turnover rank} for a whole sector."""
+def fetch_sector_ranking(sector: str, skill_dir: str, python_exe: str):
+    """({code: 1-based turnover rank}, ok) for a whole sector.
+
+    ZERO ROWS IS ALWAYS A FAILURE HERE, never a genuinely empty sector: this is
+    only ever called for a sector that appeared on the calendar, so it has at
+    least one member by construction. Returning that as an empty ranking would
+    quietly demote every name in it to unranked.
+    """
     q = "所属行业为%s的A股按成交额从大到小排列" % sector
     rows = run_screener(q, skill_dir, python_exe)
     ranks = {}
@@ -197,7 +231,7 @@ def fetch_sector_ranking(sector: str, skill_dir: str, python_exe: str) -> dict:
         code = str(_col(r, "代码") or "").strip().zfill(6)
         if code.isdigit() and len(code) == 6 and code not in ranks:
             ranks[code] = i
-    return ranks
+    return ranks, bool(ranks)
 
 
 def sectors_worth_ranking(entries) -> set:
@@ -274,8 +308,14 @@ def main(argv=None):
     sectors = sorted(sectors_worth_ranking(entries))
     skipped = len({e["sector"] for e in entries if e.get("sector")}) - len(sectors)
     sector_ranks = {}
-    for s in sectors:
-        sector_ranks[s] = fetch_sector_ranking(s, args.skill_dir, args.python_exe)
+    failed_sectors = []
+    for i, s in enumerate(sectors):
+        ranks, ok = fetch_sector_ranking(s, args.skill_dir, args.python_exe)
+        sector_ranks[s] = ranks
+        if not ok:
+            failed_sectors.append(s)
+        if i < len(sectors) - 1:
+            time.sleep(SECTOR_QUERY_PAUSE_SEC)
 
     scored = build_candidates(today, entries, sector_ranks, args.horizon_days)
     selected = dc.rank(scored)
@@ -288,6 +328,7 @@ def main(argv=None):
         "sectors_ranked": len(sectors),
         "sectors_skipped_illiquid": skipped,
         "unranked": sum(1 for c in scored if c.get("sector_rank") is None),
+        "sectors_failed": failed_sectors,
         "selected": selected,
         "rejected": [c for c in scored if not c.get("selected")],
     }
@@ -296,6 +337,13 @@ def main(argv=None):
 
     print("scored %d over %d sectors (%d skipped as illiquid); %d selected -> %s"
           % (len(scored), len(sectors), skipped, len(selected), args.out))
+    if failed_sectors:
+        unranked = sum(1 for c in scored if c.get("sector_rank") is None)
+        print("[WARN] %d sector queries returned nothing after %d attempts, "
+              "leaving %d names unranked and scored on the weaker pooled "
+              "evidence: %s"
+              % (len(failed_sectors), SCREENER_ATTEMPTS, unranked,
+                 ", ".join(failed_sectors[:8])), file=sys.stderr)
     for c in selected[:15]:
         print("  %-8s %-10s rank %-4s in %-10s reports in %s sessions"
               % (c["code"], (c.get("name") or "")[:9],

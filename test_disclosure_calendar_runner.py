@@ -135,6 +135,9 @@ class CandidateBuildTests(unittest.TestCase):
 class FetchTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
+        # Restore the real one: leaving a stub on the module leaks into every
+        # later test, and the retry tests silently passed against it.
+        self.addCleanup(setattr, r, "run_screener", r.run_screener)
 
     def fake(self, rows_by_query):
         def _run(query, skill_dir, python_exe, timeout=0):
@@ -183,22 +186,61 @@ class FetchTests(unittest.TestCase):
     def test_sector_ranking_is_row_position(self):
         rows = [{"代码": "688825"}, {"代码": "603986"}, {"代码": "688008"}]
         r.run_screener = self.fake({"按成交额": rows})
-        got = r.fetch_sector_ranking("半导体", "/x", "python")
+        got, ok = r.fetch_sector_ranking("半导体", "/x", "python")
         self.assertEqual(got, {"688825": 1, "603986": 2, "688008": 3})
+        self.assertTrue(ok)
 
     def test_sector_query_orders_by_turnover_descending(self):
         r.run_screener = self.fake({})
         r.fetch_sector_ranking("半导体", "/x", "python")
         self.assertIn("成交额从大到小", self.calls[0])
 
-    def test_a_failed_screener_call_yields_nothing_rather_than_partial_ranks(self):
+    def test_an_empty_sector_reply_is_reported_as_a_failure(self):
+        """This is only called for a sector that appeared on the calendar, so it
+        has a member by construction: no rows means the query failed, and
+        reporting it as an empty ranking would quietly demote every name in it.
+        The first live run lost 房地产开发, 电力 and 化学制药 exactly this way."""
         r.run_screener = self.fake({})
-        self.assertEqual(r.fetch_sector_ranking("半导体", "/x", "python"), {})
+        ranks, ok = r.fetch_sector_ranking("半导体", "/x", "python")
+        self.assertEqual(ranks, {})
+        self.assertFalse(ok)
 
     def test_duplicate_codes_keep_the_best_rank(self):
         rows = [{"代码": "688825"}, {"代码": "688825"}]
         r.run_screener = self.fake({"按成交额": rows})
-        self.assertEqual(r.fetch_sector_ranking("x", "/x", "python")["688825"], 1)
+        self.assertEqual(r.fetch_sector_ranking("x", "/x", "python")[0]["688825"], 1)
+
+
+class RetryTests(unittest.TestCase):
+    """A throttled call returns no rows and raises nothing."""
+
+    def setUp(self):
+        self.addCleanup(setattr, r.time, "sleep", r.time.sleep)
+        self.addCleanup(setattr, r, "_screener_once", r._screener_once)
+        r.time.sleep = lambda *_: None
+        self.calls = []
+
+    def stub(self, results):
+        def _once(query, skill_dir, python_exe, timeout):
+            self.calls.append(query)
+            return results[min(len(self.calls) - 1, len(results) - 1)]
+        r._screener_once = _once
+
+    def test_a_transient_empty_reply_is_retried(self):
+        self.stub([[], [], [{"代码": "688825"}]])
+        rows = r.run_screener("q", "/x", "python")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_a_first_time_success_does_not_retry(self):
+        self.stub([[{"代码": "688825"}]])
+        r.run_screener("q", "/x", "python")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_retries_are_bounded(self):
+        self.stub([[]])
+        self.assertEqual(r.run_screener("q", "/x", "python"), [])
+        self.assertEqual(len(self.calls), r.SCREENER_ATTEMPTS)
 
 
 class SectorSkipTests(unittest.TestCase):
