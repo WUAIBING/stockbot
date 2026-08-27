@@ -157,6 +157,23 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(out[0]["scheduled"], 20260831)
         self.assertAlmostEqual(out[0]["turnover"], 1.8839e10, places=2)
 
+    def test_a_dropped_row_does_not_shift_every_sector_after_it(self):
+        """parse_calendar_rows drops unusable rows. Pairing its output against
+        the raw rows by POSITION files later names under the wrong industry."""
+        rows = [
+            {"代码": "notacode", "名称": "junk",
+             "定期报告预计披露日期 2026.06.30": "2026-08-31",
+             "东财行业分类二级": "房地产开发"},
+            {"代码": "688825", "名称": "长鑫科技",
+             "定期报告预计披露日期 2026.06.30": "2026-08-31",
+             "东财行业分类二级": "半导体"},
+        ]
+        r.run_screener = self.fake({"预计披露日期": rows})
+        out = r.fetch_calendar(20260828, 20260910, "/x", "python")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["code"], "688825")
+        self.assertEqual(out[0]["sector"], "半导体")
+
     def test_the_calendar_query_asks_for_the_scheduled_field(self):
         r.run_screener = self.fake({})
         r.fetch_calendar(20260828, 20260910, "/x", "python")
@@ -182,6 +199,29 @@ class FetchTests(unittest.TestCase):
         rows = [{"代码": "688825"}, {"代码": "688825"}]
         r.run_screener = self.fake({"按成交额": rows})
         self.assertEqual(r.fetch_sector_ranking("x", "/x", "python")["688825"], 1)
+
+
+class SectorSkipTests(unittest.TestCase):
+    """One screener call per sector, and a day spans about 83 of them."""
+
+    def test_an_all_illiquid_sector_is_skipped(self):
+        entries = [{"code": "000001", "sector": "冷门行业", "turnover": 1e6}]
+        self.assertEqual(r.sectors_worth_ranking(entries), set())
+
+    def test_one_liquid_name_keeps_the_sector(self):
+        entries = [{"code": "000001", "sector": "半导体", "turnover": 1e6},
+                   {"code": "688825", "sector": "半导体", "turnover": 1e10}]
+        self.assertEqual(r.sectors_worth_ranking(entries), {"半导体"})
+
+    def test_unknown_turnover_is_not_treated_as_illiquid(self):
+        """The calendar query need not carry the column; a missing value must
+        not silently empty the book."""
+        entries = [{"code": "000001", "sector": "半导体", "turnover": None}]
+        self.assertEqual(r.sectors_worth_ranking(entries), {"半导体"})
+
+    def test_entries_without_a_sector_are_ignored(self):
+        entries = [{"code": "000001", "sector": None, "turnover": 1e10}]
+        self.assertEqual(r.sectors_worth_ranking(entries), set())
 
 
 class SafetyTests(unittest.TestCase):

@@ -172,9 +172,18 @@ def fetch_calendar(start: int, end: int, skill_dir: str, python_exe: str):
     q = ("定期报告预计披露日期在%s到%s之间的A股，显示所属东财行业和成交额"
          % (fmt(start), fmt(end)))
     rows = run_screener(q, skill_dir, python_exe)
+    # Match sector to entry BY CODE, never by position. parse_calendar_rows drops
+    # rows it cannot use - a bad code, a missing date - so zipping its output
+    # against the raw rows shifts every sector after the first dropped row and
+    # silently files a name under someone else industry.
+    sectors = {}
+    for raw in rows:
+        code = str(_col(raw, "代码") or "").strip().zfill(6)
+        if code.isdigit() and len(code) == 6:
+            sectors.setdefault(code, sector_of(raw))
     entries = []
-    for parsed, raw in zip(dc.parse_calendar_rows(rows), rows):
-        parsed["sector"] = sector_of(raw)
+    for parsed in dc.parse_calendar_rows(rows):
+        parsed["sector"] = sectors.get(parsed["code"])
         entries.append(parsed)
     return entries
 
@@ -189,6 +198,29 @@ def fetch_sector_ranking(sector: str, skill_dir: str, python_exe: str) -> dict:
         if code.isdigit() and len(code) == 6 and code not in ranks:
             ranks[code] = i
     return ranks
+
+
+def sectors_worth_ranking(entries) -> set:
+    """Sectors holding at least one name that could survive the liquidity floor.
+
+    One screener call per sector, and a day's calendar spans ~83 of them. A
+    sector whose every calendar name is already below the floor will have all of
+    those names rejected whatever their rank, so fetching its ranking buys
+    nothing.
+
+    Unknown turnover does NOT count as illiquid - the calendar query need not
+    carry the column, and treating a missing value as a rejection would silently
+    empty the book on the day the screener changes its columns.
+    """
+    out = set()
+    for e in entries:
+        sector = e.get("sector")
+        if not sector:
+            continue
+        turnover = e.get("turnover")
+        if turnover is None or turnover >= dc.MIN_TURNOVER_YUAN:
+            out.add(sector)
+    return out
 
 
 def build_candidates(today: int, entries, sector_ranks, horizon_days: int):
@@ -239,7 +271,8 @@ def main(argv=None):
               file=sys.stderr)
         return 1
 
-    sectors = sorted({e["sector"] for e in entries if e.get("sector")})
+    sectors = sorted(sectors_worth_ranking(entries))
+    skipped = len({e["sector"] for e in entries if e.get("sector")}) - len(sectors)
     sector_ranks = {}
     for s in sectors:
         sector_ranks[s] = fetch_sector_ranking(s, args.skill_dir, args.python_exe)
@@ -253,6 +286,7 @@ def main(argv=None):
         "horizon_end": horizon_end,
         "entries_scored": len(scored),
         "sectors_ranked": len(sectors),
+        "sectors_skipped_illiquid": skipped,
         "unranked": sum(1 for c in scored if c.get("sector_rank") is None),
         "selected": selected,
         "rejected": [c for c in scored if not c.get("selected")],
@@ -260,8 +294,8 @@ def main(argv=None):
     Path(args.out).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print("scored %d over %d sectors; %d selected -> %s"
-          % (len(scored), len(sectors), len(selected), args.out))
+    print("scored %d over %d sectors (%d skipped as illiquid); %d selected -> %s"
+          % (len(scored), len(sectors), skipped, len(selected), args.out))
     for c in selected[:15]:
         print("  %-8s %-10s rank %-4s in %-10s reports in %s sessions"
               % (c["code"], (c.get("name") or "")[:9],
