@@ -205,8 +205,66 @@ class RankTests(unittest.TestCase):
         self.assertEqual(dc.rank([bad]), [])
 
 
+class SectorRankTests(unittest.TestCase):
+    """Splitting by sector rank is what separated +0.91% from +0.37%.
+
+        band        K=3            K=5            K=10          stocks
+        top 1-3   +0.91 t=3.03   +0.49 t=1.30   -0.21 t=-0.47    1,084
+        4-10      +0.53 t=2.73   +0.71 t=2.64   +0.94 t=2.45     2,342
+        11-30     +0.49 t=3.42   +0.69 t=3.79   +0.74 t=3.00     5,082
+        31+       +0.37 t=2.18   +0.54 t=2.33   +0.50 t=1.70    11,679
+    """
+
+    PEERS = [100.0, 90.0, 80.0, 70.0, 60.0, 50.0, 40.0, 30.0]
+
+    def test_largest_turnover_ranks_first(self):
+        self.assertEqual(dc.sector_rank_from_turnovers(100.0, self.PEERS), 1)
+
+    def test_smallest_ranks_last(self):
+        self.assertEqual(dc.sector_rank_from_turnovers(30.0, self.PEERS), 8)
+
+    def test_a_thin_sector_declines_rather_than_calling_everyone_a_leader(self):
+        self.assertIsNone(dc.sector_rank_from_turnovers(10.0, [1.0, 2.0]))
+
+    def test_missing_turnover_is_none_not_rank_one(self):
+        self.assertIsNone(dc.sector_rank_from_turnovers(None, self.PEERS))
+
+    def test_the_tail_band_is_rejected(self):
+        e = {"code": "600000", "scheduled": 20260429,
+             "turnover": 1e9, "sector_rank": 90}
+        r = dc.evaluate(e, 20260428, CAL)
+        self.assertFalse(r["selected"])
+        self.assertIn("sector", r["reason"])
+
+    def test_a_leader_uses_the_shorter_window(self):
+        """Top 1-3 measured +0.91% at three sessions and -0.21% at ten."""
+        self.assertEqual(dc.entry_window_for(1), dc.ENTRY_SESSIONS_BEFORE_LEADER)
+        self.assertEqual(dc.entry_window_for(20), dc.ENTRY_SESSIONS_BEFORE)
+        self.assertEqual(dc.entry_window_for(None), dc.ENTRY_SESSIONS_BEFORE)
+
+    def test_a_leader_five_sessions_out_is_too_early(self):
+        e = {"code": "600000", "scheduled": 20260508,
+             "turnover": 1e9, "sector_rank": 1}
+        r = dc.evaluate(e, 20260428, CAL)
+        self.assertFalse(r["selected"])
+        self.assertIn("beyond", r["reason"])
+
+    def test_a_mid_band_name_five_sessions_out_is_fine(self):
+        e = {"code": "600000", "scheduled": 20260508,
+             "turnover": 1e9, "sector_rank": 20}
+        self.assertTrue(dc.evaluate(e, 20260428, CAL)["selected"])
+
+    def test_leaders_rank_ahead_of_the_mid_band(self):
+        lead = dc.evaluate({"code": "000001", "scheduled": 20260429,
+                            "turnover": 1e9, "sector_rank": 2}, 20260428, CAL)
+        mid = dc.evaluate({"code": "000002", "scheduled": 20260429,
+                           "turnover": 9e9, "sector_rank": 25}, 20260428, CAL)
+        self.assertEqual([c["code"] for c in dc.rank([mid, lead])],
+                         ["000001", "000002"])
+
+
 class TiltTests(unittest.TestCase):
-    """+0.45% over three sessions is a tiebreaker, not a book."""
+    """Even the best band is +0.91% over three sessions: a tiebreaker, not a book."""
 
     def test_inside_the_window_tilts_up(self):
         self.assertGreater(dc.tilt_weight(3), 1.0)
@@ -219,9 +277,22 @@ class TiltTests(unittest.TestCase):
         """Deferral is bad news, but this module measured a run-up, not a short."""
         self.assertEqual(dc.tilt_weight(-9), 1.0)
 
+    def test_a_leader_tilts_harder_than_the_mid_band(self):
+        self.assertGreater(dc.tilt_weight(2, sector_rank=1),
+                           dc.tilt_weight(2, sector_rank=20))
+
+    def test_the_tail_gets_no_tilt(self):
+        self.assertEqual(dc.tilt_weight(2, sector_rank=90), 1.0)
+
+    def test_a_leader_outside_its_shorter_window_is_neutral(self):
+        """Rank alone does not earn a tilt; the window still has to hold."""
+        self.assertEqual(dc.tilt_weight(5, sector_rank=1), 1.0)
+        self.assertGreater(dc.tilt_weight(5, sector_rank=20), 1.0)
+
     def test_the_tilt_stays_small(self):
-        """A measured +0.45% cannot justify a large multiplier."""
-        self.assertLessEqual(dc.tilt_weight(3), 1.10)
+        """A measured +0.91% cannot justify a large multiplier."""
+        for rk in (1, 20, None):
+            self.assertLessEqual(dc.tilt_weight(2, sector_rank=rk), 1.10)
 
 
 class SafetyTests(unittest.TestCase):

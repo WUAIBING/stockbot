@@ -124,6 +124,60 @@ def drift_test(dates, C, A, row, pairs, idx, K, offset=0):
     return st
 
 
+def drift_test_ranked(dates, C, A, row, pairs, idx, K, ind, RK,
+                      lo, hi, offset=0):
+    """Same window, restricted to stocks ranked lo..hi inside their own sector.
+
+    The claim being tested is that the leaders carry the signal and the tail
+    dilutes it. If that is true the top band beats the pooled number AND still
+    beats its own placebo. If only the first half holds, the leaders were simply
+    drifting and this is the pre-announcement mistake wearing a new hat.
+    """
+    buckets = collections.defaultdict(list)
+    for code, d in pairs:
+        j = session_at_or_after(dates, d)
+        if j <= 0:
+            continue
+        j += offset
+        if j <= 0 or j >= C.shape[1]:
+            continue
+        r = row[code]
+        entry, exit_ = j - 1 - K, j - 1
+        if entry < 0:
+            continue
+        if not np.isfinite(A[r, entry]) or A[r, entry] < MIN_AMOUNT:
+            continue
+        if code not in ind:
+            continue
+        rk = RK[r, entry]
+        if not np.isfinite(rk) or rk < lo or rk > hi:
+            continue
+        e = excess(C, idx, r, entry, exit_)
+        if e is not None:
+            buckets[int(dates[j])].append(e)
+    per_date = {d: sum(v) / len(v) for d, v in buckets.items() if v}
+    st = by_date_stats(per_date)
+    st["stocks"] = sum(len(v) for v in buckets.values())
+    return st, per_date
+
+
+def welch(a, b):
+    """Two-sample t on per-date means: is the true anchor above its placebos?
+
+    The adjusted figure is a difference of two noisy estimates, so quoting it
+    without a test is how a 0.9pp gap between two 3pp standard deviations gets
+    reported as a finding.
+    """
+    na, nb = len(a), len(b)
+    if na < 3 or nb < 3:
+        return float("nan"), float("nan")
+    ma, mb = sum(a) / na, sum(b) / nb
+    va = sum((x - ma) ** 2 for x in a) / (na - 1)
+    vb = sum((x - mb) ** 2 for x in b) / (nb - 1)
+    se = math.sqrt(va / na + vb / nb)
+    return ma - mb, (ma - mb) / se if se else float("nan")
+
+
 def event_and_after(dates, C, A, row, pairs, idx, K):
     """The disclosure session itself, and the K sessions after it."""
     ev, af = collections.defaultdict(list), collections.defaultdict(list)
@@ -142,6 +196,68 @@ def event_and_after(dates, C, A, row, pairs, idx, K):
             af[int(dates[j])].append(b)
     return (by_date_stats({d: sum(v) / len(v) for d, v in ev.items() if v}),
             by_date_stats({d: sum(v) / len(v) for d, v in af.items() if v}))
+
+
+def load_industry(path, level=5):
+    """tdxhy.cfg -> {code: sector}. Line is market|code|tdx_hy|||csrc_hy.
+
+    Level 5 keeps T1102 out of T110201: the second tier, which groups a sector
+    tightly enough to have a recognisable leader without splitting it into
+    fragments of three names.
+    """
+    out = {}
+    for ln in open(path, encoding="gbk", errors="ignore"):
+        parts = ln.strip().split("|")
+        if len(parts) < 3:
+            continue
+        code, hy = parts[1].strip(), parts[2].strip()
+        if len(code) == 6 and code.isdigit() and hy.startswith("T"):
+            out[code] = hy[:level]
+    return out
+
+
+def rolling_mean_turnover(A, w=20):
+    """Trailing mean turnover, NaN-tolerant, ending AT each session.
+
+    Used to rank a stock inside its sector as of the entry session. Ranking by
+    today size instead would ask which names are big NOW, which is a different
+    and unanswerable question at the moment the trade is placed.
+    """
+    V = np.where(np.isfinite(A), A, 0.0)
+    M = np.isfinite(A).astype(np.float64)
+    cs = np.cumsum(V, axis=1)
+    cm = np.cumsum(M, axis=1)
+    out = np.full(A.shape, np.nan)
+    tot = cs[:, w - 1:] - np.concatenate(
+        [np.zeros((A.shape[0], 1)), cs[:, :-w]], axis=1)
+    cnt = cm[:, w - 1:] - np.concatenate(
+        [np.zeros((A.shape[0], 1)), cm[:, :-w]], axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out[:, w - 1:] = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)
+    return out
+
+
+def sector_rank_matrix(R20, members, min_members=5):
+    """RK[stock, session] = 1-based turnover rank inside its own sector.
+
+    Precomputed for the whole panel: the study runs the same ranking through
+    four bands, three windows and five anchor shifts, and recomputing it inside
+    that loop turns a vectorised sort into 150M interpreted comparisons.
+    """
+    RK = np.full(R20.shape, np.nan, dtype=np.float32)
+    for rows in members.values():
+        if len(rows) < min_members:
+            continue
+        rows = np.asarray(rows)
+        sub = R20[rows, :]
+        keyed = np.where(np.isfinite(sub), sub, -np.inf)
+        order = np.argsort(-keyed, axis=0, kind="stable")
+        ranks = np.empty(order.shape, dtype=np.float32)
+        seq = np.arange(1, len(rows) + 1, dtype=np.float32)[:, None]
+        np.put_along_axis(ranks, order, np.broadcast_to(seq, order.shape), axis=0)
+        ranks[~np.isfinite(sub)] = np.nan
+        RK[rows, :] = ranks
+    return RK
 
 
 def board_of(code):
@@ -268,6 +384,46 @@ def main():
         st = drift_test(dates, C, A, row, sub, idx, 10)
         print("  %-10s %6d %7d %+9.3f %+7.2f"
               % (b, st["n"], st["stocks"], st["mean"], st["t"]))
+
+    hycfg = sys.argv[3] if len(sys.argv) > 3 else None
+    if hycfg:
+        ind = load_industry(hycfg)
+        members = collections.defaultdict(list)
+        for c, s in ind.items():
+            r = row.get(c)
+            if r is not None:
+                members[s].append(r)
+        R20 = rolling_mean_turnover(A, 20)
+        RK = sector_rank_matrix(R20, members)
+        print()
+        print("BY SECTOR RANK, ranked on trailing 20-session turnover AT ENTRY")
+        print("  sectors %d | the question is whether the leaders carry it"
+              % len(members))
+        print()
+        print("  The raw column is NOT comparable across bands. Excess here is")
+        print("  measured against an EQUAL-WEIGHTED universe, so a sector leader")
+        print("  carries a structural drag that has nothing to do with reporting:")
+        print("  every placebo shift on the top band is negative too. Only")
+        print("  true-minus-its-own-placebo isolates the event.")
+        print()
+        print("  %-10s %-4s %9s %9s %9s %7s %6s %7s"
+              % ("band", "K", "raw", "placebo", "adjusted", "t", "dates", "stocks"))
+        bands = ((1, 3, "top 1-3"), (4, 10, "4-10"),
+                 (11, 30, "11-30"), (31, 9999, "31+"))
+        for lo, hi, label in bands:
+            for K in (3, 5, 10):
+                st, tru = drift_test_ranked(dates, C, A, row, pairs, idx, K,
+                                            ind, RK, lo, hi)
+                ctrl = []
+                for off in (-60, -40, 40, 60):
+                    _, pd_ = drift_test_ranked(dates, C, A, row, pairs, idx, K,
+                                               ind, RK, lo, hi, offset=off)
+                    ctrl.extend(pd_.values())
+                adj, tstat = welch(list(tru.values()), ctrl)
+                print("  %-10s %-4d %+9.2f %+9.2f %+9.2f %+7.2f %6d %7d"
+                      % (label, K, st["mean"],
+                         (sum(ctrl) / len(ctrl)) if ctrl else float("nan"),
+                         adj, tstat, st["n"], st["stocks"]))
 
     print()
     print("TEST 2  early schedulers vs late, held over the same sessions")

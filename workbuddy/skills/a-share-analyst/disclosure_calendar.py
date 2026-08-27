@@ -49,14 +49,27 @@ conference failed the same way: four World Robot Conferences averaged +0.63%
 So: measure against a shifted anchor, or you are measuring what the stock was
 already doing.
 
+WHERE IT ACTUALLY LIVES: THE TOP OF EACH SECTOR
+
+The +0.45% above pools everything liquid, and pooling is what diluted it. Rank
+each name by trailing turnover inside its own sector and the top three measure
++0.91% (t=3.03) against +0.37% (t=2.18) for everything past rank 30 - roughly
+2.5x - even though the tail holds 11,679 of the 20,187 observations. See
+MAX_SECTOR_RANK below for the full table and for why the RAW numbers say the
+opposite until each band is compared against its own placebo.
+
+That is the practical difference between watching 5,000 names and watching the
+few hundred at the head of each sector.
+
 WHAT THIS IS WORTH, STATED PLAINLY
 
-+0.45% over three sessions is roughly +0.30% net of a 0.15% round trip. That is
-a TILT, not a book. Sized as a standalone strategy it would be swamped by the
-noise it trades in; used to break ties between candidates the mainline already
-likes, it is free money on information nothing else in the system reads. The
-reporting calendar is also seasonal - April, July-August and October - so this
-sits idle most of the year by construction.
++0.91% over three sessions for a sector leader is roughly +0.76% net of a 0.15%
+round trip; the pooled figure is half that. Either way it is a TILT, not a book.
+Sized as a standalone strategy it would be swamped by the noise it trades in;
+used to break ties between candidates the mainline already likes, it is free
+money on information nothing else in the system reads. The reporting calendar is
+also seasonal - April, July-August and October - so this sits idle most of the
+year by construction.
 
     board       mean%      t    dates
     STAR 688   +1.242   +1.57      87
@@ -94,6 +107,33 @@ from typing import Iterable, Mapping, Sequence
 # there.
 ENTRY_SESSIONS_BEFORE = 5
 EXIT_SESSIONS_BEFORE = 1          # out the session before the report lands
+
+# Rank inside the stock own sector, by trailing 20-session turnover measured AT
+# ENTRY - never by size today, which is not knowable when the trade is placed.
+#
+# Splitting the same 24,773 events by that rank changes the picture, but ONLY
+# after each band is compared against its own placebo. Raw excess is measured
+# against an equal-weighted universe, so a sector leader carries a structural
+# drag - every placebo shift on the top band is negative - and the raw column
+# makes the tail look best while the adjusted column reverses it:
+#
+#     band        K=3            K=5            K=10          stocks
+#     top 1-3   +0.91 t=3.03   +0.49 t=1.30   -0.21 t=-0.47    1,084
+#     4-10      +0.53 t=2.73   +0.71 t=2.64   +0.94 t=2.45     2,342
+#     11-30     +0.49 t=3.42   +0.69 t=3.79   +0.74 t=3.00     5,082
+#     31+       +0.37 t=2.18   +0.54 t=2.33   +0.50 t=1.70    11,679
+#
+# The leaders carry about 2.5x the tail at three sessions. The tail is the
+# weakest band at every window despite holding 11,679 of the observations, which
+# is why pooling everything liquid diluted the pooled figure to +0.45%.
+#
+# And the leader edge is SHORT. Top 1-3 is strongest at three sessions and gone
+# by ten; the 4-30 band still pays at ten. Read that as the leaders being where
+# large money can actually transact, so the anticipation is priced quickly and
+# holding past it is holding someone else exit.
+MAX_SECTOR_RANK = 30              # past this the band is weakest; drop it
+LEADER_SECTOR_RANK = 3            # top of the sector
+ENTRY_SESSIONS_BEFORE_LEADER = 3  # leaders price it faster, so enter later
 
 # The event day ran -0.106% (t=-1.31) across 241 dates. Holding through the
 # announcement is a different trade with a worse measured outcome, so the
@@ -224,6 +264,40 @@ def _schedule_slipped(sessions: int) -> bool:
     return sessions < -MAX_SCHEDULE_SLIP_SESSIONS
 
 
+def sector_rank_from_turnovers(own_turnover: float | None,
+                               peer_turnovers: Sequence[float],
+                               min_peers: int = 5) -> int | None:
+    """1-based rank of a stock inside its sector, largest turnover first.
+
+    Peers must be the WHOLE sector, not just the names reporting that day -
+    ranking a stock against the handful of its neighbours that happen to be on
+    the calendar would call almost everyone a leader.
+
+    Turnover is the measure rather than market cap because it is where money can
+    actually transact, and it is what the study ranked on: a trailing 20-session
+    mean taken AT ENTRY, never a figure known only later.
+    """
+    if own_turnover is None:
+        return None
+    peers = [float(p) for p in peer_turnovers
+             if p is not None and float(p) == float(p)]
+    if len(peers) < min_peers:
+        return None
+    return sum(1 for p in peers if p > own_turnover) + 1
+
+
+def entry_window_for(sector_rank: int | None) -> int:
+    """How early to enter, given where the name sits in its sector.
+
+    Top-of-sector names measured +0.91% at three sessions and -0.21% at ten, so
+    entering them early is not more of the same edge - it is the part of the
+    window where the edge has not arrived and, by ten, has already gone.
+    """
+    if sector_rank is not None and sector_rank <= LEADER_SECTOR_RANK:
+        return ENTRY_SESSIONS_BEFORE_LEADER
+    return ENTRY_SESSIONS_BEFORE
+
+
 def evaluate(entry: Mapping, today: int,
              trading_dates: Sequence[int]) -> dict:
     """Judge one calendar entry. Always returns a reason, including when it declines."""
@@ -234,16 +308,23 @@ def evaluate(entry: Mapping, today: int,
     result["sessions_until"] = sessions
 
     turnover = entry.get("turnover")
+    rank_in_sector = entry.get("sector_rank")
+    window = entry_window_for(rank_in_sector)
     if sessions is None:
         result.update(selected=False, reason="scheduled date not on the trading calendar")
     elif _schedule_slipped(sessions):
         result.update(selected=False,
                       reason="scheduled %d sessions ago with no report - deferred, "
                              "and companies defer when the numbers are bad" % (-sessions))
-    elif sessions > ENTRY_SESSIONS_BEFORE:
+    elif rank_in_sector is not None and rank_in_sector > MAX_SECTOR_RANK:
         result.update(selected=False,
-                      reason="%d sessions out, beyond the %d-session window where the "
-                             "drift was measured" % (sessions, ENTRY_SESSIONS_BEFORE))
+                      reason="ranked %d in its sector by turnover; past %d the band "
+                             "measured +0.37%% against +0.91%% at the top"
+                             % (rank_in_sector, MAX_SECTOR_RANK))
+    elif sessions > window:
+        result.update(selected=False,
+                      reason="%d sessions out, beyond the %d-session window measured "
+                             "for this band" % (sessions, window))
     elif sessions < EXIT_SESSIONS_BEFORE:
         result.update(selected=False,
                       reason="inside %d sessions - the event day itself measured "
@@ -253,36 +334,50 @@ def evaluate(entry: Mapping, today: int,
                       reason="turnover below the %.0f万 floor the measurement used"
                              % (MIN_TURNOVER_YUAN / 1e4))
     else:
+        if rank_in_sector is None:
+            band = "unranked, pooled +0.45%"
+        elif rank_in_sector <= LEADER_SECTOR_RANK:
+            band = "sector rank %d, top band +0.91%%" % rank_in_sector
+        else:
+            band = "sector rank %d, mid band +0.49%% to +0.94%%" % rank_in_sector
         result.update(selected=True,
-                      reason="reports in %d sessions; measured +0.45%% to +0.54%% "
-                             "excess over this window" % sessions)
+                      reason="reports in %d sessions; %s" % (sessions, band))
     return result
 
 
 def rank(candidates: Iterable[Mapping]) -> list[dict]:
-    """Selected only, nearest report first, then by turnover.
+    """Selected only: sector leaders first, then nearest report, then turnover.
 
-    Nearest-first because the drift concentrates in the last three sessions: a
-    name reporting in two is further into the measured window than one reporting
-    in five.
+    Leaders lead because the top band measured +0.91% against +0.37% for the
+    tail. Nearest-report second because the drift concentrates in the final
+    sessions - a name reporting in two is further into the measured window than
+    one reporting in five.
     """
     sel = [c for c in candidates if c.get("selected")]
-    sel.sort(key=lambda c: (c.get("sessions_until", 99),
+    sel.sort(key=lambda c: (0 if (c.get("sector_rank") is not None
+                                  and c["sector_rank"] <= LEADER_SECTOR_RANK)
+                            else 1,
+                            c.get("sessions_until", 99),
                             -(c.get("turnover") or 0.0)))
     return sel
 
 
-def tilt_weight(sessions_until_report: int | None) -> float:
+def tilt_weight(sessions_until_report: int | None,
+                sector_rank: int | None = None) -> float:
     """A multiplier for an existing candidate score, never a standalone signal.
 
-    +0.45% over three sessions cannot carry a book of its own. It can break a tie
-    between two names the mainline already likes, which is the only use the
-    measured size supports.
+    Even the best band is +0.91% over three sessions, which cannot carry a book
+    of its own. It can break a tie between two names the mainline already likes,
+    and it should break it harder for a sector leader than for the tail - that
+    is the whole of what the rank split earned.
     """
-    if sessions_until_report is None:
+    if sessions_until_report is None or _schedule_slipped(sessions_until_report):
         return 1.0
-    if _schedule_slipped(sessions_until_report):
+    if sector_rank is not None and sector_rank > MAX_SECTOR_RANK:
         return 1.0
-    if EXIT_SESSIONS_BEFORE <= sessions_until_report <= ENTRY_SESSIONS_BEFORE:
-        return 1.05
-    return 1.0
+    window = entry_window_for(sector_rank)
+    if not (EXIT_SESSIONS_BEFORE <= sessions_until_report <= window):
+        return 1.0
+    if sector_rank is not None and sector_rank <= LEADER_SECTOR_RANK:
+        return 1.08
+    return 1.05
