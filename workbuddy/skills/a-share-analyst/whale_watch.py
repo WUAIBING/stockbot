@@ -21,11 +21,17 @@ WHY EACH RULE EXISTS - all three came from screens that caught the wrong thing:
       中国银行, 南京银行, 中信证券, 中金公司, 华能国际 - index flow. 30M into a
       trillion-yuan bank is noise; the same figure in a mid-cap is conviction.
 
-  Sustained across days, not one spike.
-      佰仁医疗 passed a one-day screen on 4,029万 of 超大单 inflow. Its previous
-      nine sessions ran -259, +12, +69, +275, +364, -598, +160, -97, -161万 -
-      noise around zero. One block trade, not accumulation. A single session
-      cannot tell a whale from a splash.
+  Early in the campaign, not late.
+      佰仁医疗 passed a one-day screen on 4,029万 of 超大单 inflow after nine
+      sessions of noise. One session cannot tell a whale from a splash - but the
+      first fix was worse than the problem. Requiring flow positive on 6 of 10
+      sessions rejects block trades and SELECTS campaigns already six days along.
+      A large position takes days or weeks to build; six positive days means the
+      whale is most of the way done, and the supply it still needs is whoever
+      buys now. That slowness is the opportunity only if you are early, so the
+      test is the TURN - flow crossing from neutral or negative into positive on
+      more than one session, while the prior window was NOT already accumulating
+      and price has not moved.
 
 WHAT IT DELIBERATELY WILL NOT DO
 
@@ -49,10 +55,24 @@ MIN_TURNOVER_YUAN = 5.0e9          # 50亿
 # by size and finds index flow instead of conviction.
 MIN_FLOW_RATIO = 0.05
 
-# Sustained accumulation: positive extra-large-order flow on at least this many
-# of the trailing sessions available.
-SUSTAIN_MIN_DAYS = 6
+# A large position takes days or weeks to build, and that slowness is the whole
+# opportunity - but only if you are early in the campaign rather than late.
+#
+# The first version of this module required flow positive on 6 of 10 sessions.
+# That rejects block trades, but look at what it SELECTS: a campaign already six
+# days along. If a whale needs two weeks to build, six positive days means they
+# are most of the way done, and the supply they still need is whoever buys now.
+# It was structurally a LATE detector, which is exactly the moment you become
+# their exit liquidity.
+#
+# So the test is the TURN, not the level: flow crossing from neutral or negative
+# into positive, while price has not moved yet. Day one to three of a campaign,
+# not day seven to ten.
 SUSTAIN_WINDOW = 10
+RECENT_DAYS = 3           # the possible turn
+PRIOR_DAYS = 7            # what it is turning away from
+MIN_RECENT_POSITIVE = 2   # of RECENT_DAYS, so one spike is not a campaign
+MAX_PRIOR_POSITIVE = 0.50 # if the prior window was already accumulating, we are late
 
 # If the move has already happened, the whale's wake is what is being bought.
 MAX_PRICE_RUN_PCT = 15.0
@@ -139,34 +159,54 @@ def parse_screen_rows(rows: Iterable[Mapping]) -> list[dict]:
     return out
 
 
-def sustained_accumulation(history: Sequence[Mapping],
-                           min_days: int = SUSTAIN_MIN_DAYS,
-                           window: int = SUSTAIN_WINDOW) -> dict:
-    """Is the extra-large-order flow ongoing, or was it one session?
+def early_turn(history: Sequence[Mapping], window: int = SUSTAIN_WINDOW) -> dict:
+    """Has money just STARTED arriving, or has it been arriving for a while?
 
     history: newest-first rows carrying 'whale_flow' and optionally 'change_pct'.
+
+    Three conditions, all necessary:
+
+      the recent window turned positive   - money is arriving now
+      on more than one session            - a campaign, not a block trade
+      the prior window was not already    - we are near the start of it,
+        accumulating                        not near the end
+
+    The last condition is what the previous version had backwards. Requiring a
+    long run of positive sessions selected campaigns that were nearly complete.
     """
     rows = [h for h in history if h.get("whale_flow") is not None][:window]
-    if len(rows) < min_days:
-        return {"sustained": False, "positive_days": 0, "sessions": len(rows),
-                "reason": f"only {len(rows)} sessions, need {min_days}"}
+    need = RECENT_DAYS + MIN_RECENT_POSITIVE
+    if len(rows) < need:
+        return {"early": False, "sessions": len(rows), "recent_positive": 0,
+                "reason": f"only {len(rows)} sessions, need {need}"}
+
     flows = [float(h["whale_flow"]) for h in rows]
-    pos = sum(1 for f in flows if f > 0)
-    # A single session dominating the window is a block trade, not a campaign.
-    total_abs = sum(abs(f) for f in flows) or 1.0
-    top_share = max(abs(f) for f in flows) / total_abs
-    concentrated = top_share > 0.60
-    ok = pos >= min_days and not concentrated
+    recent, prior = flows[:RECENT_DAYS], flows[RECENT_DAYS:RECENT_DAYS + PRIOR_DAYS]
+    recent_pos = sum(1 for f in recent if f > 0)
+    prior_pos_ratio = (sum(1 for f in prior if f > 0) / len(prior)) if prior else 0.0
+    recent_mean = sum(recent) / len(recent)
+    prior_mean = (sum(prior) / len(prior)) if prior else 0.0
+    turn = recent_mean - prior_mean
+
+    if recent_pos < MIN_RECENT_POSITIVE:
+        ok, why = False, (f"only {recent_pos}/{len(recent)} recent sessions positive"
+                          f" - a single print, not a campaign")
+    elif prior_pos_ratio > MAX_PRIOR_POSITIVE:
+        ok, why = False, (f"prior window already {prior_pos_ratio:.0%} positive"
+                          f" - the campaign is mature, this is its exit liquidity")
+    elif turn <= 0:
+        ok, why = False, "recent flow is not above the prior window - no turn"
+    else:
+        ok, why = True, (f"turn: {recent_pos}/{len(recent)} recent positive against"
+                         f" a prior window {prior_pos_ratio:.0%} positive")
+
     return {
-        "sustained": ok,
-        "positive_days": pos,
+        "early": ok,
         "sessions": len(rows),
-        "top_day_share": round(top_share, 3),
-        "reason": (
-            f"{pos}/{len(rows)} sessions positive"
-            + ("; one session is %.0f%% of all flow - block trade, not accumulation"
-               % (top_share * 100) if concentrated else "")
-        ),
+        "recent_positive": recent_pos,
+        "prior_positive_ratio": round(prior_pos_ratio, 3),
+        "turn": turn,
+        "reason": why,
     }
 
 
@@ -182,12 +222,12 @@ def price_run_pct(history: Sequence[Mapping], window: int = SUSTAIN_WINDOW) -> f
 def evaluate(candidate: Mapping, history: Sequence[Mapping]) -> dict:
     """Judge one candidate. Always returns a reason, including when it declines."""
     result = dict(candidate)
-    acc = sustained_accumulation(history)
+    acc = early_turn(history)
     run = price_run_pct(history)
     result.update({
-        "positive_days": acc["positive_days"],
+        "recent_positive": acc["recent_positive"],
+        "prior_positive_ratio": acc.get("prior_positive_ratio"),
         "sessions": acc["sessions"],
-        "top_day_share": acc.get("top_day_share"),
         "price_run_pct": round(run, 2),
     })
     if candidate.get("turnover", 0) < MIN_TURNOVER_YUAN:
@@ -196,7 +236,7 @@ def evaluate(candidate: Mapping, history: Sequence[Mapping]) -> dict:
         result.update(selected=False,
                       reason=f"flow ratio {candidate.get('flow_ratio', 0):.3f} "
                              f"below {MIN_FLOW_RATIO}")
-    elif not acc["sustained"]:
+    elif not acc["early"]:
         result.update(selected=False, reason=acc["reason"])
     elif run > MAX_PRICE_RUN_PCT:
         result.update(selected=False,

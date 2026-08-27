@@ -91,42 +91,55 @@ class ScreenParsingTests(unittest.TestCase):
         self.assertEqual(w.parse_screen_rows(rows), [])
 
 
-class SustainTests(unittest.TestCase):
-    """Whale versus splash - the distinction a one-day screen cannot make."""
+class EarlyTurnTests(unittest.TestCase):
+    """Early in the campaign, not late - the distinction that decides who eats whom."""
 
-    def test_the_bairen_case_is_rejected(self):
-        """佰仁医疗: nine sessions of noise, then one 4,029万 spike."""
+    def test_a_fresh_turn_is_accepted(self):
+        """Quiet, then money starts arriving on the last three sessions."""
+        h = hist([3e7, 2.8e7, 1.5e7,          # recent: turning
+                  -1e7, -5e6, 2e6, -8e6, -2e7, 1e6, -4e6])
+        acc = w.early_turn(h)
+        self.assertTrue(acc["early"])
+        self.assertGreaterEqual(acc["recent_positive"], w.MIN_RECENT_POSITIVE)
+
+    def test_a_mature_campaign_is_rejected(self):
+        """This is what the previous version SELECTED - six days in, nearly done."""
+        h = hist([3e7, 2.5e7, 2.8e7, 3.2e7, 2.1e7, 2.9e7, 3.1e7, 2.7e7, 2.4e7, 3e7])
+        acc = w.early_turn(h)
+        self.assertFalse(acc["early"])
+        self.assertIn("mature", acc["reason"])
+
+    def test_the_bairen_single_print_is_rejected(self):
+        """佰仁医疗: one 4,029万 session, the two before it negative."""
         h = hist([4029e4, -17e4, -161e4, -97e4, 160e4,
                   -598e4, 364e4, 275e4, 69e4, 12e4])
-        acc = w.sustained_accumulation(h)
-        self.assertFalse(acc["sustained"])
-        self.assertIn("block trade", acc["reason"])
+        acc = w.early_turn(h)
+        self.assertFalse(acc["early"])
+        self.assertIn("single print", acc["reason"])
 
-    def test_steady_accumulation_is_accepted(self):
-        h = hist([3e7, 2.5e7, 2.8e7, -1e7, 3.2e7, 2.1e7, 2.9e7, -5e6, 3.1e7, 2.7e7])
-        acc = w.sustained_accumulation(h)
-        self.assertTrue(acc["sustained"])
-        self.assertGreaterEqual(acc["positive_days"], w.SUSTAIN_MIN_DAYS)
-
-    def test_mostly_outflow_is_rejected(self):
-        h = hist([1e7, -2e7, -3e7, -1e7, -2e7, -4e7, 1e7, -1e7, -2e7, -3e7])
-        self.assertFalse(w.sustained_accumulation(h)["sustained"])
+    def test_continued_outflow_is_rejected(self):
+        h = hist([-1e7, -2e7, -3e7, -1e7, -2e7, -4e7, 1e7, -1e7, -2e7, -3e7])
+        self.assertFalse(w.early_turn(h)["early"])
 
     def test_short_history_declines_rather_than_assumes(self):
-        acc = w.sustained_accumulation(hist([1e7, 2e7, 1e7]))
-        self.assertFalse(acc["sustained"])
+        acc = w.early_turn(hist([1e7, 2e7]))
+        self.assertFalse(acc["early"])
         self.assertIn("need", acc["reason"])
 
-    def test_one_day_dominating_is_a_block_trade(self):
-        """Even with enough positive days, one session owning the flow is a splash."""
-        h = hist([1e9, 1e5, 1e5, 1e5, 1e5, 1e5, 1e5, 1e5, 1e5, 1e5])
-        acc = w.sustained_accumulation(h)
-        self.assertEqual(acc["positive_days"], 10)
-        self.assertFalse(acc["sustained"])
+    def test_recent_must_exceed_prior_not_merely_be_positive(self):
+        """Weakly positive after a strongly positive run is fading, not turning."""
+        h = hist([1e6, 1e6, 1e6, 5e7, 6e7, 5.5e7, -1e7, -2e7, -1e7, -2e7])
+        self.assertFalse(w.early_turn(h)["early"])
+
+    def test_every_outcome_explains_itself(self):
+        for h in (hist([3e7, 2.8e7, 1.5e7, -1e7, -5e6, 2e6, -8e6, -2e7, 1e6, -4e6]),
+                  hist([3e7]*10), hist([1e7, 2e7])):
+            self.assertTrue(w.early_turn(h)["reason"])
 
 
 class EvaluateTests(unittest.TestCase):
-    STEADY = hist([3e7, 2.5e7, 2.8e7, -1e7, 3.2e7, 2.1e7, 2.9e7, -5e6, 3.1e7, 2.7e7],
+    # a fresh turn: quiet prior window, money arriving on the recent sessions
+    STEADY = hist([3e7, 2.8e7, 1.5e7, -1e7, -5e6, 2e6, -8e6, -2e7, 1e6, -4e6],
                   [0.4, 0.2, -0.3, 0.5, 0.1, -0.2, 0.6, 0.0, 0.3, -0.1])
 
     def cand(self, **kw):
@@ -153,7 +166,8 @@ class EvaluateTests(unittest.TestCase):
 
     def test_a_completed_move_is_rejected(self):
         """+8%/day for ten sessions is the wake."""
-        run = hist([3e7]*10, [8.0]*10)
+        run = hist([3e7, 2.8e7, 1.5e7, -1e7, -5e6, 2e6, -8e6, -2e7, 1e6, -4e6],
+                   [8.0]*10)
         r = w.evaluate(self.cand(), run)
         self.assertFalse(r["selected"])
         self.assertIn("wake", r["reason"])
