@@ -325,3 +325,89 @@ class ShareCountAnomalyTests(unittest.TestCase):
         self.assertLess(sum(e["pnl"] for e in eps), 0.0)
         cash_in = 400 * 98.31 + 19 * 99.30
         self.assertGreater(cash_in - 300 * 128.42, 0.0)
+
+
+class CorporateActionTests(unittest.TestCase):
+    """688800 瑞可达, 10转4派3元, credited to shareholders 2026-06-17.
+
+    300 bought at 128.42 on 06-04 become 420 shares plus 90 yuan cash on 06-17,
+    which is why the stock opened 87.98 against a 124.54 close that morning.
+    Then 400 sold at 98.31 and 19 at 99.30.
+
+    Cash out 38,526. Cash back 39,324 + 1,886.70 + 90 dividend = 41,300.70.
+    The position MADE money. Naive pairing called it -9,033, the largest single
+    loss in the ledger.
+    """
+
+    EX = 1781654400   # 2026-06-17
+    ORDERS = [
+        order("688800", "buy", 12842, 300, 1780617000, name="瑞可达"),
+        order("688800", "sell", 9831, 400, 1782000000, name="瑞可达"),
+        order("688800", "sell", 9930, 19, 1782200000, name="瑞可达"),
+    ]
+    ACTION = [{"code": "688800", "time": EX, "per_10_bonus": 4, "per_10_cash": 3}]
+
+    def build(self):
+        return ml.build_episodes(self.ORDERS, corporate_actions=self.ACTION)
+
+    def test_the_share_count_grows_by_the_stated_ratio(self):
+        res = ml.apply_corporate_action(
+            [{"price": 128.42, "remaining": 300, "quantity": 300}], 4, 3)
+        self.assertEqual(res["lots"][0]["remaining"], 420)
+
+    def test_cost_is_preserved_and_the_basis_falls(self):
+        """The holding did not change value, only how many pieces it is in."""
+        res = ml.apply_corporate_action(
+            [{"price": 128.42, "remaining": 300, "quantity": 300}], 4, 3)
+        lot = res["lots"][0]
+        self.assertAlmostEqual(lot["price"] * lot["remaining"], 128.42 * 300, places=2)
+        self.assertAlmostEqual(lot["price"], 91.7286, places=3)
+
+    def test_the_cash_dividend_is_three_yuan_per_ten_shares(self):
+        res = ml.apply_corporate_action(
+            [{"price": 128.42, "remaining": 300, "quantity": 300}], 4, 3)
+        self.assertAlmostEqual(res["cash_dividend"], 90.0)
+
+    def test_the_position_is_now_a_gain(self):
+        out = self.build()
+        total = sum(e["pnl"] for e in out["episodes"]) + out["cash_dividend_total"]
+        self.assertGreater(total, 0.0)
+        # 419 of the 420 credited shares were sold, so realised is the gain on
+        # those plus the dividend. Cash in minus cash out is 2,774.70, which is
+        # 91.73 lower because it writes the one unsold share off to nothing
+        # instead of leaving it open at its basis.
+        self.assertAlmostEqual(total, 2866.43, delta=1.0)
+
+    def test_the_unsold_share_stays_open_rather_than_vanishing(self):
+        """300 x 1.4 credits 420; 400 + 19 were sold, so one share is still held."""
+        out = self.build()
+        remaining = [l for l in out["open_lots"] if l["code"] == "688800"]
+        self.assertEqual(sum(l["remaining"] for l in remaining), 1)
+        self.assertAlmostEqual(remaining[0]["price"], 91.7286, places=3)
+
+    def test_naive_pairing_would_have_called_it_a_9033_loss(self):
+        naive = sum(e["pnl"] for e in ml.build_episodes(self.ORDERS)["episodes"])
+        self.assertAlmostEqual(naive, -9033.0, delta=1.0)
+
+    def test_the_extra_shares_are_no_longer_unpaired(self):
+        self.assertEqual(self.build()["unpaired_sells"], [])
+
+    def test_the_dividend_reaches_realised_pnl(self):
+        out = self.build()
+        self.assertAlmostEqual(out["cash_dividend_total"], 90.0)
+        self.assertIn("cash_dividend_total", out["summary"])
+
+    def test_an_action_before_the_position_exists_does_nothing(self):
+        out = ml.build_episodes(self.ORDERS, corporate_actions=[
+            {"code": "688800", "time": 1, "per_10_bonus": 4, "per_10_cash": 3}])
+        self.assertEqual(out["cash_dividend_total"], 0.0)
+
+    def test_a_cash_only_dividend_leaves_the_share_count_alone(self):
+        res = ml.apply_corporate_action(
+            [{"price": 10.0, "remaining": 1000, "quantity": 1000}], 0, 3)
+        self.assertEqual(res["lots"][0]["remaining"], 1000)
+        self.assertAlmostEqual(res["cash_dividend"], 300.0)
+
+    def test_negative_terms_are_refused(self):
+        with self.assertRaises(ValueError):
+            ml.apply_corporate_action([], -1, 0)

@@ -53,25 +53,34 @@ account has run 163 days, and it accepts no date range and no pagination -
 fltOrderDrt and fltOrderStatus are its only parameters, and totalNum equals the
 number returned. So the first ten weeks are simply not retrievable.
 
-That this is a rolling window rather than a quiet start was settled by the
-arithmetic. Rebuilt realised P&L of +92,910.68 plus floating +3,907.30 stands
-against an account lifetime of +78,266.82, a gap of 18,551.16. Two things fill
-it exactly:
+That this is a rolling window rather than a quiet start was settled by a sale
+with no purchase: 002423 中粮资本, 9,000 shares at 9.02 on 2026-06-04, bought
+2026-03-20 at 11.06 when the account was two weeks old.
 
-    002423 中粮资本 sold 2026-06-04, 9,000 shares at 9.02, with NO buy anywhere
-    in the window. An entry of 10.52 closes the gap, and 10.52 was tradeable on
-    seven sessions in late March and early April - when this account was two
-    weeks old.        9,000 x (10.52 - 9.02)  ~ 13,483
+With every known fact supplied - that opening lot, and 瑞可达 10转4派3元 credited
+2026-06-17 - the window accounts for:
 
-    commission at 0.025% each way on 10,140,643 of turnover plus stamp duty at
-    0.05% on 5,066,974 of sales                ~  5,069
-                                               ---------
-                                                  18,552   against 18,551 observed
+    122 round trips, realised +86,450.11 including 90.00 of dividend
+    expected realised is 78,266.82 lifetime less 3,907.30 floating = 74,359.52
+    residual                                                        +12,090.59
+
+The residual is POSITIVE, meaning the rebuild claims more than the account made,
+and the explanation that fits is the one thing the API structurally cannot show:
+round trips that both opened AND closed before 2026-06-01. A position carried
+across the boundary at least leaves its sale behind as evidence. One completed
+entirely inside the missing ten weeks leaves nothing at all, and about 12,090 of
+losses there would close the books.
+
+That figure is bounded, not proven, and it is quoted as an unknown rather than
+folded into any performance number. An earlier version of this file claimed the
+books closed to 191.16 by attributing about 5,069 to commission and stamp duty
+and inferring a 10.52 entry from the remainder. The real entry was 11.06 and the
+simulator charges no meaningful fees; that reconciliation only looked clean
+because a -11,717.70 error on 瑞可达 was cancelling it. Reasoning backwards from
+a gap produces a number that fits and is wrong.
 
 So: from 2026-06-01 the record is complete and authoritative. Before it, only
-positions still open INTO the window are visible at all, and they appear here as
-unpaired sells rather than being dropped. Anything bought and closed entirely
-before June is gone.
+positions still open INTO the window are visible at all.
 
 THE WINDOW IS THE REASON TO ARCHIVE. Because it rolls, history exists only if
 something writes it down. A daily snapshot of the raw orders response costs one
@@ -156,7 +165,8 @@ def normalise_orders(orders: Iterable[Mapping]) -> list[dict]:
 
 
 def build_episodes(orders: Iterable[Mapping],
-                   opening_lots: Iterable[Mapping] | None = None) -> dict:
+                   opening_lots: Iterable[Mapping] | None = None,
+                   corporate_actions: Iterable[Mapping] | None = None) -> dict:
     """FIFO-pair fills into round trips, per code.
 
     FIFO because partial fills are normal here: 德科立 was one 400-share buy
@@ -200,7 +210,32 @@ def build_episodes(orders: Iterable[Mapping],
             "opening": True,
         })
 
+    # Ex dates are applied in time order against the orders, because an action
+    # restates whatever is open AT that moment. 瑞可达 credited its 10转4派3元 on
+    # 2026-06-17, between the 06-04 buy and the 06-22 sale, so applying it late
+    # or early prices the wrong number of shares.
+    pending = sorted(
+        (dict(a) for a in (corporate_actions or []) if a.get("code")),
+        key=lambda a: int(a.get("time") or 0))
+    dividends: list[dict] = []
+
+    def _apply_due(now: int) -> None:
+        while pending and int(pending[0].get("time") or 0) <= now:
+            act = pending.pop(0)
+            code = str(act["code"]).strip()
+            if not lots.get(code):
+                continue
+            res = apply_corporate_action(
+                list(lots[code]),
+                float(act.get("per_10_bonus") or 0.0),
+                float(act.get("per_10_cash") or 0.0))
+            lots[code] = collections.deque(res["lots"])
+            if res["cash_dividend"]:
+                dividends.append({"code": code, "time": act.get("time"),
+                                  "cash": res["cash_dividend"]})
+
     for o in normalise_orders(orders):
+        _apply_due(o["time"])
         code = o["code"]
         if o["side"] == "buy":
             lots[code].append(dict(o, remaining=o["quantity"]))
@@ -235,13 +270,65 @@ def build_episodes(orders: Iterable[Mapping],
         if remaining > 0:
             unpaired_sells.append(dict(o, unmatched_quantity=remaining))
 
+    _apply_due(2 ** 62)   # anything credited after the last order still counts
     open_lots = [dict(l) for code in lots for l in lots[code] if l["remaining"] > 0]
-    return {
+    cash_total = round(sum(d["cash"] for d in dividends), 2)
+    out = {
         "episodes": episodes,
         "unpaired_sells": unpaired_sells,
         "open_lots": open_lots,
+        "dividends": dividends,
+        "cash_dividend_total": cash_total,
         "summary": summarise(episodes),
     }
+    # A dividend is realised the moment it is paid, so it belongs in realised
+    # P&L even when the position is never closed.
+    out["summary"]["cash_dividend_total"] = cash_total
+    out["summary"]["realised_pnl"] = round(
+        out["summary"]["realised_pnl"] + cash_total, 2)
+    return out
+
+
+def apply_corporate_action(lots: Sequence[Mapping], per_10_bonus: float,
+                           per_10_cash: float) -> dict:
+    """Restate open lots across an ex date. A-share terms read 每10股转X派Y元.
+
+    688800 瑞可达 was 10转4派3元: every ten shares became fourteen, and every ten
+    paid 3 yuan. On 300 shares that is 120 free shares and 90 yuan.
+
+    The free shares are NOT profit and the lower price is NOT a loss - they are
+    the same holding renumbered, which is why the stock opened 87.98 against a
+    124.54 close on 2026-06-17. What must move is the BASIS: 38,526 paid, spread
+    over 420 shares instead of 300, is 91.73 a share rather than 128.42. Selling
+    at 98.31 is then a gain, and the -9,033 that naive pairing reported was an
+    artefact of comparing a pre-adjustment cost against a post-adjustment price.
+
+    Cash is returned separately rather than folded into the basis, because a
+    dividend is realised money the moment it is paid, whether or not the position
+    is ever closed.
+    """
+    if per_10_bonus < 0 or per_10_cash < 0:
+        raise ValueError("corporate action terms cannot be negative")
+    factor = 1.0 + (per_10_bonus / 10.0)
+    cash = 0.0
+    out = []
+    for lot in lots:
+        qty = int(lot.get("remaining", lot.get("quantity", 0)) or 0)
+        price = float(lot.get("price") or 0)
+        if qty <= 0 or price <= 0:
+            out.append(dict(lot))
+            continue
+        cash += qty / 10.0 * per_10_cash
+        new_qty = int(round(qty * factor))
+        adjusted = dict(lot)
+        adjusted["remaining"] = new_qty
+        adjusted["quantity"] = new_qty
+        # Cost is preserved, not the per-share price: the holding did not change
+        # value, only how many pieces it is divided into.
+        adjusted["price"] = round(price * qty / new_qty, 6) if new_qty else price
+        adjusted["corporate_action"] = "10转%g派%g" % (per_10_bonus, per_10_cash)
+        out.append(adjusted)
+    return {"lots": out, "cash_dividend": round(cash, 2)}
 
 
 def share_count_anomalies(orders: Iterable[Mapping]) -> list[dict]:
