@@ -221,3 +221,57 @@ class SafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpeningLotTests(unittest.TestCase):
+    """Positions already held when the window opens.
+
+    The orders endpoint floor is 2026-06-01 and it is a DATE cap, not a record
+    cap: filtering to buys returns 147 and sells 146, both still starting
+    2026-06-01, so no filter reaches further back. Anything held across that
+    boundary has to be supplied from the 调仓记录 in the app.
+    """
+
+    # 002423 中粮资本: 9,000 bought 2026-03-20 at 11.06, sold 2026-06-04 at 9.02.
+    OPENING = [{"code": "002423", "name": "中粮资本", "price": 11.06,
+                "quantity": 9000, "time": 1774000000}]
+    SELL = [order("002423", "sell", 902, 9000, 1780000000, name="中粮资本")]
+
+    def test_without_the_opening_lot_the_sale_cannot_be_paired(self):
+        out = ml.build_episodes(self.SELL)
+        self.assertEqual(out["episodes"], [])
+        self.assertEqual(len(out["unpaired_sells"]), 1)
+
+    def test_the_opening_lot_completes_the_round_trip(self):
+        out = ml.build_episodes(self.SELL, opening_lots=self.OPENING)
+        self.assertEqual(len(out["episodes"]), 1)
+        self.assertEqual(out["unpaired_sells"], [])
+
+    def test_it_recovers_the_real_loss(self):
+        e = ml.build_episodes(self.SELL, opening_lots=self.OPENING)["episodes"][0]
+        self.assertAlmostEqual(e["pnl"], -18360.0, places=2)
+        self.assertAlmostEqual(e["entry_price"], 11.06)
+
+    def test_a_hand_entered_basis_stays_labelled(self):
+        """This ledger exists because a hand-derived price was trusted as a fill."""
+        e = ml.build_episodes(self.SELL, opening_lots=self.OPENING)["episodes"][0]
+        self.assertEqual(e["source"], "opening_lot")
+
+    def test_broker_fills_are_still_labelled_as_fills(self):
+        e = ml.build_episodes(DEKELI)["episodes"][0]
+        self.assertEqual(e["source"], "broker_fill")
+
+    def test_opening_lots_are_consumed_before_in_window_buys(self):
+        out = ml.build_episodes(
+            [order("002423", "buy", 1000, 100, 1779000000),
+             order("002423", "sell", 902, 9000, 1780000000)],
+            opening_lots=self.OPENING)
+        self.assertAlmostEqual(out["episodes"][0]["entry_price"], 11.06)
+
+    def test_malformed_opening_lots_are_ignored_not_crashed_on(self):
+        for bad in ({"code": "", "price": 1, "quantity": 1, "time": 1},
+                    {"code": "002423", "price": 0, "quantity": 1, "time": 1},
+                    {"code": "002423", "price": 1, "quantity": 0, "time": 1},
+                    {"code": "002423", "price": "x", "quantity": 1, "time": 1}):
+            out = ml.build_episodes(self.SELL, opening_lots=[bad])
+            self.assertEqual(out["episodes"], [], repr(bad))

@@ -155,20 +155,50 @@ def normalise_orders(orders: Iterable[Mapping]) -> list[dict]:
     return out
 
 
-def build_episodes(orders: Iterable[Mapping]) -> dict:
+def build_episodes(orders: Iterable[Mapping],
+                   opening_lots: Iterable[Mapping] | None = None) -> dict:
     """FIFO-pair fills into round trips, per code.
 
     FIFO because partial fills are normal here: 德科立 was one 400-share buy
     closed by two 200-share sells, and pairing whole orders would have thrown
     away half the position or double counted it.
 
-    A sell with no open lot means the buy predates the API window. That is
-    reported as an unpaired sell rather than dropped, because a silently short
-    ledger is what made the old one believable.
+    opening_lots carries positions already held when the window opens, which the
+    orders endpoint cannot supply and which are therefore supplied by hand from
+    the 调仓记录 in the 妙想 app. Each needs code, price, quantity and time.
+    Seeding them lets the matching sell find its real cost basis:
+
+        002423 中粮资本, 9,000 bought 2026-03-20 at 11.06, sold 2026-06-04 at
+        9.02. That single position is a 18,360 loss, and it accounts for 18,360
+        of the 18,551 that otherwise separates rebuilt P&L from the account
+        lifetime figure - leaving 191, which also settles that this simulator
+        charges no meaningful commission or stamp duty.
+
+    A sell still lacking an open lot is reported as unpaired rather than
+    dropped, because a silently short ledger is what made the old one
+    believable.
     """
     lots: dict[str, collections.deque] = collections.defaultdict(collections.deque)
     episodes: list[dict] = []
     unpaired_sells: list[dict] = []
+
+    for seed in (opening_lots or []):
+        code = str(seed.get("code") or "").strip()
+        try:
+            price = float(seed.get("price") or 0)
+            qty = int(seed.get("quantity") or 0)
+            ts = int(seed.get("time") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not code or price <= 0 or qty <= 0:
+            continue
+        lots[code].append({
+            "order_id": str(seed.get("order_id") or "opening"),
+            "code": code, "name": str(seed.get("name") or "").strip(),
+            "side": "buy", "price": price, "quantity": qty,
+            "amount": price * qty, "time": ts, "remaining": qty,
+            "opening": True,
+        })
 
     for o in normalise_orders(orders):
         code = o["code"]
@@ -193,7 +223,10 @@ def build_episodes(orders: Iterable[Mapping]) -> dict:
                 "sell_order_id": o["order_id"],
                 "pnl": round((exit_ - entry) * matched, 2),
                 "pnl_pct": round((exit_ / entry - 1.0) * 100.0, 4) if entry else None,
-                "source": "broker_fill",
+                # An opening lot was typed in from the app rather than read from
+                # a fill, so it is kept labelled: this ledger exists because an
+                # unlabelled hand-derived price was trusted as a fill.
+                "source": "opening_lot" if lot.get("opening") else "broker_fill",
             })
             lot["remaining"] -= matched
             remaining -= matched
