@@ -95,6 +95,7 @@ a test asserts it.
 from __future__ import annotations
 
 import collections
+import datetime as _dt
 from typing import Iterable, Mapping, Sequence
 
 ORDERS_ENDPOINT = "/api/claw/mockTrading/orders"
@@ -387,6 +388,141 @@ def summarise(episodes: Sequence[Mapping]) -> dict:
         "win_rate_pct": round(100.0 * wins / len(rets), 2) if rets else None,
         "win_count": wins,
         "loss_count": len(rets) - wins,
+    }
+
+
+# Fields the broker settles and the strategy may not overwrite. These are the
+# ones that were wrong: entry_price carried 22.92 against a 155.65 fill.
+# The local sell date can be a day out, so matching tolerates drift rather
+# than trusting it. 002258 was recorded a day late at a price never traded.
+MATCH_DATE_TOLERANCE_DAYS = 3
+
+EXECUTION_FIELDS = (
+    "entry_price", "sell_price", "quantity", "buy_amount",
+    "pnl", "pnl_pct", "buy_date", "sell_date", "hold_days",
+    "buy_order_id", "sell_order_id",
+)
+
+# Fields only the strategy knows. The broker has no idea why a position was
+# opened or what rule closed it, so a rebuild that dropped these would fix the
+# prices and destroy every reason the learning layer reads.
+STRATEGY_FIELDS = (
+    "mode", "tier", "decision_id", "decision_run_slot", "selected_reason_hash",
+    "market_regime", "build_note", "close_reason", "big_meat_state",
+    "big_meat_confirmed_at", "big_meat_success_flag", "false_selection_flag",
+    "falsify_level", "falsify_reason_codes", "t3_observe_flag",
+    "candidate_pool_flag", "execution_damaged", "execution_damage_score",
+    "execution_damage_reasons", "profit_truncation", "decision_match",
+    "selection_verdict", "sample_quality_score", "blocked_reasons",
+)
+
+
+def _day(ts: int) -> str:
+    import datetime as _d
+    return _d.datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+
+
+def rebuild_episode_history(broker_episodes: Sequence[Mapping],
+                            local_episodes: Iterable[Mapping]) -> dict:
+    """Broker fills for the facts, the local file for the intent.
+
+    The corrupt history is not simply wrong, it is wrong in one direction: every
+    price came from a quote and every REASON came from the strategy itself.
+    Rebuilding from fills alone would fix 22.92 and throw away close_reason,
+    mode and tier - the only record of why anything was done, and the whole
+    reason the learning layer reads this file.
+
+    So execution fields are taken from the broker and strategy fields are
+    carried across, matched on code and sell date.
+
+    Three outcomes, all reported, because the counts are the finding:
+
+      matched     a local record backed by a real fill
+      unrecorded  a real round trip the local file never held - there are far
+                  more of these than matches, since it held 29 against 120
+      orphaned    a local record no fill supports. 德科立 at 22.92 is one, and
+                  an orphan is never carried forward: it describes a trade that
+                  did not happen at the price claimed.
+    """
+    # Matching must NOT key on the local sell date, because that field is
+    # corrupt too. 002258 利尔化学 was really sold 2026-08-12 at 14.15 and the
+    # local file records 2026-08-13 at 14.04 - wrong day and wrong price. An
+    # exact-date key silently orphans the record and loses its close_reason.
+    # So: match within a code by quantity first, then nearest date.
+    by_code: dict[str, list] = collections.defaultdict(list)
+    for le in local_episodes:
+        by_code[str(le.get("code") or "").strip()].append(le)
+
+    rebuilt, unrecorded = [], []
+    used: set[tuple] = set()
+
+    def _pick(code: str, sell_day: str, qty: int):
+        pool = by_code.get(code) or []
+        best, best_i, best_cost = None, None, None
+        for i, le in enumerate(pool):
+            if (code, i) in used:
+                continue
+            lq = le.get("quantity")
+            try:
+                same_qty = int(lq) == int(qty)
+            except (TypeError, ValueError):
+                same_qty = False
+            try:
+                drift = abs((_dt.date(*map(int, str(le.get("sell_date"))[:10].split("-")))
+                             - _dt.date(*map(int, sell_day.split("-")))).days)
+            except (TypeError, ValueError):
+                drift = 99
+            if drift > MATCH_DATE_TOLERANCE_DAYS:
+                continue
+            cost = (0 if same_qty else 100) + drift
+            if best_cost is None or cost < best_cost:
+                best, best_i, best_cost = le, i, cost
+        if best is not None:
+            used.add((code, best_i))
+        return best
+
+    for be in broker_episodes:
+        match = _pick(be["code"], _day(be["sell_time"]), be["quantity"])
+        row = {
+            "code": be["code"], "name": be.get("name"),
+            "entry_price": be["entry_price"], "sell_price": be["exit_price"],
+            "quantity": be["quantity"],
+            "buy_amount": round(be["entry_price"] * be["quantity"], 2),
+            "pnl": be["pnl"], "pnl_pct": be["pnl_pct"],
+            "buy_date": _day(be["buy_time"]), "sell_date": _day(be["sell_time"]),
+            "hold_days": max(0, be["hold_seconds"] // 86400),
+            "buy_order_id": be.get("buy_order_id"),
+            "sell_order_id": be.get("sell_order_id"),
+            "price_source": be.get("source", "broker_fill"),
+        }
+        if match:
+            for f in STRATEGY_FIELDS:
+                if f in match:
+                    row[f] = match[f]
+            row["metadata_source"] = "local_episode"
+        else:
+            row["metadata_source"] = "none"
+            unrecorded.append(row)
+        rebuilt.append(row)
+
+    orphaned = []
+    for code, pool in by_code.items():
+        for i, le in enumerate(pool):
+            if (code, i) not in used:
+                orphaned.append({"code": code,
+                                 "sell_date": str(le.get("sell_date"))[:10],
+                                 "entry_price": le.get("entry_price"),
+                                 "pnl_pct": le.get("pnl_pct"),
+                                 "name": le.get("name")})
+
+    return {
+        "episodes": rebuilt,
+        "unrecorded": unrecorded,
+        "orphaned": orphaned,
+        "summary": dict(summarise(rebuilt),
+                        matched=len(rebuilt) - len(unrecorded),
+                        unrecorded_count=len(unrecorded),
+                        orphaned_count=len(orphaned)),
     }
 
 

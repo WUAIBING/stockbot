@@ -29,6 +29,13 @@ sys.path.insert(0, str(SKILL))
 import mx_moni_ledger as ml  # noqa: E402
 
 
+def _ts(y, m, d):
+    """UTC midnight for a date. A-share fills land 01:30-07:00 UTC, so the UTC
+    day and the Beijing trading day are the same."""
+    import calendar, datetime
+    return calendar.timegm(datetime.date(y, m, d).timetuple())
+
+
 def order(code, side, raw_price, count, ts, dec=2, traded=None, oid=None,
           name="", status=4):
     traded = count if traded is None else traded
@@ -411,3 +418,81 @@ class CorporateActionTests(unittest.TestCase):
     def test_negative_terms_are_refused(self):
         with self.assertRaises(ValueError):
             ml.apply_corporate_action([], -1, 0)
+
+
+class RebuildHistoryTests(unittest.TestCase):
+    """Broker fills for the facts, the local file for the intent.
+
+    Against the real data: 29 of 29 local records matched a fill, 93 real round
+    trips had never been logged at all, and 19 of the 29 - two thirds - carried
+    a wrong entry price. Only three of those were IMPOSSIBLE against the tape;
+    the rest were plausible and wrong, which is why nothing noticed.
+    """
+
+    # Real dates, not magic numbers: the whole point is that the broker sold on
+    # 2026-08-12 while the local record claims 2026-08-13.
+    BUY_TS = _ts(2026, 8, 10)
+    SELL_TS = _ts(2026, 8, 12)
+    BROKER = [{
+        "code": "002258", "name": "利尔化学", "quantity": 3700,
+        "entry_price": 14.38, "exit_price": 14.15,
+        "buy_time": BUY_TS, "sell_time": SELL_TS,
+        "hold_seconds": SELL_TS - BUY_TS, "pnl": -851.0, "pnl_pct": -1.60,
+        "buy_order_id": "b1", "sell_order_id": "s1", "source": "broker_fill",
+    }]
+
+    def local(self, **kw):
+        base = {"code": "002258", "name": "利尔化学", "quantity": 3700,
+                "entry_price": 14.48, "sell_price": 14.04, "pnl_pct": -3.04,
+                "sell_date": "2026-08-13", "mode": "pre_breakout", "tier": 2,
+                "close_reason": "信号衰减[连跌2日]"}
+        base.update(kw)
+        return [base]
+
+    def test_a_sell_date_a_day_out_still_matches(self):
+        """002258 really sold 08-12; the local file says 08-13 at a price that
+        never traded. An exact-date key would orphan it and lose close_reason."""
+        r = ml.rebuild_episode_history(self.BROKER, self.local())
+        self.assertEqual(r["summary"]["orphaned_count"], 0)
+        self.assertEqual(r["summary"]["matched"], 1)
+
+    def test_the_strategy_reason_survives_the_rebuild(self):
+        e = ml.rebuild_episode_history(self.BROKER, self.local())["episodes"][0]
+        self.assertEqual(e["close_reason"], "信号衰减[连跌2日]")
+        self.assertEqual(e["mode"], "pre_breakout")
+        self.assertEqual(e["tier"], 2)
+
+    def test_the_broker_price_wins_over_the_recorded_one(self):
+        e = ml.rebuild_episode_history(self.BROKER, self.local())["episodes"][0]
+        self.assertAlmostEqual(e["entry_price"], 14.38)
+        self.assertAlmostEqual(e["pnl_pct"], -1.60)
+        self.assertEqual(e["price_source"], "broker_fill")
+
+    def test_a_trade_never_logged_is_kept_and_marked(self):
+        """93 real round trips had no local record at all."""
+        r = ml.rebuild_episode_history(self.BROKER, [])
+        self.assertEqual(r["summary"]["unrecorded_count"], 1)
+        self.assertEqual(r["episodes"][0]["metadata_source"], "none")
+
+    def test_a_record_no_fill_supports_is_orphaned_not_carried(self):
+        """An orphan describes a trade that did not happen as claimed."""
+        r = ml.rebuild_episode_history([], self.local())
+        self.assertEqual(r["summary"]["orphaned_count"], 1)
+        self.assertEqual(r["episodes"], [])
+
+    def test_a_wildly_wrong_date_is_not_forced_to_match(self):
+        r = ml.rebuild_episode_history(self.BROKER, self.local(sell_date="2026-07-01"))
+        self.assertEqual(r["summary"]["orphaned_count"], 1)
+        self.assertEqual(r["summary"]["unrecorded_count"], 1)
+
+    def test_quantity_breaks_ties_between_two_near_dates(self):
+        local = self.local() + [dict(self.local()[0], quantity=999,
+                                     close_reason="wrong one")]
+        e = ml.rebuild_episode_history(self.BROKER, local)["episodes"][0]
+        self.assertEqual(e["close_reason"], "信号衰减[连跌2日]")
+
+    def test_one_local_record_cannot_be_reused_twice(self):
+        two = self.BROKER + [dict(self.BROKER[0], sell_time=_ts(2026, 8, 13))]
+        r = ml.rebuild_episode_history(two, self.local())
+        self.assertEqual(r["summary"]["matched"], 1)
+        self.assertEqual(r["summary"]["unrecorded_count"], 1)
