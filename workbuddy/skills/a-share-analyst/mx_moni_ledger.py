@@ -244,6 +244,50 @@ def build_episodes(orders: Iterable[Mapping],
     }
 
 
+def share_count_anomalies(orders: Iterable[Mapping]) -> list[dict]:
+    """Codes where more was sold than bought. A share count does not grow by itself.
+
+    Two causes, and they need opposite treatment:
+
+      a position opened before the window - the buy is simply not retrievable,
+      and an opening lot supplies its basis
+
+      a bonus or capitalisation issue - the shares are real and free, and the
+      price was cut to match on the ex date, so pairing the ORIGINAL entry price
+      against the POST-adjustment sale invents a loss that never happened
+
+    688800 瑞可达 is the second kind. 300 bought at 128.42 on 2026-06-04; on
+    2026-06-17 it opened at 87.98 against a 124.54 close, a -29.4% gap that is
+    the -28.6% of a 4-for-10 issue, not a collapse. 419 shares were then sold for
+    41,210.70 against 38,526 paid - a GAIN of 2,684.70. Pairing 300 at 128.42
+    into a 98.31 sale reports -9,033 instead, and that was this ledger largest
+    single loss until the share counts were checked against each other.
+
+    Reporting the anomaly is the point. A ledger that silently books -9,033 for a
+    profitable position is the failure this module was written to end, and doing
+    it with fill prices rather than quotes would be no improvement at all.
+    """
+    tally: dict[str, dict] = {}
+    for o in normalise_orders(orders):
+        e = tally.setdefault(o["code"], {"code": o["code"], "name": o["name"],
+                                         "bought": 0, "sold": 0})
+        e["bought" if o["side"] == "buy" else "sold"] += o["quantity"]
+        if o["name"]:
+            e["name"] = o["name"]
+    out = []
+    for e in tally.values():
+        if e["sold"] > e["bought"]:
+            extra = e["sold"] - e["bought"]
+            out.append(dict(
+                e, extra_shares=extra,
+                extra_ratio_pct=(round(100.0 * extra / e["bought"], 2)
+                                 if e["bought"] else None),
+                likely_cause=("opened before the window" if e["bought"] == 0
+                              else "bonus or capitalisation issue"),
+            ))
+    return sorted(out, key=lambda x: -x["extra_shares"])
+
+
 def summarise(episodes: Sequence[Mapping]) -> dict:
     """Plain arithmetic on realised round trips. No weighting, no exclusions."""
     rets = [e["pnl_pct"] for e in episodes if e.get("pnl_pct") is not None]

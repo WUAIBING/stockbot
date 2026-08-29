@@ -275,3 +275,53 @@ class OpeningLotTests(unittest.TestCase):
                     {"code": "002423", "price": "x", "quantity": 1, "time": 1}):
             out = ml.build_episodes(self.SELL, opening_lots=[bad])
             self.assertEqual(out["episodes"], [], repr(bad))
+
+
+class ShareCountAnomalyTests(unittest.TestCase):
+    """A share count does not grow on its own.
+
+    688800 瑞可达: 300 bought at 128.42 on 2026-06-04, then 419 sold. On
+    2026-06-17 it opened 87.98 against a 124.54 close - a -29.4% gap, which is
+    the -28.6% of a 4-for-10 issue rather than a collapse. Real cash: 38,526 out,
+    41,210.70 back, a GAIN of 2,684.70. Naive FIFO reports -9,033, and that was
+    the largest single loss in this ledger until the counts were compared.
+    """
+
+    RUIKEDA = [
+        order("688800", "buy", 12842, 300, 1780000000, name="瑞可达"),
+        order("688800", "sell", 9831, 400, 1781500000, name="瑞可达"),
+        order("688800", "sell", 9930, 19, 1781700000, name="瑞可达"),
+    ]
+
+    def test_a_bonus_issue_is_detected(self):
+        a = ml.share_count_anomalies(self.RUIKEDA)
+        self.assertEqual(len(a), 1)
+        self.assertEqual(a[0]["code"], "688800")
+        self.assertEqual(a[0]["extra_shares"], 119)
+
+    def test_the_ratio_points_at_the_issue_size(self):
+        a = ml.share_count_anomalies(self.RUIKEDA)[0]
+        self.assertAlmostEqual(a["extra_ratio_pct"], 39.67, places=1)
+        self.assertIn("bonus", a["likely_cause"])
+
+    def test_a_pre_window_position_is_named_differently(self):
+        """0 bought and 9,000 sold is a missing buy, not a free share."""
+        a = ml.share_count_anomalies(
+            [order("002423", "sell", 902, 9000, 1780000000, name="中粮资本")])[0]
+        self.assertEqual(a["bought"], 0)
+        self.assertIn("before the window", a["likely_cause"])
+        self.assertIsNone(a["extra_ratio_pct"])
+
+    def test_normal_trading_raises_nothing(self):
+        self.assertEqual(ml.share_count_anomalies(DEKELI), [])
+
+    def test_an_open_position_is_not_an_anomaly(self):
+        """Holding is the ordinary case: bought more than sold."""
+        self.assertEqual(ml.share_count_anomalies(DEKELI[:2]), [])
+
+    def test_naive_pairing_still_reports_the_wrong_sign(self):
+        """Pinning the defect: detection is warning, not yet correction."""
+        eps = ml.build_episodes(self.RUIKEDA)["episodes"]
+        self.assertLess(sum(e["pnl"] for e in eps), 0.0)
+        cash_in = 400 * 98.31 + 19 * 99.30
+        self.assertGreater(cash_in - 300 * 128.42, 0.0)
