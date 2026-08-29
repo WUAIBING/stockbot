@@ -46,12 +46,36 @@ are status 8, all with tradeCount 0. Counting them as trades would inflate the
 episode count and score decisions that never happened - 德科立 alone has nine
 rejected sells sitting next to its two real ones.
 
-WHAT CANNOT BE REBUILT
+WHAT CANNOT BE REBUILT, AND WHY IT IS TRUNCATION RATHER THAN AN EMPTY PAST
 
-The orders endpoint returned 2026-06-01 as its oldest record while the account
-has run 163 days, so roughly a 90-day window is available. Episodes that opened
-before it cannot be verified from fills, and are marked unverifiable rather than
-quietly keeping the value that is already suspect.
+The orders endpoint holds 293 records reaching back to 2026-06-01 while the
+account has run 163 days, and it accepts no date range and no pagination -
+fltOrderDrt and fltOrderStatus are its only parameters, and totalNum equals the
+number returned. So the first ten weeks are simply not retrievable.
+
+That this is a rolling window rather than a quiet start was settled by the
+arithmetic. Rebuilt realised P&L of +92,910.68 plus floating +3,907.30 stands
+against an account lifetime of +78,266.82, a gap of 18,551.16. Two things fill
+it exactly:
+
+    002423 中粮资本 sold 2026-06-04, 9,000 shares at 9.02, with NO buy anywhere
+    in the window. An entry of 10.52 closes the gap, and 10.52 was tradeable on
+    seven sessions in late March and early April - when this account was two
+    weeks old.        9,000 x (10.52 - 9.02)  ~ 13,483
+
+    commission at 0.025% each way on 10,140,643 of turnover plus stamp duty at
+    0.05% on 5,066,974 of sales                ~  5,069
+                                               ---------
+                                                  18,552   against 18,551 observed
+
+So: from 2026-06-01 the record is complete and authoritative. Before it, only
+positions still open INTO the window are visible at all, and they appear here as
+unpaired sells rather than being dropped. Anything bought and closed entirely
+before June is gone.
+
+THE WINDOW IS THE REASON TO ARCHIVE. Because it rolls, history exists only if
+something writes it down. A daily snapshot of the raw orders response costs one
+call and makes this limitation stop growing.
 
 READ ONLY
 
