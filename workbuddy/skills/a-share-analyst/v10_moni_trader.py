@@ -344,6 +344,170 @@ DAILY_EVOLUTION_BUNDLE_FILE = str(DATA_DIR / 'v10_daily_evolution_bundle_latest.
 ENGINEERING_REVIEW_FILE = str(DATA_DIR / 'v10_engineering_review_latest.json')
 ENGINEERING_MANUAL_INCIDENTS_FILE = str(DATA_DIR / 'v10_engineering_manual_incidents_latest.json')
 TRADE_EPISODE_HISTORY_FILE = str(DATA_DIR / 'v10_trade_episode_history_latest.json')
+
+# === 成交记录校正 (broker fill correction) ===
+# The episode history recorded what the system BELIEVED it paid, resolved from a
+# quote around order time. Checked against the broker own fills, 19 of 29
+# records carried a wrong entry price - two thirds - and only three of those
+# were impossible against the tape. The rest were plausible and wrong:
+#
+#     688205 德科立   22.92 -> 155.65   +557.07% -> -3.31%
+#     601609 金田股份  11.89 ->  13.34     +9.50% -> -2.25%   a winner was a loser
+#     000676 智度股份   7.72 ->   7.04    -10.23% -> -1.42%
+#
+# Sell dates are wrong too: 002258 利尔化学 really sold 2026-08-12 at 14.15 and
+# is recorded 2026-08-13 at 14.04.
+#
+# This reads an ARCHIVED snapshot rather than calling the API, so no network
+# dependency enters the close-node path and a failure leaves every episode
+# exactly as it was.
+MX_ORDERS_ARCHIVE_FILE = str(DATA_DIR / 'mx_orders_archive' / 'mx_moni_orders_merged.json')
+# Facts the orders window cannot supply, kept as data so they can be added from
+# the 调仓记录 without touching code: positions opened before the window, and
+# corporate actions that changed a share count.
+MX_LEDGER_SUPPLEMENT_FILE = str(DATA_DIR / 'mx_moni_ledger_supplement.json')
+# The shipped default, which travels with the repo. DATA_DIR is excluded from
+# the deploy sync so an operator copy there survives a deploy and wins - but it
+# also means a rebuilt box would lose these facts entirely if they lived only
+# there. They are irreplaceable: the orders window cannot reach back to the
+# 中粮资本 purchase, and nothing in the API records a corporate action.
+MX_LEDGER_SUPPLEMENT_DEFAULT = str(
+    Path(__file__).resolve().parent / 'mx_moni_ledger_supplement.json')
+
+
+def _load_ledger_supplement():
+    payload = _read_json(MX_LEDGER_SUPPLEMENT_FILE)
+    if not isinstance(payload, dict) or not payload:
+        payload = _read_json(MX_LEDGER_SUPPLEMENT_DEFAULT) or {}
+    if not isinstance(payload, dict):
+        return [], []
+    opening = [x for x in (payload.get('opening_lots') or []) if isinstance(x, dict)]
+    actions = [x for x in (payload.get('corporate_actions') or []) if isinstance(x, dict)]
+    return opening, actions
+
+
+def _recompute_episode_flags(episode):
+    """Re-derive the pnl-dependent flags after a price correction.
+
+    false_selection_flag, big_meat_success_flag and profit_truncation are all
+    computed from pnl_pct inside _build_trade_episode_history, so correcting the
+    price alone leaves them describing the OLD number. That matters more than the
+    return itself: mode penalties key on false_selection_rate and success_rate,
+    not on avg_return_pct, and LEARNING_BIG_MEAT_SUCCESS_PNL_PCT is 8.0 - so
+    德科立 at a fabricated +557% was recorded as a big-meat SUCCESS on a trade
+    that lost 3.31%.
+
+    profit_truncation also has an opening-shock clause that cannot be rebuilt
+    from a finished episode, so a flag already set stays set; only the
+    pnl-dependent half is re-derived.
+    """
+    pnl_pct = _fnum(episode.get('pnl_pct', 0.0), 0.0)
+    hold_days = _inum(episode.get('hold_days', 0), 0)
+    close_reason = str(episode.get('close_reason', '')).strip()
+    build_note = str(episode.get('build_note', '')).strip()
+    big_meat_state = str(episode.get('big_meat_state', '')).strip()
+    execution_damaged = bool(episode.get('execution_damaged'))
+
+    truncation_pnl_clause = (
+        (
+            _is_big_meat_identity_record(episode)
+            or big_meat_state == BIG_MEAT_STATE_CONFIRMED
+            or BIG_MEAT_BUY_POOL_CANDIDATE_NOTE in build_note
+        )
+        and pnl_pct > 0
+        and pnl_pct < LEARNING_BIG_MEAT_SUCCESS_PNL_PCT
+        and any(token in close_reason for token in ('信号衰减', 'risk_trim[', 'hard_exit['))
+    )
+    profit_truncation = bool(truncation_pnl_clause)
+    episode['profit_truncation'] = profit_truncation
+    episode['big_meat_success_flag'] = bool(
+        _episode_is_big_meat_success(episode, pnl_pct=pnl_pct))
+    episode['false_selection_flag'] = bool(
+        _classify_false_selection(
+            episode,
+            pnl_pct=pnl_pct,
+            hold_days=hold_days,
+            close_reason=close_reason,
+            execution_damaged=execution_damaged,
+            profit_truncation=profit_truncation,
+        ).get('flag'))
+    return episode
+
+
+def _correct_episodes_from_broker_fills(episodes):
+    """Overwrite recorded prices with what the broker actually filled.
+
+    Corrects IN PLACE and never adds or removes an episode. The archive holds
+    122 round trips against this file 29, but adding the other 93 would change
+    what the file means to everything downstream, and dropping an unmatched one
+    would change counts the learning layer sizes its samples by. So the scope is
+    exactly: fix the numbers that are wrong, and mark what could not be checked.
+
+    Any failure leaves the episodes untouched. A wrong price is bad; a
+    close-node phase that dies on the way to writing the day results is worse.
+    """
+    episodes = [e for e in (episodes or []) if isinstance(e, dict)]
+    if not episodes:
+        return {'corrected': 0, 'unverified': len(episodes), 'reason': 'no episodes'}
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import mx_moni_ledger as _ledger
+
+        archive = _read_json(MX_ORDERS_ARCHIVE_FILE) or {}
+        orders = archive.get('orders') if isinstance(archive, dict) else None
+        if not orders:
+            for e in episodes:
+                e['price_verified'] = False
+            return {'corrected': 0, 'unverified': len(episodes),
+                    'reason': 'no order archive at %s' % MX_ORDERS_ARCHIVE_FILE}
+
+        opening, actions = _load_ledger_supplement()
+        broker = _ledger.build_episodes(orders, opening_lots=opening,
+                                        corporate_actions=actions)['episodes']
+        rebuilt = _ledger.rebuild_episode_history(broker, episodes)
+    except Exception as exc:  # noqa: BLE001 - reported, never raised into close-node
+        for e in episodes:
+            e['price_verified'] = False
+        return {'corrected': 0, 'unverified': len(episodes),
+                'reason': 'correction failed: %s' % exc}
+
+    by_sell_order = {}
+    for row in rebuilt.get('episodes', []):
+        if row.get('metadata_source') == 'local_episode' and row.get('sell_order_id'):
+            by_sell_order.setdefault(str(row['sell_order_id']), row)
+
+    corrected = 0
+    changed = []
+    matched_rows = [r for r in rebuilt.get('episodes', [])
+                    if r.get('metadata_source') == 'local_episode']
+    pool = list(matched_rows)
+    for episode in episodes:
+        code = str(episode.get('code', '')).zfill(6)
+        hit = None
+        for i, row in enumerate(pool):
+            if str(row.get('code', '')).zfill(6) != code:
+                continue
+            hit = pool.pop(i)
+            break
+        if hit is None:
+            episode['price_verified'] = False
+            continue
+        before = _fnum(episode.get('entry_price', 0.0), 0.0)
+        after = _fnum(hit.get('entry_price', 0.0), 0.0)
+        episode['price_verified'] = True
+        episode['price_source'] = 'broker_fill'
+        for field in ('entry_price', 'sell_price', 'pnl', 'pnl_pct',
+                      'quantity', 'buy_date', 'sell_date', 'hold_days'):
+            if hit.get(field) is not None:
+                episode[field] = hit[field]
+        _recompute_episode_flags(episode)
+        if after > 0 and abs(after - before) > 0.005:
+            corrected += 1
+            changed.append('%s %.4f->%.4f' % (code, before, after))
+
+    unverified = sum(1 for e in episodes if not e.get('price_verified'))
+    return {'corrected': corrected, 'unverified': unverified,
+            'changed': changed[:20], 'reason': 'ok'}
 LEARNING_ACTIONS_FILE = str(DATA_DIR / 'v10_learning_actions_latest.json')
 REGIME_EXECUTION_HISTORY_FILE = str(DATA_DIR / 'v10_regime_execution_history.jsonl')
 OPENING_TRADABILITY_FILE = str(DATA_DIR / 'opening_tradability_latest.json')
@@ -8066,6 +8230,17 @@ def _build_daily_evolution_bundle(*, summary, records, trade_date=None):
     decision_reference = _build_selected_decision_reference(_read_jsonl(MODEL_DECISIONS_FILE, limit=5000))
     alpha_loss_events = _build_alpha_loss_events(trade_date)
     trade_episode_history = _build_trade_episode_history(records, decision_reference=decision_reference)
+    # Correct prices BEFORE summarising: the summary averages pnl_pct, and two
+    # 德科立 rows booked at +557% dragged the reported average return from
+    # -0.77% to +38.32%.
+    _fill_correction = _correct_episodes_from_broker_fills(trade_episode_history)
+    if _fill_correction.get('corrected'):
+        print(f" 成交记录校正: {_fill_correction['corrected']} 笔入场价已按券商成交价修正"
+              f"（{_fill_correction.get('unverified', 0)} 笔无法核对）")
+        for _chg in _fill_correction.get('changed', [])[:10]:
+            print(f"   {_chg}")
+    elif _fill_correction.get('reason') != 'ok':
+        print(f" [WARN] 成交记录校正未执行: {_fill_correction.get('reason')}")
     history_summary = _summarize_trade_episode_history(trade_episode_history)
     today_episodes = [
         dict(item)
@@ -12954,6 +13129,11 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
         return fail('校正后的运行时记录未采用 MX 成交价；请保留现场并排查')
 
     episodes = _build_trade_episode_history(records)
+    # The repair path writes the SAME file as close-node, so it has to correct
+    # too. Without this, running a fill repair silently republishes uncorrected
+    # prices over the corrected ones - and the learning layer would go straight
+    # back to believing vol_breakout averages +161% when it averages +0.11%.
+    _correct_episodes_from_broker_fills(episodes)
     _write_json_atomic(TRADE_EPISODE_HISTORY_FILE, {
         'generated_at': _now_str(),
         'trade_date': _market_today(),

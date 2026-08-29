@@ -1,0 +1,22 @@
+[Unit]
+Description=Snapshot the broker order window before it rolls past
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=stockbotrunner
+Group=stockbotrunner
+WorkingDirectory=/opt/stockbot
+EnvironmentFile=-/etc/stockbot/trading-day.env
+# The archiver stamps each snapshot with the local date, and the correction it
+# feeds reasons in China trading days. The droplet runs UTC, so pin the process
+# to market time or a 15:02 fire would file itself under the wrong day.
+Environment=TZ=Asia/Shanghai
+# One screener call; if it has not answered in three minutes it will not answer
+# before close-node needs the file.
+TimeoutStartSec=180
+ExecStart=/usr/bin/env bash /opt/stockbot/scripts/archive_mx_orders.sh
+
+[Install]
+WantedBy=multi-user.target
