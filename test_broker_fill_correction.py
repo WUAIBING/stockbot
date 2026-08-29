@@ -221,3 +221,44 @@ class EveryWriteSiteTests(unittest.TestCase):
     def test_the_correction_is_defined_once(self):
         self.assertEqual(
             self.SRC.count("def _correct_episodes_from_broker_fills"), 1)
+
+
+class SupplementFallbackTests(unittest.TestCase):
+    """The pre-window facts must survive a rebuilt box.
+
+    DATA_DIR is excluded from the deploy sync, so an operator copy there
+    persists across deploys and rightly wins. But that same exclusion means
+    facts living ONLY there would be lost if the box were rebuilt - and they are
+    irreplaceable: the orders window cannot reach the 2026-03-20 中粮资本
+    purchase, and no endpoint records 瑞可达's 10转4派3元.
+    """
+
+    def test_a_shipped_default_travels_with_the_repo(self):
+        self.assertTrue(Path(trader.MX_LEDGER_SUPPLEMENT_DEFAULT).exists())
+
+    def test_the_shipped_default_carries_both_known_facts(self):
+        payload = json.loads(
+            Path(trader.MX_LEDGER_SUPPLEMENT_DEFAULT).read_text(encoding="utf-8"))
+        codes = {str(x.get("code")) for x in payload.get("opening_lots", [])}
+        actions = {str(x.get("code")) for x in payload.get("corporate_actions", [])}
+        self.assertIn("002423", codes)
+        self.assertIn("688800", actions)
+
+    def test_the_default_is_used_when_no_operator_copy_exists(self):
+        self.addCleanup(setattr, trader, "MX_LEDGER_SUPPLEMENT_FILE",
+                        trader.MX_LEDGER_SUPPLEMENT_FILE)
+        trader.MX_LEDGER_SUPPLEMENT_FILE = "/nonexistent/supplement.json"
+        opening, actions = trader._load_ledger_supplement()
+        self.assertTrue(opening)
+        self.assertTrue(actions)
+
+    def test_an_operator_copy_wins_over_the_default(self):
+        d = Path(tempfile.mkdtemp()) / "supp.json"
+        d.write_text(json.dumps({"opening_lots": [
+            {"code": "999999", "price": 1.0, "quantity": 1, "time": 1}]}),
+            encoding="utf-8")
+        self.addCleanup(setattr, trader, "MX_LEDGER_SUPPLEMENT_FILE",
+                        trader.MX_LEDGER_SUPPLEMENT_FILE)
+        trader.MX_LEDGER_SUPPLEMENT_FILE = str(d)
+        opening, _ = trader._load_ledger_supplement()
+        self.assertEqual([x["code"] for x in opening], ["999999"])

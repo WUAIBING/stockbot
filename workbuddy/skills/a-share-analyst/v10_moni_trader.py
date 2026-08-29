@@ -366,10 +366,19 @@ MX_ORDERS_ARCHIVE_FILE = str(DATA_DIR / 'mx_orders_archive' / 'mx_moni_orders_me
 # the 调仓记录 without touching code: positions opened before the window, and
 # corporate actions that changed a share count.
 MX_LEDGER_SUPPLEMENT_FILE = str(DATA_DIR / 'mx_moni_ledger_supplement.json')
+# The shipped default, which travels with the repo. DATA_DIR is excluded from
+# the deploy sync so an operator copy there survives a deploy and wins - but it
+# also means a rebuilt box would lose these facts entirely if they lived only
+# there. They are irreplaceable: the orders window cannot reach back to the
+# 中粮资本 purchase, and nothing in the API records a corporate action.
+MX_LEDGER_SUPPLEMENT_DEFAULT = str(
+    Path(__file__).resolve().parent / 'mx_moni_ledger_supplement.json')
 
 
 def _load_ledger_supplement():
-    payload = _read_json(MX_LEDGER_SUPPLEMENT_FILE) or {}
+    payload = _read_json(MX_LEDGER_SUPPLEMENT_FILE)
+    if not isinstance(payload, dict) or not payload:
+        payload = _read_json(MX_LEDGER_SUPPLEMENT_DEFAULT) or {}
     if not isinstance(payload, dict):
         return [], []
     opening = [x for x in (payload.get('opening_lots') or []) if isinstance(x, dict)]
