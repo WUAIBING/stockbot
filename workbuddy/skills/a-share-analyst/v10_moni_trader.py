@@ -377,6 +377,54 @@ def _load_ledger_supplement():
     return opening, actions
 
 
+def _recompute_episode_flags(episode):
+    """Re-derive the pnl-dependent flags after a price correction.
+
+    false_selection_flag, big_meat_success_flag and profit_truncation are all
+    computed from pnl_pct inside _build_trade_episode_history, so correcting the
+    price alone leaves them describing the OLD number. That matters more than the
+    return itself: mode penalties key on false_selection_rate and success_rate,
+    not on avg_return_pct, and LEARNING_BIG_MEAT_SUCCESS_PNL_PCT is 8.0 - so
+    德科立 at a fabricated +557% was recorded as a big-meat SUCCESS on a trade
+    that lost 3.31%.
+
+    profit_truncation also has an opening-shock clause that cannot be rebuilt
+    from a finished episode, so a flag already set stays set; only the
+    pnl-dependent half is re-derived.
+    """
+    pnl_pct = _fnum(episode.get('pnl_pct', 0.0), 0.0)
+    hold_days = _inum(episode.get('hold_days', 0), 0)
+    close_reason = str(episode.get('close_reason', '')).strip()
+    build_note = str(episode.get('build_note', '')).strip()
+    big_meat_state = str(episode.get('big_meat_state', '')).strip()
+    execution_damaged = bool(episode.get('execution_damaged'))
+
+    truncation_pnl_clause = (
+        (
+            _is_big_meat_identity_record(episode)
+            or big_meat_state == BIG_MEAT_STATE_CONFIRMED
+            or BIG_MEAT_BUY_POOL_CANDIDATE_NOTE in build_note
+        )
+        and pnl_pct > 0
+        and pnl_pct < LEARNING_BIG_MEAT_SUCCESS_PNL_PCT
+        and any(token in close_reason for token in ('信号衰减', 'risk_trim[', 'hard_exit['))
+    )
+    profit_truncation = bool(truncation_pnl_clause)
+    episode['profit_truncation'] = profit_truncation
+    episode['big_meat_success_flag'] = bool(
+        _episode_is_big_meat_success(episode, pnl_pct=pnl_pct))
+    episode['false_selection_flag'] = bool(
+        _classify_false_selection(
+            episode,
+            pnl_pct=pnl_pct,
+            hold_days=hold_days,
+            close_reason=close_reason,
+            execution_damaged=execution_damaged,
+            profit_truncation=profit_truncation,
+        ).get('flag'))
+    return episode
+
+
 def _correct_episodes_from_broker_fills(episodes):
     """Overwrite recorded prices with what the broker actually filled.
 
@@ -443,6 +491,7 @@ def _correct_episodes_from_broker_fills(episodes):
                       'quantity', 'buy_date', 'sell_date', 'hold_days'):
             if hit.get(field) is not None:
                 episode[field] = hit[field]
+        _recompute_episode_flags(episode)
         if after > 0 and abs(after - before) > 0.005:
             corrected += 1
             changed.append('%s %.4f->%.4f' % (code, before, after))
