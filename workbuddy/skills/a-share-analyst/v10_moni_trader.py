@@ -13071,6 +13071,11 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
         return fail('校正后的运行时记录未采用 MX 成交价；请保留现场并排查')
 
     episodes = _build_trade_episode_history(records)
+    # The repair path writes the SAME file as close-node, so it has to correct
+    # too. Without this, running a fill repair silently republishes uncorrected
+    # prices over the corrected ones - and the learning layer would go straight
+    # back to believing vol_breakout averages +161% when it averages +0.11%.
+    _correct_episodes_from_broker_fills(episodes)
     _write_json_atomic(TRADE_EPISODE_HISTORY_FILE, {
         'generated_at': _now_str(),
         'trade_date': _market_today(),

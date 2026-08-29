@@ -183,3 +183,41 @@ class SafetyTests(Harness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EveryWriteSiteTests(unittest.TestCase):
+    """Both producers of the episode file must correct.
+
+    The file is written in two places - the close-node phase and the MX fill
+    repair path. Correcting only one means a repair run silently republishes
+    uncorrected prices, and the learning layer goes straight back to believing
+    vol_breakout averages +161% when it averages +0.11%.
+    """
+
+    SRC = Path(trader.__file__).read_text(encoding="utf-8")
+
+    def test_every_producer_of_episodes_is_corrected(self):
+        """The invariant is per PRODUCER, not per write.
+
+        A first version of this asserted the correction appeared near each
+        _write_json_atomic(TRADE_EPISODE_HISTORY_FILE...) call, and failed on
+        the close-node write - which publishes a bundle corrected four thousand
+        lines earlier. Proximity to the write is not the property that matters;
+        what matters is that nothing builds an episode list without correcting
+        it.
+        """
+        calls = [i for i in range(len(self.SRC))
+                 if self.SRC.startswith("_build_trade_episode_history(", i)]
+        # one definition plus every call site
+        self.assertGreaterEqual(len(calls), 3)
+        for at in calls:
+            if self.SRC[max(0, at - 4):at].strip().endswith("def"):
+                continue
+            following = self.SRC[at:at + 900]
+            self.assertIn("_correct_episodes_from_broker_fills", following,
+                          "episodes are built at offset %d and never corrected"
+                          % at)
+
+    def test_the_correction_is_defined_once(self):
+        self.assertEqual(
+            self.SRC.count("def _correct_episodes_from_broker_fills"), 1)
