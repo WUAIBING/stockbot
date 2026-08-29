@@ -1,0 +1,14 @@
+[Unit]
+Description=Archive broker orders at 15:02 China time, before close-node at 15:06
+
+[Timer]
+# MUST stay ahead of the 07:06 UTC close-node run. The episode-history
+# correction reads this archive instead of calling the API, so today fills have
+# to be written before close-node rebuilds the day episodes. Market closes at
+# 07:00 UTC, which leaves two minutes to settle and four before close-node.
+OnCalendar=Mon..Fri *-*-* 07:02:00 UTC
+Persistent=true
+Unit=stockbot-orders-archive.service
+
+[Install]
+WantedBy=timers.target
