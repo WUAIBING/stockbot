@@ -54,15 +54,21 @@ from typing import Iterable, Mapping
 # recognisable leader, broad enough not to fragment into groups of three.
 DEFAULT_LEVEL = 5
 
+# This file lives in workbuddy/skills/a-share-analyst/, so one dirname reaches
+# workbuddy/skills/ and csi1000-skills sits directly beside it. Going up twice
+# AND re-appending "skills" builds workbuddy/skills/skills/, which never exists.
+# That miss is silent - load_code_sectors returns {} and every stock becomes
+# "unknown" again, which is precisely the bug this module was written to fix -
+# and it hides on the droplet, where the absolute path matches first.
+_SKILLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 _TDXHY_CANDIDATES = (
     "/opt/stockbot/workbuddy/skills/csi1000-skills/tdxhy.cfg",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "skills", "csi1000-skills", "tdxhy.cfg"),
+    os.path.join(_SKILLS_DIR, "csi1000-skills", "tdxhy.cfg"),
 )
 _INCON_CANDIDATES = (
     "/opt/stockbot/workbuddy/skills/csi1000-skills/incon.dat",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "skills", "csi1000-skills", "incon.dat"),
+    os.path.join(_SKILLS_DIR, "csi1000-skills", "incon.dat"),
 )
 
 

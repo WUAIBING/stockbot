@@ -177,6 +177,38 @@ class ConcentrationTests(unittest.TestCase):
         self.assertEqual(sm.concentration([], smap()), [])
 
 
+class PathTests(unittest.TestCase):
+    """The fallback path had one dirname too many.
+
+    sector_map.py lives in workbuddy/skills/a-share-analyst/, so ONE dirname
+    reaches workbuddy/skills/ where csi1000-skills sits. Going up twice and then
+    re-appending "skills" built workbuddy/skills/skills/csi1000-skills, which
+    never exists.
+
+    The miss was silent: load_code_sectors returns {} on OSError-or-absent, so
+    SectorMap loaded zero codes and every stock resolved to unknown - exactly
+    the bug this module exists to fix. It hid on the droplet because the
+    absolute /opt/stockbot path matches first, and it hid in the tests because
+    ShippedDataTests SKIPS when the map is empty. A skip is not a pass.
+    """
+
+    def test_no_candidate_path_doubles_the_skills_directory(self):
+        for p in sm._TDXHY_CANDIDATES + sm._INCON_CANDIDATES:
+            norm = p.replace("\\", "/")
+            self.assertNotIn("skills/skills", norm, p)
+
+    def test_the_repo_relative_fallback_resolves_when_the_file_is_there(self):
+        """If the repo ships the data, the fallback MUST find it - rather than
+        skipping, which is how the doubled path survived."""
+        import os
+        repo = Path(sm.__file__).resolve().parent.parent / "csi1000-skills"
+        if not (repo / "tdxhy.cfg").exists():
+            self.skipTest("csi1000-skills/tdxhy.cfg not in this checkout")
+        self.assertTrue(any(os.path.exists(p) for p in sm._TDXHY_CANDIDATES),
+                        "shipped tdxhy.cfg exists but no candidate path finds it")
+        self.assertGreater(len(sm.SectorMap()), 1000)
+
+
 class ShippedDataTests(unittest.TestCase):
     """The real files, if present on this machine."""
 
