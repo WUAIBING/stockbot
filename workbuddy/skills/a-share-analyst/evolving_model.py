@@ -477,12 +477,58 @@ def _compute_sector_stats(rows, industry_map):
     return sector_stats
 
 
+def _recentre_sector_scores(rows, industry_map, sector_stats):
+    """Keep the sector component's LEVEL, change only its ranking.
+
+    Fixing the industry map is a bug fix, but it moves the score scale: the
+    broken single-bucket score sat at 60.41 on 2026-08-31 while real sector
+    scores run 6.02 to 55.29. Every candidate therefore drops - mean 3.32,
+    worst 10.27 - though ranking barely moves, with a top-10 overlap of 8 of 10.
+
+    That level matters because min_trade_score is a CONSTANT (64/58/52 by market
+    regime), not a percentile, so it cannot follow the scale. Deployed raw the
+    fix cut candidates clearing 64 from 29 to 21 - a 28% tightening on a book
+    already holding 12 of 25 slots, which is the opposite of what it needs.
+
+    So the corrected per-sector scores are shifted to the mean the single-bucket
+    score would have had. Relative differences between sectors - the entire
+    point - survive untouched, while the thresholds keep meaning what they were
+    calibrated to mean. Recalibrating the constants instead would work for one
+    day and drift the next, because the single-bucket score itself moves daily.
+    """
+    if not REAL_SECTOR_ENABLED or not sector_stats:
+        return sector_stats
+    legacy = _compute_sector_stats(rows, {})
+    if not legacy:
+        return sector_stats
+    target = _fnum(next(iter(legacy.values())).get("score"), 52.0)
+    scores = []
+    for row in rows or []:
+        code = str(row.get("code", "")).zfill(6)
+        entry = sector_stats.get(industry_map.get(code, "unknown"))
+        if entry is not None:
+            scores.append(_fnum(entry.get("score"), 52.0))
+    if not scores:
+        return sector_stats
+    shift = target - (sum(scores) / len(scores))
+    out = {}
+    for key, entry in sector_stats.items():
+        moved = dict(entry)
+        moved["score"] = round(_clamp(_fnum(entry.get("score"), 52.0) + shift,
+                                      0.0, 100.0), 2)
+        moved["recentre_shift"] = round(shift, 2)
+        moved["score_before_recentre"] = _fnum(entry.get("score"), 52.0)
+        out[key] = moved
+    return out
+
+
 def prepare_context(signals, scan_context=None, model_state=None):
     state = model_state or load_model_state()
     rows = _flatten_signals(signals)
     industry_map = load_industry_mapping()
     market = _compute_market_score(scan_context or {}, rows)
     sector_stats = _compute_sector_stats(rows, industry_map)
+    sector_stats = _recentre_sector_scores(rows, industry_map, sector_stats)
     return {
         "state": state,
         "rows": rows,
