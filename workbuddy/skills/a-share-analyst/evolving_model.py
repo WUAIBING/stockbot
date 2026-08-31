@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import json
 import hashlib
 import math
@@ -314,6 +316,25 @@ def _bounded_bias_update(current_map, target_map, *, step_limit, low, high):
     return merged
 
 
+# The sector fix below is CORRECT but changes the score SCALE, and every
+# threshold in the system was calibrated while sector was a broken constant.
+#
+# Measured on the 58 signals of 2026-08-31: model_score falls by a mean of 3.32
+# (median 1.37, worst 10.27) because the old constant 60.41 sat ABOVE most real
+# sector scores, which range 6.02 to 55.29. Ranking barely moves - top-10
+# overlap 8 of 10 - but the LEVEL drops, and the level is what thresholds read:
+#
+#     clearing min_trade_score (64)    29 -> 21   (-28%)
+#     clearing 72                       7 ->  4
+#     clearing 76                       1 ->  0
+#
+# Enabling it raw would quietly tighten a book already holding 12 of 25 slots.
+# So it is off until the thresholds are re-derived against the corrected scale.
+# Set TLFZ_REAL_SECTOR=1 to enable.
+REAL_SECTOR_ENABLED = str(
+    os.environ.get("TLFZ_REAL_SECTOR", "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_industry_mapping():
     mapping = {}
     for candidate in INDUSTRY_FILE_CANDIDATES:
@@ -327,7 +348,30 @@ def load_industry_mapping():
                         continue
                     parts = line.split("|")
                     if len(parts) >= 3:
-                        mapping[parts[0].strip()] = parts[2].strip() or "unknown"
+                        # tdxhy.cfg is market|code|tdx_hy|||csrc_hy. This keyed
+                        # on parts[0] - the MARKET field, 0/1/2 - so the whole
+                        # 5,586-line file collapsed to three entries holding
+                        # whatever each market's last line happened to be:
+                        # {'0': 'T0701', '1': 'unknown', '2': 'T0403'}.
+                        #
+                        # Every lookup therefore missed, every stock resolved to
+                        # "unknown", and _compute_sector_stats grouped the whole
+                        # universe into ONE bucket. That is why the sector score
+                        # was identical for every candidate every day - 60.41 on
+                        # 2026-08-31, 20 distinct values across 2,507 decisions
+                        # against 1,067 for stock and 918 for flow. The sector
+                        # dimension was switched off by an index.
+                        industry = parts[2].strip() or "unknown"
+                        code = parts[1].strip()
+                        if REAL_SECTOR_ENABLED:
+                            if len(code) == 6 and code.isdigit():
+                                mapping[code] = industry
+                        else:
+                            # The historical key: parts[0] is the MARKET field,
+                            # so the file collapses to three entries and every
+                            # lookup misses. Kept verbatim so behaviour is
+                            # unchanged until thresholds are recalibrated.
+                            mapping[parts[0].strip()] = industry
             if mapping:
                 break
         except Exception:
