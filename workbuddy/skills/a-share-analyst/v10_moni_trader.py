@@ -524,6 +524,64 @@ MX_FILL_REPAIR_FILE = str(DATA_DIR / 'v10_mx_fill_repair_latest.json')
 PENDING_ORDERS_FILE = str(DATA_DIR / 'v10_pending_orders.json')
 PENDING_ORDERS_ARCHIVE_FILE = str(DATA_DIR / 'v10_pending_orders_archive.json')
 SMART_SELL_RETRY_STATE_FILE = str(DATA_DIR / 'v10_smart_sell_retry_state.json')
+
+# === 停牌交易日记录 (halted sessions) ===
+# The 09:31 gate tells us which codes cannot trade TODAY. A hold-length exit
+# needs to know which sessions a position was suspended for over its whole life,
+# so each day's exclusions are appended here.
+HALTED_SESSIONS_FILE = str(DATA_DIR / 'v10_halted_sessions.json')
+
+
+def _record_halted_sessions(exclusion_map, trade_date):
+    """Append today's suspended codes. Never raises into the trading path."""
+    try:
+        codes = sorted(str(c).zfill(6) for c in (exclusion_map or {}))
+        if not codes:
+            return {}
+        payload = _read_json(HALTED_SESSIONS_FILE) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        day = _date_key(trade_date)
+        for code in codes:
+            days = payload.get(code) or []
+            if not isinstance(days, list):
+                days = []
+            if day and day not in days:
+                days.append(day)
+            payload[code] = sorted(set(days))[-120:]
+        _write_json_atomic(HALTED_SESSIONS_FILE, payload)
+        return payload
+    except Exception:
+        return _read_json(HALTED_SESSIONS_FILE) or {}
+
+
+def _hold_sessions(code, buy_date, as_of=None):
+    """Trading sessions a position has actually been holdable.
+
+    hold_days counts CALENDAR days, so a weekend inflates it: 000543 皖能电力
+    bought Friday 2026-07-17 and sold Tuesday 2026-07-21 recorded 3 against 2
+    real sessions. MAX_HOLD_DAYS is 10 and the study behind that 10 measured
+    TRADING sessions - +5.60pp/yr at ten against +3.80 at five - so a
+    calendar-day gate fires roughly a third early on every position.
+
+    Suspended sessions are excluded too: they carry no decay and no opportunity,
+    and ageing through one fires an exit that cannot fill.
+
+    Returns None when the answer is not knowable - outside the verified holiday
+    table, or a missing date - and the caller then keeps the old behaviour
+    rather than acting on a guess.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import trading_halt as _halt
+
+        halted = (_read_json(HALTED_SESSIONS_FILE) or {}).get(
+            str(code).zfill(6)) or []
+        return _halt.sessions_held(
+            buy_date, as_of or datetime.now().strftime('%Y-%m-%d'),
+            halted_dates=halted)
+    except Exception:
+        return None
 SMART_SELL_SHARED_LOCK_TTL_SECONDS = 420
 SMART_SELL_RATE_LIMIT_COOLDOWN_SECONDS = 35 * 60
 SCAN_FRESHNESS_MINUTES = 20
@@ -1650,7 +1708,15 @@ def _load_today_tradability_exclusions():
     payload = _read_json(OPENING_TRADABILITY_FILE)
     if not isinstance(payload, dict):
         return {}
-    return build_today_exclusion_map(payload)
+    exclusion_map = build_today_exclusion_map(payload)
+    # Persist which sessions each code could not trade. The gate only ever
+    # describes TODAY, but a hold-length exit has to reason over the whole life
+    # of a position, so the days accumulate in HALTED_SESSIONS_FILE.
+    _record_halted_sessions(
+        exclusion_map,
+        str((payload or {}).get('trade_date') or '').strip()
+        or datetime.now().strftime('%Y-%m-%d'))
+    return exclusion_map
 
 
 def _is_excluded_today_for_trading(code, exclusions=None):
@@ -11360,6 +11426,11 @@ def _do_sell_core(smart=False, dry_run=False):
             hold_days = (datetime.now() - buy_dt).days
         except ValueError:
             hold_days = 0
+        # The T+N gate below measures decay in TRADING sessions, which is what
+        # the hold-length study measured. hold_days is calendar arithmetic and
+        # runs ahead of that across weekends, holidays and suspensions.
+        hold_sessions = _hold_sessions(code, buy_date)
+        hold_days_for_exit = hold_days if hold_sessions is None else hold_sessions
 
         pos = active_pos_map.get(str(code).zfill(6))
         if not pos:
@@ -11457,8 +11528,12 @@ def _do_sell_core(smart=False, dry_run=False):
             sell_action = BIG_MEAT_ACTION_HARD_EXIT
 
         # ── 规则1: T+N兜底 ──
-        elif hold_days >= MAX_HOLD_DAYS:
-            sell_reason = f"T+{MAX_HOLD_DAYS}到期(持仓{hold_days}天)"
+        elif hold_days_for_exit >= MAX_HOLD_DAYS:
+            sell_reason = (
+                f"T+{MAX_HOLD_DAYS}到期(交易日{hold_days_for_exit}天/自然日{hold_days}天)"
+                if hold_sessions is not None
+                else f"T+{MAX_HOLD_DAYS}到期(持仓{hold_days}天)"
+            )
             sell_action = BIG_MEAT_ACTION_HARD_EXIT
 
         # ── 规则2: 信号衰减 → 提前卖出（smart模式） ──

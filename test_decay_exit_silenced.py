@@ -113,14 +113,15 @@ class SellRuleOrderTests(unittest.TestCase):
         self.assertIn("pnl_pct <= INTRADAY_HARD_STOP_PCT", SRC)
 
     def test_backstop_uses_the_constant_not_a_literal(self):
-        self.assertIn("hold_days >= MAX_HOLD_DAYS", SRC)
+        # The gate now measures TRADING sessions, not calendar days.
+        self.assertIn("hold_days_for_exit >= MAX_HOLD_DAYS", SRC)
         self.assertNotIn("if hold_days >= 5:\n            sell_reason", SRC)
 
     def test_the_two_rules_are_mutually_exclusive(self):
         """elif, so a stopped-out position is not also labelled an expiry."""
         i = SRC.find("pnl_pct <= INTRADAY_HARD_STOP_PCT")
         window = SRC[i:i + 700]
-        self.assertIn("elif hold_days >= MAX_HOLD_DAYS", window)
+        self.assertIn("elif hold_days_for_exit >= MAX_HOLD_DAYS", window)
 
 
 if __name__ == "__main__":
