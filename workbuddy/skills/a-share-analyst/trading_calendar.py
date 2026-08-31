@@ -57,7 +57,13 @@ MARKET_HOLIDAYS = {
     "2026-05-05",
     "2026-06-19",
     "2026-09-25",
-    "2026-09-28",
+    # 2026-09-28 was listed here and is a TRADING day. The exchange
+    # notice reads 六、中秋节：9月25日（星期五）至9月27日（星期日）休市，
+    # 9月28日（星期一）起照常开市 - a Friday-to-Sunday closure, which is
+    # the standard shape when 中秋 falls on a Friday. Six independent
+    # sources agree and 2026-09-28 is indeed a Monday. Closing it here
+    # shifted every session count that crosses it, days before Q3
+    # reporting season.
     "2026-10-01",
     "2026-10-02",
     "2026-10-05",

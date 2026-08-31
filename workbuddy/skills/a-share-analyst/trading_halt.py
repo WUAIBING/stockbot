@@ -58,6 +58,7 @@ halt into an accidental long-term hold, which is the opposite of the fix.
 
 from __future__ import annotations
 
+import datetime as _dt
 from typing import Mapping, Sequence
 
 # A price that has not moved at all since the previous close. Exact zero rather
@@ -197,3 +198,77 @@ def summarise(states: Sequence[Mapping]) -> dict:
                                if not s.get("confirmed")
                                and int(s.get("flat_observations", 0)) > 0]),
     }
+
+
+# === trading-session arithmetic ===
+#
+# hold_days was computed as CALENDAR days - (datetime.now() - buy_dt).days - so
+# a weekend inflated it. 000543 皖能电力 bought Friday 2026-07-17 and sold
+# Tuesday 2026-07-21 recorded 3 days against 2 actual sessions.
+#
+# That matters because MAX_HOLD_DAYS is 10 and the hold-length study that chose
+# 10 measured TRADING SESSIONS: +5.60pp/yr at ten against +3.80 at five and
+# -0.75 at three. Ten calendar days spanning two weekends is about seven
+# sessions, so the exit has been firing roughly a third early on every position
+# since long before any halt existed.
+#
+# The calendar is NOT duplicated here. trading_calendar carries the official
+# SSE/SZSE closures for 2025-2026 and the trader already imports it; a second
+# copy would drift, and this one already did - it was missing nothing but the
+# canonical table held a wrong 2026-09-28 that this module disagreed with.
+# One table, one place.
+from trading_calendar import (
+    MARKET_HOLIDAYS as _CANON_HOLIDAYS,
+    is_trading_day as _is_trading_day,
+)
+
+# Derived from the canonical table rather than restated, so extending the
+# calendar to a new year automatically extends what this will answer for.
+# Outside these years sessions_held returns None instead of guessing a
+# weekday calendar, because a wrong session count moves a real exit.
+HOLIDAY_COVERAGE_YEARS = tuple(sorted({int(str(d)[:4]) for d in _CANON_HOLIDAYS}))
+
+
+def _as_date(value):
+    if isinstance(value, _dt.date):
+        return value
+    s = str(value or "").strip()[:10].replace("/", "-")
+    try:
+        return _dt.date(*map(int, s.split("-")))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_trading_session(day) -> bool:
+    d = _as_date(day)
+    return bool(d) and bool(_is_trading_day(d))
+
+
+def sessions_held(buy_date, as_of, *, halted_dates=()) -> int | None:
+    """Trading sessions a position has actually been holdable.
+
+    Counts sessions AFTER the buy up to and including as_of, skipping weekends,
+    exchange holidays, and any session the stock was suspended.
+
+    A halted session carries no decay and no opportunity, so ageing a position
+    through one would fire an exit whose reason never happened - and fire it
+    into a stock that cannot fill the order.
+
+    Returns None outside the verified holiday table rather than guessing a
+    weekday calendar, because a wrong session count moves a real exit.
+    """
+    a, b = _as_date(buy_date), _as_date(as_of)
+    if a is None or b is None:
+        return None
+    if a.year not in HOLIDAY_COVERAGE_YEARS or b.year not in HOLIDAY_COVERAGE_YEARS:
+        return None
+    if b < a:
+        return 0
+    skip = {d for d in (_as_date(x) for x in (halted_dates or [])) if d}
+    n = 0
+    cur = a + _dt.timedelta(days=1)
+    while cur <= b:
+        if is_trading_session(cur) and cur not in skip:
+            n += 1
+        cur += _dt.timedelta(days=1)
+    return n
