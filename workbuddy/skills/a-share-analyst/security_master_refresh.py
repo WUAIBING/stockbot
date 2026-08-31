@@ -26,6 +26,10 @@ from market_resolver import fallback_market_info
 
 SECURITY_MASTER_JSON = DATA_DIR / "security_master_latest.json"
 SECURITY_MASTER_CSV = DATA_DIR / "security_master_latest.csv"
+# Turnover below this is not a trade, it is a float artefact. See the note
+# in build_opening_tradability: a halted stock reports 5.877471754111438e-39.
+MIN_MEANINGFUL_AMOUNT = 1.0
+
 OPENING_TRADABILITY_JSON = DATA_DIR / "opening_tradability_latest.json"
 OPENING_TRADABILITY_CSV = DATA_DIR / "opening_tradability_latest.csv"
 OPENING_TRADABILITY_HISTORY = DATA_DIR / "automation_status" / "opening_tradability_history.jsonl"
@@ -466,6 +470,22 @@ def build_opening_tradability(records: list[dict]) -> list[dict]:
         last_close = _safe_float(quote.get("last_close", 0.0), 0.0)
         volume = _safe_int(quote.get("vol", 0), 0)
         amount = _safe_float(quote.get("amount", 0.0), 0.0)
+
+        # pytdx returns a DENORMALIZED FLOAT rather than zero for a suspended
+        # stock's turnover: 688432 有研硅 and 600929 雪天盐业 both read
+        # amount = 5.877471754111438e-39 on 2026-08-31, the day 有研硅 halted
+        # for a 重大资产重组. That is uninitialised bytes read as float32, and
+        # the identical constant on both proves it is a fixed pattern.
+        #
+        # It defeated `amount <= 0`: three of the four zero checks passed, the
+        # fourth did not, and a suspended stock was published as allow_today.
+        # The evidence was invisible in the output because round(5.877e-39, 2)
+        # is 0.0 - the file showed a zero that the comparison never saw.
+        #
+        # So turnover is judged against a floor a real trade must clear. One
+        # yuan is far below any A-share round lot and far above any float
+        # artefact.
+        amount = 0.0 if amount < MIN_MEANINGFUL_AMOUNT else amount
 
         status = "tradable_today"
         action = "allow_today"
