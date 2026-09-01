@@ -939,6 +939,86 @@ TIER_CONFIG = {
 PARTIAL_ROLLBACK_DISABLE_FULL_V9_BUILD = True
 PARTIAL_ROLLBACK_DISABLE_POSITIVE_CAPITAL_BIAS = True
 
+# === 披露日历倾斜 (disclosure calendar tilt) ===
+# 默认关闭。开启: TLFZ_DISCLOSURE_TILT=1
+#
+# Measured over 24,773 disclosure events on 272 dates, 2017-2026, as excess over
+# the same sessions equal-weighted universe and aggregated per DATE. Ranked by
+# trailing turnover INSIDE each stock own sector, and quoted against each band
+# own placebo, because raw excess against an equal-weighted universe carries a
+# structural drag for large names that reverses the ordering:
+#
+#     band        K=3            K=5            K=10          stocks
+#     top 1-3   +0.91 t=3.03   +0.49 t=1.30   -0.21 t=-0.47    1,084
+#     4-10      +0.53 t=2.73   +0.71 t=2.64   +0.94 t=2.45     2,342
+#     11-30     +0.49 t=3.42   +0.69 t=3.79   +0.74 t=3.00     5,082
+#     31+       +0.37 t=2.18   +0.54 t=2.33   +0.50 t=1.70    11,679
+#
+# This is a TIEBREAKER and is applied to ranking_score only - the secondary sort
+# key, used after big_meat_seed_score. It deliberately does NOT touch seed_score,
+# because seed_score is re-derived into effective_tier through fixed thresholds:
+# a bump there could silently promote a name from T3 to T2 and change its
+# position size, which is far more than +0.91% over three sessions can justify.
+DISCLOSURE_TILT_ENABLED = str(
+    os.environ.get('TLFZ_DISCLOSURE_TILT', '0')).strip().lower() in ('1', 'true', 'yes', 'on')
+DISCLOSURE_TILT_FILE = Path(__file__).resolve().parent / 'disclosure_candidates_latest.json'
+DISCLOSURE_TILT_LEADER_BONUS = 1.0    # sector rank 1-3, the +0.91% band
+DISCLOSURE_TILT_MID_BONUS = 0.5       # rank 4-30
+_DISCLOSURE_TILT_CACHE = {'loaded': False, 'by_code': {}, 'note': ''}
+
+
+def _load_disclosure_tilt(today_yyyymmdd=None):
+    """Read the candidate file the disclosure runner writes. Never raises.
+
+    A STALE FILE IS IGNORED rather than reused. The whole signal is how many
+    sessions remain before a scheduled report, so yesterday file does not say
+    something slightly out of date - it says the wrong number, and reusing it
+    would enter names whose window has already closed.
+    """
+    if _DISCLOSURE_TILT_CACHE['loaded']:
+        return _DISCLOSURE_TILT_CACHE
+    _DISCLOSURE_TILT_CACHE['loaded'] = True
+    if not DISCLOSURE_TILT_ENABLED:
+        return _DISCLOSURE_TILT_CACHE
+    try:
+        payload = json.loads(Path(DISCLOSURE_TILT_FILE).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        _DISCLOSURE_TILT_CACHE['note'] = '披露日历文件缺失'
+        return _DISCLOSURE_TILT_CACHE
+    stamped = _inum(payload.get('today', 0), 0)
+    if today_yyyymmdd and stamped and stamped != _inum(today_yyyymmdd, 0):
+        _DISCLOSURE_TILT_CACHE['note'] = f'披露日历过期({stamped})'
+        return _DISCLOSURE_TILT_CACHE
+    by_code = {}
+    for item in (payload.get('selected') or []):
+        code = str(item.get('code', '')).strip()
+        if code:
+            by_code[code] = {
+                'sessions_until': item.get('sessions_until'),
+                'sector_rank': item.get('sector_rank'),
+                'sector': item.get('sector'),
+            }
+    _DISCLOSURE_TILT_CACHE['by_code'] = by_code
+    return _DISCLOSURE_TILT_CACHE
+
+
+def _disclosure_tilt_bonus(code, today_yyyymmdd=None):
+    """(bonus, note) for one code. Zero and empty when disabled or absent."""
+    if not DISCLOSURE_TILT_ENABLED:
+        return 0.0, ''
+    hit = _load_disclosure_tilt(today_yyyymmdd)['by_code'].get(str(code).strip())
+    if not hit:
+        return 0.0, ''
+    rank = hit.get('sector_rank')
+    sessions = hit.get('sessions_until')
+    if rank is not None and _inum(rank, 999) <= 3:
+        bonus = DISCLOSURE_TILT_LEADER_BONUS
+        band = f"行业前{_inum(rank, 0)}"
+    else:
+        bonus = DISCLOSURE_TILT_MID_BONUS
+        band = f"行业第{_inum(rank, 0)}" if rank is not None else '行业未排名'
+    return bonus, f"披露倾斜(+{bonus:.1f}/{band}/{_inum(sessions, 0)}日后披露)"
+
 # 每只股票买入金额 = 总资产 × position_pct%
 # 例如：1M × 10% = 10万/只(T1), 1M × 6% = 6万/只(T2), 1M × 3% = 3万/只(T3)
 # 由 do_buy() 动态计算，此处仅作默认值
@@ -10857,6 +10937,12 @@ def _do_buy_core(dry_run=False):
             amount_per_stock_this = min(amount_per_stock_this, target_amount_this)
             if amount_per_stock_this <= 0 or target_amount_this <= 0:
                 continue
+            # Applied to ranking_score only - the SECONDARY sort key. Never to
+            # seed_score, which is re-derived into effective_tier by threshold
+            # and would change position size, not just order.
+            disclosure_bonus, disclosure_note = _disclosure_tilt_bonus(s['code'])
+            if disclosure_note:
+                build_note = f"{build_note}; {disclosure_note}"
             candidate_buckets[effective_tier].append({
                 'code': s['code'],
                 'name': s['name'],
@@ -10868,7 +10954,8 @@ def _do_buy_core(dry_run=False):
                 'build_note': build_note,
                 'target_amount': target_amount_this,
                 'model_score': model_score,
-                'ranking_score': round(model_score + ranking_bonus + freshness_adjustment + seed_bonus, 4),
+                'disclosure_bonus': round(disclosure_bonus, 2),
+                'ranking_score': round(model_score + ranking_bonus + freshness_adjustment + seed_bonus + disclosure_bonus, 4),
                 'model_industry': s.get('model_industry', 'unknown'),
                 'model_market_score': _fnum(s.get('model_market_score', 0.0), 0.0),
                 'model_sector_score': _fnum(s.get('model_sector_score', 0.0), 0.0),
