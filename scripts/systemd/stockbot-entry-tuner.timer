@@ -1,0 +1,14 @@
+[Unit]
+Description=Re-estimate entry effects at 15:20 China time, after close-node
+
+[Timer]
+# 15:20 China = 07:20 UTC. Deliberately LAST in the chain: orders archive at
+# 15:02 supplies the fills, close-node at 15:06 writes the decisions, and this
+# reads both. Fourteen minutes of headroom after close-node, which has run long
+# before now.
+OnCalendar=Mon..Fri *-*-* 07:20:00 UTC
+Persistent=true
+Unit=stockbot-entry-tuner.service
+
+[Install]
+WantedBy=timers.target

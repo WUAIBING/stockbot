@@ -1,0 +1,23 @@
+[Unit]
+Description=Re-estimate which entries pay, from realised broker fills
+After=network-online.target stockbot-orders-archive.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=stockbotrunner
+Group=stockbotrunner
+WorkingDirectory=/opt/stockbot
+EnvironmentFile=-/etc/stockbot/trading-day.env
+# Snapshots are stamped with the local date and the effects are reasoned in
+# China trading days. The droplet runs UTC, so pin the process to market time
+# or a 15:20 fire files itself under the wrong day.
+Environment=TZ=Asia/Shanghai
+# Reads two local files and does arithmetic over ~124 round trips. If it has
+# not finished in two minutes something is wrong, and a stuck estimator must
+# not hold a slot until tomorrow.
+TimeoutStartSec=120
+ExecStart=/usr/bin/env bash /opt/stockbot/scripts/run_entry_tuner.sh
+
+[Install]
+WantedBy=multi-user.target
