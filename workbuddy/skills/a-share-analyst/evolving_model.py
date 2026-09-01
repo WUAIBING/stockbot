@@ -706,9 +706,70 @@ def rank_signals(signals, *, scan_context=None):
     }
 
 
+_SECTOR_MAP = None
+_SECTOR_MAP_LOADED = False
+
+
+def _sector_map():
+    """Real TDX sector identity, loaded once.
+
+    Deliberately INDEPENDENT of REAL_SECTOR_ENABLED. That gate governs whether
+    a corrected sector score reaches selection, and it stays off: measured
+    against the live candidate pool over 18 validated days the corrected score
+    moved within-day rank IC by -0.023 at T+1 (t=-0.52) and was negative at
+    four of five horizons. Within-sector turnover rank fared no better on that
+    pool - the top 1-3 band ran -0.63% at T+1 and -1.45% at T+3, inverting the
+    disclosure-event bands it was derived from.
+
+    Recording carries no such burden of proof. It cannot change a buy, and the
+    book cannot learn from a dimension it never writes down: `industry` reads
+    "unknown" on all 2,507 existing records, which is why the concentration
+    question had to be answered by reconstructing sectors from TDX dailies
+    after the fact instead of simply reading the log.
+    """
+    global _SECTOR_MAP, _SECTOR_MAP_LOADED
+    if not _SECTOR_MAP_LOADED:
+        _SECTOR_MAP_LOADED = True
+        try:
+            import sector_map as _sm
+            loaded = _sm.SectorMap()
+            _SECTOR_MAP = loaded if len(loaded) else None
+        except Exception:
+            _SECTOR_MAP = None
+    return _SECTOR_MAP
+
+
+def sector_concentration(selected_codes):
+    """{sector_code: how many of these buys sit in it}, real sectors only.
+
+    On 2026-08-31 three of five buys - 300747, 688700 and 688596 - were all
+    T0705 工业机械 and nothing in the system could say so. Buys that shared a
+    sector with another same-day buy went on to underperform the names bought
+    beside them by -4.90% at T+5 (t=-2.39) and -6.31% at T+10 (t=-2.26),
+    demeaned within day so a crowded day cannot look bad merely by being a bad
+    day.
+
+    That is recorded rather than enforced. The sign survives every deletion -
+    dropping the 16-buy day, dropping 半导体, dropping 医药 - but leave-one-day-out
+    takes T+5 to t=-1.62 on just 17 shared names. A cap would have vetoed 17 of
+    60 buys on evidence one absent Tuesday can erase.
+    """
+    smap = _sector_map()
+    tally = defaultdict(int)
+    if smap is None:
+        return {}
+    for code in selected_codes or ():
+        sec = smap.sector_code(str(code).zfill(6))
+        if sec:
+            tally[sec] += 1
+    return dict(tally)
+
+
 def record_decisions(run_slot, candidates, *, selected_codes=None, scan_context=None):
     selected_codes = {str(code).zfill(6) for code in (selected_codes or set())}
     MODEL_DECISIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    smap = _sector_map()
+    same_day_buys = sector_concentration(selected_codes)
     trade_date = _normalize_trade_date(datetime.now().strftime("%Y-%m-%d"), run_slot)
     meta = {}
     if isinstance(scan_context, dict):
@@ -746,6 +807,15 @@ def record_decisions(run_slot, candidates, *, selected_codes=None, scan_context=
                 "tier": _inum(item.get("tier", 0), 0),
                 "mode": item.get("mode", ""),
                 "industry": item.get("model_industry", "unknown"),
+                # Real sector, from tdxhy.cfg rather than from `industry` above
+                # - that one reads "unknown" on every record ever written.
+                # sector_same_day_buys counts this row's sector among the day's
+                # BUYS and includes the row itself when it was one, so >= 2
+                # means it was bought alongside a sibling.
+                "sector": (smap.sector_code(code) or "unknown") if smap else "unknown",
+                "sector_name": (smap.sector_name(code) or "unknown") if smap else "unknown",
+                "sector_same_day_buys": int(
+                    same_day_buys.get(smap.sector_code(code), 0)) if smap else 0,
                 "score": round(_fnum(item.get("model_score", 0.0), 0.0), 2),
                 "selected": code in selected_codes,
                 "selection_rank": _inum(item.get("selection_rank", 0), 0),
