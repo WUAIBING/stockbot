@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import entry_tuner as et  # noqa: E402
 import mx_moni_ledger as ml  # noqa: E402
+import vol_regime as vr  # noqa: E402
 
 try:
     from package_paths import DATA_DIR
@@ -32,6 +33,8 @@ except Exception:                                    # pragma: no cover
 ORDERS_FILE = os.path.join(_DATA, "mx_orders_archive", "mx_moni_orders_merged.json")
 DECISIONS_FILE = os.path.join(_DATA, "v10_model_decisions.jsonl")
 HISTORY_FILE = os.path.join(_DATA, "v10_entry_tuner_history.jsonl")
+TRADABILITY_FILE = os.path.join(_DATA, "opening_tradability_latest.json")
+UNIVERSE_STORE = os.path.join(_DATA, "v10_universe_closes.jsonl")
 
 
 def _day(ts):
@@ -161,10 +164,33 @@ def main(argv=None):
           "TLFZ_ENTRY_TUNER=1 (now: %s)"
           % (et.SHRINK_K, "on" if et.TUNER_ENABLED else "off"))
 
+    # Accumulate the universe closes the regime measurement needs. The droplet
+    # has no price history, and every shortcut fails: the scan CSV's own vol20
+    # reads 4.971 where the liquid universe reads 2.294 (a filtered population),
+    # and cross-sectional dispersion correlates 0.380, agreeing on tercile 44.9%
+    # of the time against a 33% coin. So the history gets built rather than
+    # guessed. It rides along here because this already runs daily after close.
+    regime = {"regime": "unknown", "reason": "not attempted"}
+    try:
+        with open(TRADABILITY_FILE, "r", encoding="utf-8") as fh:
+            trad = json.load(fh)
+        closes = vr.snapshot_universe(trad)
+        day = str(trad.get("trade_date") or "").strip()
+        if closes and day and not args.dry_run:
+            n = vr.append_close_snapshot(UNIVERSE_STORE, day, closes)
+            print()
+            print("universe closes: +%d names for %s (%d sessions stored)"
+                  % (len(closes), day, n))
+        regime = vr.regime_from_store(UNIVERSE_STORE)
+    except (OSError, ValueError) as exc:
+        regime = {"regime": "unknown", "reason": "tradability unreadable: %s" % exc}
+    print("  volatility regime: %-7s  %s" % (regime.get("regime"), regime.get("reason")))
+
     if args.dry_run:
         print()
         print("dry run - nothing written")
         return 0
+    snap["volatility_regime"] = regime
     et.append_snapshot(snap, args.history)
     print()
     print("appended snapshot to %s" % args.history)
