@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Adding to a winner: the best-paying thing the account did, gated shut.
+"""Adding to a winner: our book said yes, the market says no.
 
-    already up +5%    n=31   then +4.83%   t+2.38
-    already up +10%   n=19   then +5.80%   t+2.37
-    a fresh entry     n=124  then +1.07%   t+1.13
+Our 124 round trips said adds returned +4.83% against +1.07% for a fresh entry
+(t+2.38), on cells of 8 and 13 trades. Asked of every liquid stock from 2015 to
+2026 - 2.0M observations, excess over the same session's liquid universe, t
+across entry sessions - it inverts:
 
-Two gates stopped it. The hold window is inverted - positions reaching +5%
-within 4 sessions then returned +2.07% (t+0.87) while those taking longer
-returned +12.78% (t+5.34) - and the sector threshold was a constant compared
-against a single global number that blocked every add on 77% of days.
+    first up +10%, then         next 10 sess    next 60 sess
+      reached within 4 sess       -2.007%         -5.325%   t-19.24 / t-39.60
+      reached in 5 or more        -0.980%         -2.785%   t-18.26 / t-29.52
+      baseline                    -0.000%         +0.000%
+
+Buying strength underperforms at every horizon, worsening with time. The boat
+disagreed because it measured forward to the ACTUAL exit - crediting a good
+exit rule to the entry - over three months whose only profitable one was June.
+
+So adds stay shut. What survives is SPEED (slow beats fast, +2.540% at 60
+sessions, t+17.68 - though both are negative) and the sector gate being a
+constant on a scale that no longer exists.
 """
 
 from __future__ import annotations
@@ -32,13 +41,17 @@ class HoldWindowTests(unittest.TestCase):
     """A floor, not a ceiling - the inversion this module corrects."""
 
     def test_the_grinder_passes(self):
-        """002396 星网锐捷: 17+ sessions, +31.57%, excluded by the old ceiling."""
+        """002396 星网锐捷: 17+ sessions, +31.57%, excluded by the old ceiling.
+        Passing here means "less bad", not "good" - the slow bucket still
+        measures -0.980% over 10 sessions on the market."""
         ok, why = ag.hold_window_ok(17)
         self.assertTrue(ok)
         self.assertIn("17", why)
 
     def test_the_fast_spike_is_refused(self):
-        """Reaching the level inside 4 sessions then returned +2.07%, t+0.87."""
+        """Fast movers are the worst group on 11 years of market data:
+        -2.007% over the next 10 sessions (t-19.24) against -0.980% for the
+        slower group. The old ceiling selected exactly this group."""
         ok, why = ag.hold_window_ok(3)
         self.assertFalse(ok)
         self.assertIn("spent", why)

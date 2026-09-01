@@ -1,56 +1,70 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Two gates on adding to a winner, both currently calibrated backwards.
+"""Adding to a winner: refuted on the market, and why the boat said otherwise.
 
-Adding to an already-winning position was the best-paying thing the account
-did, measured on its own realised round trips:
+OUR BOOK SAID YES. THE MARKET SAYS NO.
 
-    already up +5%    n=31   then returned +4.83%   t+2.38   61.3% win
-    already up +10%   n=19   then returned +5.80%   t+2.37   68.4% win
-    already up +20%   n= 7   then returned +6.43%   t+1.35   85.7% win
-    a fresh entry     n=124                  +1.07%  t+1.13   33.9% win
+Measured on our own 124 round trips, money added to a position already up +5%
+returned +4.83% (t+2.38) against +1.07% for a fresh entry - about four times.
+Two cells of that result held 8 and 13 trades.
 
-About four times a new entry's expectation. Two gates stop it happening.
+Asked of every liquid stock on every session from 2015 to 2026 - 2.0 million
+observations, excess over the same session's liquid universe, t taken across
+entry sessions rather than stock-days because stocks move together:
 
-GATE 1: THE HOLD WINDOW IS INVERTED
+    from the moment a stock is first up +10%      next 10 sess   next 60 sess
+      reached within 4 sessions                       -2.007%       -5.325%
+                                                     t-19.24       t-39.60
+      reached in 5 or more                            -0.980%       -2.785%
+                                                     t-18.26       t-29.52
+      baseline (any liquid stock)                     -0.000%       +0.000%
 
-ADD_POSITION_MAX_HOLD_DAYS = 4 admits only positions that got there fast, and
-those are the ones that do not continue:
+Buying a stock that has just risen UNDERPERFORMS, at every horizon out to 60
+sessions, and it gets worse with time rather than reverting to momentum. The
+baseline lands on zero, so the construction is sound and the rest is readable.
 
-    reached +5%   within 4 sessions  n=23   then  +2.07%   t+0.87
-                  after  4 sessions  n= 8   then +12.78%   t+5.34
-    reached +10%  within 4 sessions  n= 6   then  -0.46%   t-0.26
-                  after  4 sessions  n=13   then  +8.69%   t+2.70
+The boat said the opposite for two reasons. It measured forward to the ACTUAL
+exit, so a good exit rule was being credited to the entry; and its only
+profitable month was June, when ChiNext rose 9.92%. Three months of one book in
+one regime cannot see a reversal effect that needs a decade to measure.
 
-A fast spike to +5% is a move already spent - the same T+1 problem that makes
-the entry score describe an untradeable day. A position that grinds up over
-more than four sessions is in something that is still going. The window admits
-the spike and excludes the grind, which is the wrong way round. 002396 星网锐捷
-is the excluded kind: 17+ sessions held, +31.57%.
+SO ADDS STAY SHUT. This module exists to hold that finding where the next
+person to reach for "big meat" will read it, and to keep the two structural
+repairs that are true regardless.
 
-GATE 2: A THRESHOLD AGAINST A SCALE THAT DOES NOT EXIST
+WHAT SURVIVES: SPEED
+
+Slow beats fast at every horizon and the gap widens - +0.348% at 5 sessions
+(t+7.29), +1.027% at 10 (t+9.95), +2.540% at 60 (t+17.68). A fast spike is a
+move already spent, the same T+1 problem that makes the entry score describe an
+untradeable day. So ADD_POSITION_MAX_HOLD_DAYS = 4 is not merely miscalibrated,
+it selects the WORST group - but the fix is not to invert it and add anyway,
+because the better group is still negative. Less bad is not good.
+
+WHAT SURVIVES: THE SECTOR GATE IS A THRESHOLD ON A DEAD SCALE
 
 ADD_POSITION_BIG_MEAT_SECTOR_SCORE = 75.0 was compared against the broken
-single-bucket sector score - ONE number for the entire market each day, from a
-map that had collapsed 5,586 lines into three entries:
+single-bucket sector score - one number for the whole market each day:
 
     days whose sector score reached 75:    5 of 22  (23%)
     days it blocked EVERY possible add:   17 of 22  (77%)
     days with more than one sector value:  0 of 22
 
-In scoring, that constant was inert: adding the same number to every candidate
-cannot reorder them, which is why fixing the map moved within-day rank IC by
--0.023 (t=-0.52). Against a THRESHOLD it is not inert at all - it became a
-market-wide on/off switch for adding to winners, off on three days in four,
-with nothing to do with the stock being added to.
+In scoring that constant was inert - the same number added to every candidate
+cannot reorder them, which is why fixing the map moved rank IC by -0.023
+(t=-0.52). Against a THRESHOLD it is not inert: it became a market-wide on/off
+switch, shut three days in four for reasons unrelated to the stock. Fixing the
+map makes it worse - real per-sector scores reach 55.29 raw and 72.88
+recentred, so neither touches 75 and a correct map would shut adds forever. A
+percentile is the only form that survives a change of scale, which this score
+has already undergone once.
 
-Fixing the map does not fix this. Real per-sector scores run 6.02-55.29 raw
-and 23.61-72.88 recentred; neither reaches 75, so a correct map with this
-constant would block adds permanently. The threshold has to become a
-PERCENTILE - "is this sector strong relative to today's sectors" - which is
-what the constant was trying to express and can only express on a fixed scale.
+That repair matters even with adds shut, because the same constant-against-a-
+moving-scale mistake is what min_trade_score makes, and this is the worked
+example of it.
 
-Gated on TLFZ_ADD_GATES, off by default. Places no orders.
+Gated on TLFZ_ADD_GATES, off by default, and the measurement above is the
+reason to leave it off. Places no orders.
 """
 
 from __future__ import annotations
@@ -60,12 +74,15 @@ import os
 ADD_GATES_ENABLED = str(
     os.environ.get("TLFZ_ADD_GATES", "0")).strip().lower() in ("1", "true", "yes", "on")
 
-# Where the evidence is, not where it is prettiest. +5% is the lowest trigger
-# that measured significantly (t+2.38) and it carries the largest sample.
+# Retained from the boat measurement (+5% was its lowest significant trigger).
+# The market says every bucket above this line is NEGATIVE, so this is the
+# floor of a door that should stay closed, not a recommendation to open it.
 MIN_PROFIT_PCT = 5.0
 
-# The grind, not the spike. Four sessions is the OLD ceiling; here it is a
-# floor, because that is what the measurement says.
+# The grind, not the spike. Four sessions was the old CEILING and it selected
+# the worst group (-2.007% at 10 sessions, t-19.24, against -0.980% for the
+# slower one). Here it is a floor. That is a repair to which group gets picked
+# if adds are ever enabled - it does not make the group profitable.
 MIN_HOLD_SESSIONS = 5
 
 # Top third of sectors. Replaces the fixed 75, which was 23% of days on the
@@ -118,7 +135,8 @@ def hold_window_ok(hold_sessions, min_sessions=MIN_HOLD_SESSIONS):
         return False, "hold length unknown"
     if h < min_sessions:
         return False, ("held %d sessions, needs %d - a fast move is a spent one "
-                       "(+2.07%%, t+0.87)" % (int(h), min_sessions))
+                       "(-2.007%% over the next 10 sessions, t-19.24, against "
+                       "-0.980%% for the slower group)" % (int(h), min_sessions))
     return True, "held %d sessions" % int(h)
 
 
