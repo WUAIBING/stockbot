@@ -1,57 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Market volatility regime - and the history the droplet needs to see it.
+"""Market volatility regime - measured on the universe we actually archive.
 
 WHAT WAS MEASURED
 
-Momentum in A-shares is switched by volatility. Over 2015-2026, splitting
-sessions by the trailing 20-session volatility of the equal-weighted liquid
-universe, and measuring the forward excess of strong stocks minus weak:
+Momentum in A-shares is switched by volatility. Splitting 2015-2026 by the
+trailing 20-session volatility of the archived universe's equal-weighted return,
+and measuring the forward excess of strong stocks minus weak:
 
-    next 10 sessions          strength effect        t
-      calm  (bottom third)         +0.225%       +2.13
-      mid                          -0.403%       -3.46
-      wild  (top third)            -1.501%      -10.49
+    next 10 sessions        strength effect        t
+      calm  (bottom third)       +0.152%       +1.47
+      mid                        -0.284%       -2.41
+      wild  (top third)          -1.596%      -11.02
 
-Monotonic at 5, 10 and 20 sessions. The placebo - the same split on a regime
-value read 40 sessions LATER - comes out flat (-0.47 to -0.57 across all three
-buckets), so the split finds regime rather than calendar.
+    next 20 sessions             +0.127% / -0.722% / -2.563%   (t-14.47 wild)
 
-The account's own record lands exactly on it:
+Monotonic at 5, 10 and 20 sessions. A placebo - the same split on a regime value
+read 40 sessions LATER - goes flat, so this finds regime and not calendar.
 
-    2026-06   vol 1.228 (51st pct)   +3.12%/trade   <- the only profitable month
-    2026-07   vol 1.577 (74th pct)   -1.96%/trade
-    2026-08   vol 1.719 (78th pct)   -0.76%/trade
+The account's record lands on it: 2026-06 was its only profitable month
+(+3.12%/trade) at the 51st volatility percentile, while 2026-07 (-1.96%) and
+2026-08 (-0.76%) sat at the 74th and 78th. Nothing in _compute_market_score
+looks at volatility - it is breadth, tier mix and turnover only.
 
-Two consecutive top-tercile months running momentum entries. And nothing in
-_compute_market_score looks at volatility - it is breadth, tier mix and
-turnover only.
+THE UNIVERSE IS CSI 1000, NOT THE MARKET
 
-WHY THIS MODULE ARCHIVES INSTEAD OF ESTIMATING
+This matters enough to state twice. The 09:31 tradability gate publishes
+`scanner_exchange_universe`, which is the CSI 1000 constituent list from
+csi1000-skills/000852cons.xls - 1,042 names with EVERY large cap excluded by
+construction. 600519, 601398, 300750 are all absent.
 
-The droplet has no market price history: no TDX dailies, no index. The two
-statistics it could reach both fail:
+So the archive stores small/mid caps, and thresholds calibrated on the liquid
+whole market do not belong to it. The first cut of this module shipped
+1.0390/1.4220 from a whole-market calibration; applied to the archived series
+those read CALM 28% / mid 34% / WILD 38% of days instead of 33/33/33 - a real
+skew toward "wild", from measuring one population and deploying on another. The
+constants below are recalibrated on the gate universe itself.
 
-  * the scan CSV's own vol20 column reads 4.971 where the liquid universe reads
-    2.294 for 2026-08-27 - more than double, because the scan is a FILTERED set
-    that selects volatile breakout names. Applying universe thresholds to it
-    would mark nearly every day wild. That is the ADD_POSITION_BIG_MEAT_SECTOR_
-    SCORE mistake exactly: a threshold calibrated on one population, applied to
-    another.
-  * cross-sectional dispersion, which one day's data can give, correlates only
-    0.380 with the quantity that matters and agrees on tercile 44.9% of the
-    time against a 33% coin. Classifying the regime wrong half the time is
-    worse than not classifying it.
+That miscalibration was mild only by luck: the two series correlate 0.996 and
+agree on tercile 94.5% of the time, because CSI 1000 volatility tracks the
+market's closely. The same mistake with the scan CSV's own vol20 column would
+NOT have been mild - it reads 4.971 where the liquid universe reads 2.294,
+correlating 0.380 and agreeing 44.9% of the time against a 33% coin. Population
+before threshold, every time.
 
-So this does not estimate the regime from what is at hand. It ARCHIVES what is
-needed - the tradability gate already publishes last_close for the whole
-tradable universe every session - and refuses to classify until enough sessions
-have accumulated. Twenty-one closes gives the first reading; before that
-`classify` returns "unknown" and says why.
+Breadth is where the difference bites hardest and is NOT interpolatable: on the
+panel, top-300-by-turnover breadth minus next-1000 breadth ranges from -18.9 to
++23.1 points day to day. A CSI 1000 reading is not a market reading, and no
+constant corrects it.
 
-Thresholds are the measured terciles of that exact statistic. Nothing here
-changes scoring: it reports a regime. Gated on TLFZ_VOL_REGIME for any consumer
-that later wants to act on it.
+WHY THIS ARCHIVES INSTEAD OF ESTIMATING
+
+The droplet has no market price history - no TDX dailies, no index - so it
+cannot compute this at all today. Rather than estimate the regime from what is
+at hand and be wrong, this stores the universe closes the gate already
+publishes and refuses to classify until 21 sessions exist.
+
+If the gate is ever widened to the whole market, these thresholds stop applying.
+`regime_from_store` therefore checks the archived universe size against the size
+it was calibrated on and refuses rather than silently reading the wrong scale.
+
+Nothing here changes scoring: it reports a regime. Gated on TLFZ_VOL_REGIME.
 """
 
 from __future__ import annotations
@@ -64,10 +73,18 @@ from datetime import datetime
 VOL_REGIME_ENABLED = str(
     os.environ.get("TLFZ_VOL_REGIME", "0")).strip().lower() in ("1", "true", "yes", "on")
 
-# Terciles of the trailing 20-session volatility of the equal-weighted liquid
-# universe, over 2,648 sessions from 2015-10 to 2026-08.
-CALM_BELOW = 1.039
-WILD_ABOVE = 1.422
+# Terciles of the trailing 20-session volatility of the equal-weighted GATE
+# universe (CSI 1000), over 2,648 sessions from 2015-10 to 2026-08. Calibrated
+# on the same population the archive stores - see the header for why the
+# previous whole-market figures (1.0390/1.4220) were wrong here.
+CALM_BELOW = 1.0969
+WILD_ABOVE = 1.4802
+
+# Names the calibration ran on: 1,042 gate codes, 1,037 present in the panel.
+# A universe that has drifted far from this is a different population and these
+# thresholds no longer describe it.
+CALIBRATION_UNIVERSE_SIZE = 1037
+UNIVERSE_TOLERANCE = 0.25
 
 WINDOW = 20
 MIN_SESSIONS = WINDOW + 1        # 21 closes -> 20 returns -> one volatility
@@ -167,13 +184,36 @@ def classify(vol, calm_below=CALM_BELOW, wild_above=WILD_ABOVE):
         return UNKNOWN, ("not enough universe history yet - needs %d closes"
                          % MIN_SESSIONS)
     if vol <= calm_below:
-        return CALM, ("vol %.3f <= %.3f: momentum measured +0.225%% over 10 "
-                      "sessions (t+2.13)" % (vol, calm_below))
+        return CALM, ("vol %.3f <= %.3f: momentum measured +0.152%% over 10 "
+                      "sessions (t+1.47)" % (vol, calm_below))
     if vol >= wild_above:
-        return WILD, ("vol %.3f >= %.3f: momentum measured -1.501%% over 10 "
-                      "sessions (t-10.49)" % (vol, wild_above))
-    return MID, ("vol %.3f between %.3f and %.3f: momentum measured -0.403%% "
-                 "(t-3.46)" % (vol, calm_below, wild_above))
+        return WILD, ("vol %.3f >= %.3f: momentum measured -1.596%% over 10 "
+                      "sessions (t-11.02)" % (vol, wild_above))
+    return MID, ("vol %.3f between %.3f and %.3f: momentum measured -0.284%% "
+                 "(t-2.41)" % (vol, calm_below, wild_above))
+
+
+def universe_matches_calibration(rows, expected=CALIBRATION_UNIVERSE_SIZE,
+                                 tolerance=UNIVERSE_TOLERANCE):
+    """Is the archived universe still the one the thresholds were built on?
+
+    The gate publishes CSI 1000 today. If it is ever widened to the whole
+    market - which is the obvious fix for breadth - the archive keeps filling
+    and the thresholds silently start describing a different population. That
+    is the failure this whole module was written after, so it refuses instead.
+    """
+    if not rows:
+        return False, "no sessions archived"
+    recent = [int(r.get("n") or 0) for r in rows[-5:]]
+    recent = [n for n in recent if n > 0]
+    if not recent:
+        return False, "archived sessions carry no universe size"
+    avg = sum(recent) / len(recent)
+    lo, hi = expected * (1 - tolerance), expected * (1 + tolerance)
+    if not (lo <= avg <= hi):
+        return False, ("universe is %d names, thresholds calibrated on %d - "
+                       "recalibrate before classifying" % (int(avg), expected))
+    return True, "universe %d names, as calibrated" % int(avg)
 
 
 def regime_from_store(store_path):
@@ -182,6 +222,10 @@ def regime_from_store(store_path):
         return {"regime": UNKNOWN, "vol": None, "sessions": len(rows),
                 "reason": "have %d of %d closes needed" % (len(rows), MIN_SESSIONS),
                 "enabled": VOL_REGIME_ENABLED}
+    ok, why = universe_matches_calibration(rows)
+    if not ok:
+        return {"regime": UNKNOWN, "vol": None, "sessions": len(rows),
+                "reason": why, "enabled": VOL_REGIME_ENABLED}
     rets = universe_returns(rows)
     vol = realised_vol(rets)
     label, reason = classify(vol)
