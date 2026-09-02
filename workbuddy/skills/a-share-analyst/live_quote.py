@@ -20,6 +20,13 @@ So every quote here carries `fetched_at` and `age_seconds`, and the formatter
 refuses to print a price without them. A number whose age is invisible will
 eventually be read as live by someone, and that someone was me.
 
+A HALT IS READ FROM VOLUME, NOT PRICE. During the session a suspended name
+quotes 0.00, but once the close rolls through the feed serves its last close
+instead: 688432 有研硅 reported 0.00 at 12:27 and 45.22 at 15:07 on the same
+suspended day. Price alone would show a normal-looking stock at a
+normal-looking price for something that cannot be traded. Volume is zero
+either way.
+
 READ-ONLY. This opens a market-data socket and asks for prices. It cannot place,
 amend or cancel an order, and a test asserts the module holds no execution path.
 """
@@ -141,6 +148,34 @@ def get_quotes(codes):
     return out
 
 
+def is_halted(quote):
+    """No trading today, judged on VOLUME rather than price.
+
+    Price is not a reliable tell and the difference only shows up after hours.
+    During the session a suspended name quotes 0.00; once the close rolls
+    through, the feed serves its last close instead - 688432 有研硅 reported
+    0.00 at 12:27 and 45.22 at 15:07 on the same suspended day. A caller
+    checking price would have seen a normal-looking stock at a normal-looking
+    price for a security that cannot be traded at all.
+
+    Volume is zero either way, so that is what this reads.
+    """
+    if not isinstance(quote, dict):
+        return None
+    raw = quote.get("volume")
+    if raw is None:
+        # ABSENT is not ZERO. `quote.get("volume") or 0` would coalesce a
+        # missing field to nought and report every incomplete quote as halted -
+        # the same shape as "".zfill(6) becoming "000000", and the third time
+        # this module has produced it. Unknown must stay unknown.
+        return None
+    try:
+        vol = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return vol <= 0
+
+
 def age_seconds(quote, as_of=None):
     try:
         return max(0.0, (as_of or time.time()) - float(quote["fetched_ts"]))
@@ -158,6 +193,12 @@ def format_quote(quote, name=""):
         return "no quote (and no timestamp, so nothing is printable)"
     age = age_seconds(quote)
     chg = quote.get("change_pct")
+    if is_halted(quote):
+        return ("%-8s %-10.10s %8s  HALTED (no volume; prev %.2f) "
+                "[fetched %s, %.0fs ago]"
+                % (quote.get("code", ""), name, "-",
+                   quote.get("last_close", 0.0),
+                   quote.get("fetched_at", "?"), age if age is not None else -1))
     return ("%-8s %-10.10s %8.2f  %+7.2f%%  prev %.2f  open %.2f  "
             "[fetched %s, %.0fs ago]"
             % (quote.get("code", ""), name, quote.get("price", 0.0),
