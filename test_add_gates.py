@@ -66,11 +66,19 @@ class HoldWindowTests(unittest.TestCase):
 
 
 class ProfitTests(unittest.TestCase):
-    def test_the_measured_trigger_passes(self):
-        self.assertTrue(ag.profit_ok(10.41)[0])       # 600403 大有能源
+    def test_the_trigger_is_at_big_meat_not_at_any_winner(self):
+        """+5% measured +1.08% (t+0.59) on our own book - nothing. The signal
+        is at +20%: +14.14% at 5 sessions, t+2.34."""
+        self.assertEqual(ag.MIN_PROFIT_PCT, 20.0)
+        self.assertTrue(ag.profit_ok(31.57)[0])       # 002396 星网锐捷
+        self.assertFalse(ag.profit_ok(10.41)[0])      # 600403 - a winner, not big meat
 
     def test_below_the_trigger_refuses(self):
         self.assertFalse(ag.profit_ok(3.49)[0])       # 603039 泛微网络
+
+    def test_the_added_slice_is_a_short_trade(self):
+        """The edge is +11.64% at 3 sessions, +14.14% at 5, gone by 10."""
+        self.assertLessEqual(ag.ADD_MAX_HOLD_SESSIONS, 5)
 
     def test_a_loser_refuses(self):
         self.assertFalse(ag.profit_ok(-8.11)[0])      # 300747 锐科激光
@@ -143,6 +151,13 @@ class EvaluateTests(unittest.TestCase):
                                      "T0705", SECTORS, 17,
                                      tradable_codes=["002396"])
         self.assertTrue(ok, checks)
+
+    def test_a_merely_good_position_is_not_big_meat(self):
+        """600403 at +10.41% is a winner. The evidence for adding is not there."""
+        ag.ADD_GATES_ENABLED = True
+        ok, _ = ag.evaluate_add({"code": "600403", "profit_pct": 10.41},
+                                "T0705", SECTORS, 20, tradable_codes=["600403"])
+        self.assertFalse(ok)
 
     def test_every_gate_reports_even_when_it_passes(self):
         """A check that only speaks when refusing leaves no way to tell a real

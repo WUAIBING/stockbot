@@ -74,10 +74,26 @@ import os
 ADD_GATES_ENABLED = str(
     os.environ.get("TLFZ_ADD_GATES", "0")).strip().lower() in ("1", "true", "yes", "on")
 
-# Retained from the boat measurement (+5% was its lowest significant trigger).
-# The market says every bucket above this line is NEGATIVE, so this is the
-# floor of a door that should stay closed, not a recommendation to open it.
-MIN_PROFIT_PCT = 5.0
+# +20%, not +5%. The +5% trigger came from a boat measurement that credited a
+# good exit rule to the entry. Measured properly - forward over a FIXED horizon
+# from the moment one of OUR positions first reaches the level, excess over the
+# same-session liquid universe:
+#
+#     our positions up +5%    n=36   +1.08% at 5 sessions   t+0.59   nothing
+#     our positions up +10%   n=21   +4.08% at 5 sessions   t+1.36   suggestive
+#     our positions up +20%   n= 9  +14.14% at 5 sessions   t+2.34   the signal
+#                                    +11.64% at 3 sessions   t+3.11
+#
+# against an ocean benchmark of -2.007% (t-19.24) for ANY stock up +10%. So the
+# selection IS different at the big-meat stage - but only there. Setting the
+# trigger at +5% would open the door where the evidence is absent and the market
+# is against us.
+MIN_PROFIT_PCT = 20.0
+
+# The added slice is a SHORT trade, not a doubling-down. The edge is +11.64% at
+# 3 sessions and +14.14% at 5, then gone by 10 (-1.33%, t-0.18). An add held to
+# the core position's exit would give back what it earned.
+ADD_MAX_HOLD_SESSIONS = 5
 
 # The grind, not the spike. Four sessions was the old CEILING and it selected
 # the worst group (-2.007% at 10 sessions, t-19.24, against -0.980% for the
