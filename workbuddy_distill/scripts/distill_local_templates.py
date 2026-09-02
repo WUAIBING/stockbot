@@ -243,7 +243,37 @@ def build_template_name(params: dict[str, Any]) -> str:
     )
 
 
-def build_veto_name(params: dict[str, Any]) -> str:
+NO_VETO_NAME = "no_veto"
+
+
+def build_veto_name(params: dict[str, Any] | None) -> str:
+    """Stable label for a template's negative veto, including when it has none.
+
+    A template WITHOUT a negative veto is a normal case, not an error:
+    `select_candidates` a few lines below declares
+    `veto_params: dict[str, Any] | None = None` and returns early on None. This
+    function carried the same contract and no guard, so one such template raised
+
+        AttributeError: 'NoneType' object has no attribute 'get'
+
+    and took the entire pool build down with it - build_workbuddy_distill_pool
+    crashed on every run from 2026-08-28, the Workbuddy candidate pool froze at
+    2026-08-27, and that account stopped buying for four sessions. The only
+    outward sign was systemd exit-code 3 on stockbot-distill-refresh, which
+    nothing reads.
+
+    It bites hardest exactly when the search is struggling: with
+    `promoted_combination_count: 0` the registry holds no templates, so
+    `load_registry` falls back to the artifact templates - and those carry no
+    negative_veto at all. So the failure arrives precisely when the fallback is
+    the only thing left, and disables the fallback too.
+
+    A string is returned rather than None because the result is added to a set
+    of names (`item["negative_vetoes"].add(...)`) that is later sorted; a None
+    among strings would move the crash downstream rather than remove it.
+    """
+    if not params:
+        return NO_VETO_NAME
     family = params.get("family", "recent_tail_veto")
     suffix = "_nost" if params.get("exclude_risk_warning") else ""
     if family == "fake_head_veto":
