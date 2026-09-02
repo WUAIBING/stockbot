@@ -186,6 +186,50 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(checks[0][0], "tradable")
 
 
+class SizingTests(unittest.TestCase):
+    """10% of book for confirmed big meat, capped in total.
+
+    The add lands on a position already up +20%, so only the ~7.3% increment
+    can be wrong, and the worst observed continuation (-9.82%) still leaves the
+    combined position green. Across a quarter's 9 big meat that is +6.65% of
+    NAV if real against -1.32% if not.
+    """
+
+    def test_a_small_position_is_taken_to_target(self):
+        add, why = ag.add_size_pct(2.7, 2.7)
+        self.assertAlmostEqual(add, 7.3, places=2)
+        self.assertIn("to 10.0%", why)
+
+    def test_a_position_already_at_target_adds_nothing(self):
+        add, why = ag.add_size_pct(10.0, 10.0)
+        self.assertEqual(add, 0.0)
+        self.assertIn("already at", why)
+
+    def test_the_total_cap_binds_before_the_name_cap(self):
+        """Two concurrent big meat is the most the book should have frozen -
+        688432 shows a 10% position can become unexitable overnight."""
+        add, why = ag.add_size_pct(2.0, 18.0)
+        self.assertAlmostEqual(add, 2.0, places=2)
+        self.assertIn("capped by total exposure", why)
+
+    def test_no_room_at_all_adds_nothing(self):
+        add, why = ag.add_size_pct(2.0, 20.0)
+        self.assertEqual(add, 0.0)
+        self.assertIn("cap", why)
+
+    def test_the_target_is_ten_percent(self):
+        """4% was a first pass that priced the add as a fresh bet."""
+        self.assertEqual(ag.BIG_MEAT_TARGET_PCT, 10.0)
+
+    def test_total_exposure_is_capped_at_two_names(self):
+        self.assertEqual(ag.TOTAL_BIG_MEAT_CAP_PCT,
+                         2 * ag.BIG_MEAT_TARGET_PCT)
+
+    def test_unmeasurable_input_adds_nothing(self):
+        self.assertEqual(ag.add_size_pct(None, 0)[0], 0.0)
+        self.assertEqual(ag.add_size_pct(2.0, "x")[0], 0.0)
+
+
 class SafetyTests(unittest.TestCase):
     def test_the_module_places_no_orders(self):
         src = Path(ag.__file__).read_text(encoding="utf-8")

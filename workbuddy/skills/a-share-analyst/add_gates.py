@@ -105,6 +105,30 @@ MIN_HOLD_SESSIONS = 5
 # broken scale and would be 0% of days on a correct one.
 SECTOR_PERCENTILE = 0.67
 
+# A confirmed big meat is taken to 10% of book. Ordinary positions stay near
+# 2%, so the slice actually at risk is the ~7.3% increment - and it lands on a
+# position already carrying +20%, which is why this is not the reckless number
+# it first looks like:
+#
+#     continuation real   +10.12% x 7.3% = +0.74% of NAV per event
+#     continuation wrong   -2.01% x 7.3% = -0.15%
+#     worst observed       -9.82% x 7.3% = -0.72%   (combined position still green)
+#
+# Across the 9 big meat of one quarter: +6.65% of NAV if real, -1.32% if not,
+# EV +3.62% at P=0.62. Raw Kelly on the measured continuation said 8%, so this
+# is just above full Kelly rather than wildly beyond it.
+#
+# A first pass set this at 4%, pricing the add as a fresh bet. It is not one -
+# only the increment can be wrong, and the cushion absorbs the worst case.
+BIG_MEAT_TARGET_PCT = 10.0
+
+# What does NOT shrink with the cushion is being unable to get out. 688432 has
+# been suspended since 2026-08-31 with no reopen date; 10% of book in a halted
+# name is 10% that cannot be exited at any price. And a -10% open on 10% is
+# -1.0% of NAV before anyone can act, with fills landing 1.9% below the open.
+# So total big-meat exposure is capped as well as per-name.
+TOTAL_BIG_MEAT_CAP_PCT = 20.0
+
 
 def _f(v, d=None):
     try:
@@ -163,6 +187,39 @@ def profit_ok(profit_pct, minimum=MIN_PROFIT_PCT):
     if p < minimum:
         return False, "up %.2f%%, needs %.1f%%" % (p, minimum)
     return True, "up %.2f%%" % p
+
+
+def add_size_pct(position_pct, book_big_meat_pct,
+                 target=BIG_MEAT_TARGET_PCT, cap=TOTAL_BIG_MEAT_CAP_PCT):
+    """(pct_of_book_to_add, reason). Never exceeds the per-name or total cap.
+
+    Sizing up happens only AFTER confirmation, which is what makes 10%
+    defensible: the position already carries +20%, so the increment is the only
+    thing that can be wrong, and the worst observed continuation (-9.82%) still
+    leaves the combined position green.
+
+    The total cap is the guard that the cushion does not provide. A halted name
+    cannot be exited at any price - 688432 is the live example - so two
+    concurrent big meat at 10% is the most the book should have frozen.
+    """
+    try:
+        cur = float(position_pct)
+        held = float(book_big_meat_pct)
+    except (TypeError, ValueError):
+        return 0.0, "position or exposure not measurable"
+    if cur >= target:
+        return 0.0, "already at %.1f%% of book, target %.1f%%" % (cur, target)
+    room_name = target - cur
+    room_total = cap - held
+    if room_total <= 0:
+        return 0.0, ("big-meat exposure already %.1f%% of book, cap %.1f%%"
+                     % (held, cap))
+    add = min(room_name, room_total)
+    if add < room_name:
+        return round(add, 2), ("capped by total exposure: %.1f%% of a possible "
+                               "%.1f%% (held %.1f%%, cap %.1f%%)"
+                               % (add, room_name, held, cap))
+    return round(add, 2), ("to %.1f%% of book from %.1f%%" % (target, cur))
 
 
 def evaluate_add(position, sector_code=None, sector_scores=None,
