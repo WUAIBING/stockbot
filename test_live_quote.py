@@ -73,7 +73,8 @@ class TimestampTests(unittest.TestCase):
 
     def quote(self, **kw):
         q = {"code": "600403", "price": 7.18, "last_close": 7.50, "open": 7.90,
-             "change_pct": -4.27, "fetched_at": "2026-09-02 12:27:39 CST",
+             "change_pct": -4.27, "volume": 123456,
+             "fetched_at": "2026-09-02 12:27:39 CST",
              "fetched_ts": time.time()}
         q.update(kw)
         return q
@@ -125,6 +126,40 @@ class DegradationTests(unittest.TestCase):
         self.assertEqual(lq.get_quotes(["abc", "", "999"]), {})
 
 
+class HaltDetectionTests(unittest.TestCase):
+    """Volume, not price - the difference only appears after the close."""
+
+    def test_zero_volume_is_halted(self):
+        self.assertTrue(lq.is_halted({"volume": 0, "price": 45.22}))
+
+    def test_a_stale_looking_price_with_no_volume_is_still_halted(self):
+        """The exact after-hours case: 45.22 looks tradeable, is not."""
+        self.assertTrue(lq.is_halted({"volume": 0, "price": 45.22,
+                                      "last_close": 45.22}))
+
+    def test_volume_means_trading(self):
+        self.assertFalse(lq.is_halted({"volume": 12345, "price": 7.17}))
+
+    def test_a_missing_volume_is_unknown_not_halted(self):
+        """ABSENT is not ZERO. `get("volume") or 0` would report every
+        incomplete quote as halted - the same shape as "".zfill(6) becoming
+        "000000", and the third time this module produced it."""
+        self.assertIsNone(lq.is_halted({"price": 7.17}))
+        self.assertIsNone(lq.is_halted(None))
+        self.assertIsNone(lq.is_halted({"price": 7.17, "volume": "x"}))
+
+    def test_an_explicit_zero_volume_is_halted(self):
+        """Distinguished from the case above: present and zero, not absent."""
+        self.assertTrue(lq.is_halted({"price": 45.22, "volume": 0}))
+
+    def test_the_formatter_says_halted_instead_of_printing_a_price(self):
+        out = lq.format_quote({"code": "688432", "volume": 0, "price": 45.22,
+                               "last_close": 45.22, "fetched_ts": 1.0,
+                               "fetched_at": "2026-09-02 15:07:06 CST"}, "有研硅")
+        self.assertIn("HALTED", out)
+        self.assertNotIn("45.22 ", out.split("prev")[0])
+
+
 class SafetyTests(unittest.TestCase):
     def test_the_module_cannot_trade(self):
         src = Path(lq.__file__).read_text(encoding="utf-8")
@@ -151,13 +186,25 @@ class LiveTests(unittest.TestCase):
         self.assertIn("CST", got["fetched_at"])
         self.assertLess(lq.age_seconds(got), 30)
 
-    def test_a_halted_name_reports_zero_not_a_stale_price(self):
-        """688432 有研硅 has been suspended since 2026-08-31. A halted name must
-        come back as no-trade rather than as its last price dressed as live."""
+    def test_a_halted_name_is_detected_by_volume_not_price(self):
+        """688432 有研硅, suspended since 2026-08-31.
+
+        THE BUG THIS REPLACES: the first version asserted price == 0.0, which
+        held during the session and broke after it. The feed quoted 0.00 at
+        12:27 and 45.22 at 15:07 on the same suspended day, so a price check
+        sees a normal-looking stock at a normal-looking price for something
+        that cannot be traded. Volume is zero either way.
+        """
         q = lq.get_quotes(["688432"])
         if not q:
             self.skipTest("no TDX host reachable from here")
-        self.assertEqual(q["688432"]["price"], 0.0)
+        self.assertTrue(lq.is_halted(q["688432"]))
+
+    def test_a_trading_name_is_not_halted(self):
+        q = lq.get_quotes(["600403"])
+        if not q:
+            self.skipTest("no TDX host reachable from here")
+        self.assertFalse(lq.is_halted(q["600403"]))
 
 
 if __name__ == "__main__":
