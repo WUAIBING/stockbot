@@ -93,7 +93,14 @@ session (t-0.93), -0.280% at 2 (t-3.99), -0.749% at 5 (t-6.39), -1.499% at 10
 (t-10.19). Note the first session is nil; this protects holds of two sessions
 or more, which is most of them but not all.
 
-Nothing here changes scoring: it reports a regime. Gated on TLFZ_VOL_REGIME.
+WHAT IT DOES, ONCE ENABLED
+
+It scales NEW entry exposure and nothing else - selection, exits and existing
+positions are untouched. Wild takes 40% size; calm and mid are unchanged; an
+unknown regime takes full size so that a data outage cannot quietly halt the
+book. See entry_exposure_multiplier for why exposure rather than the score bar.
+
+Gated on TLFZ_VOL_REGIME. With it off, the multiplier is always 1.0.
 """
 
 from __future__ import annotations
@@ -184,6 +191,61 @@ def load_close_store(store_path):
     except OSError:
         return []
     return sorted(rows, key=lambda r: r.get("trade_date") or "")
+
+
+# How much NEW entry exposure each regime gets. A policy choice, stated as one
+# - the statistics say the wild edge is negative, they do not say by how much a
+# book should shrink. Calm and mid are left alone deliberately: calm measured
+# +0.152% (t+1.47, not significant) and mid -0.284% (t-2.41, real but small),
+# and neither justifies touching a book already deployed at only 18-20% against
+# a 50% design.
+ENTRY_EXPOSURE = {CALM: 1.0, MID: 1.0, WILD: 0.4, UNKNOWN: 1.0}
+
+
+def entry_exposure_multiplier(regime):
+    """(multiplier, reason) for NEW entries. Existing positions are untouched.
+
+    WHY EXPOSURE AND NOT THE SCORE BAR
+
+    The obvious lever is min_trade_score - it already steps 64/58/52, so a wild
+    regime could simply demand one band more. That lever is wrong here, and the
+    reason is measured rather than aesthetic: raising the bar concentrates
+    selection into the HIGHEST-scoring names, and on realised P&L this score
+    runs backwards. The 76+ band returned -2.16% while the sub-64 band returned
+    +0.45% (effect +3.38pp, t+2.92, n=10 each). Raising the bar in a bad regime
+    would therefore push money toward the band that measured worst - buying
+    less, but worse.
+
+    (That band comparison is confounded: sub-64 entries only exist when the
+    regime lowers the bar to 52 or 58, so it partly measures "bought in a strong
+    tape". It is not strong enough to invert the score on - it IS strong enough
+    to avoid leaning on the score harder.)
+
+    Scaling exposure keeps selection exactly as it is and simply takes a smaller
+    bet when the edge is negative. It is also the only form that degrades
+    safely: an unknown regime returns 1.0, so a missing seed or a short archive
+    changes nothing rather than silently halting the book.
+
+    UNKNOWN IS FULL SIZE ON PURPOSE
+
+    The alternative - treating unknown as wild - would mean any data outage
+    quietly stops trading, which is a failure mode that hides. This module has
+    already produced two population mistakes; it should not also be able to shut
+    the book off by breaking.
+    """
+    if not VOL_REGIME_ENABLED:
+        return 1.0, "vol regime disabled"
+    key = str(regime or UNKNOWN)
+    mult = ENTRY_EXPOSURE.get(key)
+    if mult is None:
+        return 1.0, "unrecognised regime %r, treated as full size" % key
+    if key == WILD:
+        return mult, ("wild regime: momentum entries measured -1.596%% over 10 "
+                      "sessions (t-11.02), so new entries take %.0f%% size"
+                      % (mult * 100))
+    if key == UNKNOWN:
+        return mult, "regime unknown, full size rather than silently halting"
+    return mult, "%s regime: entries unchanged" % key
 
 
 def load_seed(path=SEED_FILE):

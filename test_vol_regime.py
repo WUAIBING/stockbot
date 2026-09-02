@@ -340,6 +340,70 @@ def vr_rows_with_returns():
             {"trade_date": "2026-06-05", "n": 1000, "closes": nxt}]
 
 
+class ExposurePolicyTests(unittest.TestCase):
+    """Scale how much we enter, never which names - and never silently halt.
+
+    Raising min_trade_score was the obvious lever and is the wrong one: it
+    concentrates selection into the highest-scoring names, and on realised P&L
+    the 76+ band returned -2.16% against +0.45% for sub-64 (t+2.92). Buying
+    less but worse is not an improvement.
+    """
+
+    def setUp(self):
+        self.addCleanup(setattr, vr, "VOL_REGIME_ENABLED", vr.VOL_REGIME_ENABLED)
+
+    def test_disabled_is_always_full_size(self):
+        vr.VOL_REGIME_ENABLED = False
+        for regime in (vr.CALM, vr.MID, vr.WILD, vr.UNKNOWN):
+            mult, why = vr.entry_exposure_multiplier(regime)
+            self.assertEqual(mult, 1.0)
+            self.assertIn("disabled", why)
+
+    def test_wild_takes_a_smaller_bet(self):
+        vr.VOL_REGIME_ENABLED = True
+        mult, why = vr.entry_exposure_multiplier(vr.WILD)
+        self.assertLess(mult, 1.0)
+        self.assertIn("-1.596%", why)
+
+    def test_calm_and_mid_are_untouched(self):
+        """calm measured +0.152% (t+1.47) and mid -0.284% (t-2.41) - neither
+        justifies shrinking a book already at 18-20% against a 50% design."""
+        vr.VOL_REGIME_ENABLED = True
+        self.assertEqual(vr.entry_exposure_multiplier(vr.CALM)[0], 1.0)
+        self.assertEqual(vr.entry_exposure_multiplier(vr.MID)[0], 1.0)
+
+    def test_unknown_is_full_size_not_a_halt(self):
+        """A data outage must not quietly stop the book - that failure hides."""
+        vr.VOL_REGIME_ENABLED = True
+        mult, why = vr.entry_exposure_multiplier(vr.UNKNOWN)
+        self.assertEqual(mult, 1.0)
+        self.assertIn("rather than silently halting", why)
+
+    def test_an_unrecognised_regime_is_full_size(self):
+        vr.VOL_REGIME_ENABLED = True
+        mult, why = vr.entry_exposure_multiplier("banana")
+        self.assertEqual(mult, 1.0)
+        self.assertIn("unrecognised", why)
+
+    def test_none_is_treated_as_unknown(self):
+        vr.VOL_REGIME_ENABLED = True
+        self.assertEqual(vr.entry_exposure_multiplier(None)[0], 1.0)
+
+    def test_every_regime_has_a_multiplier(self):
+        for regime in (vr.CALM, vr.MID, vr.WILD, vr.UNKNOWN):
+            self.assertIn(regime, vr.ENTRY_EXPOSURE)
+
+    def test_no_multiplier_is_negative_or_above_full(self):
+        for v in vr.ENTRY_EXPOSURE.values():
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+    def test_the_reason_is_always_populated(self):
+        vr.VOL_REGIME_ENABLED = True
+        for regime in (vr.CALM, vr.MID, vr.WILD, vr.UNKNOWN, "banana", None):
+            self.assertTrue(vr.entry_exposure_multiplier(regime)[1])
+
+
 class PopulationTests(unittest.TestCase):
     """The mistake this module exists to avoid."""
 
