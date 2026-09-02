@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Volatility regime: build the measurement, do not fake it.
+"""Volatility regime, calibrated on the universe actually archived.
 
-Momentum in A-shares is switched by volatility. Over 2015-2026, forward excess
-of strong stocks minus weak, by trailing 20-session universe volatility:
+Momentum in A-shares is switched by volatility. On the gate universe over
+2015-2026, forward excess of strong stocks minus weak:
 
-    calm  +0.225%  t+2.13      mid  -0.403%  t-3.46      wild  -1.501%  t-10.49
+    calm  +0.152%  t+1.47     mid  -0.284%  t-2.41     wild  -1.596%  t-11.02
 
-Monotonic at 5, 10 and 20 sessions; the placebo goes flat. The account's record
-sits on it exactly - June at the 51st percentile was the only profitable month,
-July and August at the 74th and 78th both lost.
+Monotonic at 5, 10 and 20 sessions; the placebo goes flat. The account record
+sits on it - June at the 51st percentile was its only profitable month, July and
+August at the 74th and 78th both lost.
 
-The droplet cannot measure this today, and both shortcuts fail: the scan CSV's
-vol20 reads 4.971 where the universe reads 2.294 (a filtered population), and
-cross-sectional dispersion correlates 0.380 and agrees on tercile 44.9% of the
-time against a 33% coin. So this archives the universe closes the tradability
-gate already publishes, and refuses to classify until it has enough.
+THE UNIVERSE IS CSI 1000. The 09:31 gate publishes the constituent list from
+000852cons.xls - 1,042 names with every large cap excluded (600519, 601398,
+300750 all absent). The first cut of this module shipped whole-market cuts of
+1.0390/1.4220, which on the archived series read CALM 28% / mid 34% / WILD 38%
+instead of 33/33/33. Mild only by luck: the two series correlate 0.996. The same
+error with the scan CSV vol20 column would not have been - r=0.380, agreeing
+44.9% of the time against a 33% coin.
+
+So the thresholds are recalibrated on the gate universe, and a guard refuses to
+classify if that universe drifts - because widening the gate to the whole market
+is the obvious next fix, and it would silently invalidate these numbers.
 """
 
 from __future__ import annotations
@@ -132,15 +138,22 @@ class ClassifyTests(unittest.TestCase):
     def test_calm_is_where_momentum_measured_positive(self):
         label, why = vr.classify(0.9)
         self.assertEqual(label, vr.CALM)
-        self.assertIn("+0.225%", why)
+        self.assertIn("+0.152%", why)
 
     def test_wild_is_where_momentum_measured_negative(self):
         label, why = vr.classify(1.8)
         self.assertEqual(label, vr.WILD)
-        self.assertIn("-1.501%", why)
+        self.assertIn("-1.596%", why)
 
     def test_the_middle_is_mid(self):
         self.assertEqual(vr.classify(1.2)[0], vr.MID)
+
+    def test_the_cuts_are_the_gate_universe_ones_not_the_market_ones(self):
+        """Whole-market cuts of 1.0390/1.4220 on this series read 28/34/38
+        instead of 33/33/33. Population before threshold."""
+        self.assertAlmostEqual(vr.CALM_BELOW, 1.0969, places=4)
+        self.assertAlmostEqual(vr.WILD_ABOVE, 1.4802, places=4)
+        self.assertGreater(vr.CALM_BELOW, 1.039)
 
     def test_the_boundaries_land_where_measured(self):
         self.assertEqual(vr.classify(vr.CALM_BELOW)[0], vr.CALM)
@@ -159,23 +172,236 @@ class ClassifyTests(unittest.TestCase):
 
 
 class RefusalTests(unittest.TestCase):
-    """Refusing to classify is the point until the history exists."""
+    """Refusing to classify is the point until the history exists.
+
+    These pass seed_path=None deliberately: they test what the ARCHIVE alone
+    does. With the shipped seed present the module has enough returns to speak,
+    which is the whole point of the seed - but it must still refuse when there
+    is genuinely nothing to read.
+    """
 
     def test_a_short_history_refuses_and_says_how_short(self):
-        p = store_with(flat_series(5))
-        out = vr.regime_from_store(p)
+        """Universe padded to the calibrated size, or the universe guard fires
+        first and we would be testing the wrong refusal."""
+        pad = vr.CALIBRATION_UNIVERSE_SIZE - 60
+        sessions = [(d, dict(c, **{"%06d" % (700000 + k): 20.0 for k in range(pad)}))
+                    for d, c in flat_series(5)]
+        out = vr.regime_from_store(store_with(sessions), seed_path=None)
         self.assertEqual(out["regime"], vr.UNKNOWN)
-        self.assertIn("5 of 21", out["reason"])
+        self.assertIn("of %d returns needed" % vr.WINDOW, out["reason"])
+
+    def test_a_wrong_sized_universe_refuses_before_counting(self):
+        """Order matters: a population mismatch is not a history shortage."""
+        out = vr.regime_from_store(store_with(flat_series(5)), seed_path=None)
+        self.assertEqual(out["regime"], vr.UNKNOWN)
+        self.assertIn("recalibrate", out["reason"])
 
     def test_enough_history_classifies(self):
-        p = store_with(flat_series(vr.MIN_SESSIONS))
-        out = vr.regime_from_store(p)
+        """Universe sized as calibrated, so the guard lets it through."""
+        pad = vr.CALIBRATION_UNIVERSE_SIZE - 60
+        sessions = [(d, dict(c, **{"%06d" % (700000 + k): 20.0 for k in range(pad)}))
+                    for d, c in flat_series(vr.MIN_SESSIONS)]
+        out = vr.regime_from_store(store_with(sessions), seed_path=None)
         self.assertEqual(out["regime"], vr.CALM)
         self.assertEqual(out["sessions"], vr.MIN_SESSIONS)
 
     def test_a_missing_store_refuses(self):
-        self.assertEqual(vr.regime_from_store("/nonexistent/u.jsonl")["regime"],
-                         vr.UNKNOWN)
+        self.assertEqual(
+            vr.regime_from_store("/nonexistent/u.jsonl", seed_path=None)["regime"],
+            vr.UNKNOWN)
+
+
+class UniverseGuardTests(unittest.TestCase):
+    """Widening the gate must break loudly, not silently."""
+
+    def rows(self, n, sessions=25):
+        return [{"trade_date": "2026-01-%02d" % (i + 1), "n": n, "closes": {}}
+                for i in range(sessions)]
+
+    def test_the_calibrated_universe_passes(self):
+        ok, why = vr.universe_matches_calibration(self.rows(1037))
+        self.assertTrue(ok)
+        self.assertIn("as calibrated", why)
+
+    def test_a_whole_market_gate_is_refused(self):
+        """5,505 codes sit in tdxhy.cfg; widening the gate to them would make
+        these thresholds describe a population never measured on."""
+        ok, why = vr.universe_matches_calibration(self.rows(5505))
+        self.assertFalse(ok)
+        self.assertIn("recalibrate", why)
+
+    def test_a_collapsed_universe_is_refused(self):
+        self.assertFalse(vr.universe_matches_calibration(self.rows(120))[0])
+
+    def test_normal_drift_is_tolerated(self):
+        """Constituents change and names suspend; not a new population."""
+        for n in (900, 1000, 1100, 1250):
+            self.assertTrue(vr.universe_matches_calibration(self.rows(n))[0], n)
+
+    def test_only_recent_sessions_decide(self):
+        """An old narrow stretch must not veto a healthy current universe."""
+        rows = self.rows(200, sessions=20) + self.rows(1037, sessions=5)
+        self.assertTrue(vr.universe_matches_calibration(rows)[0])
+
+    def test_sessions_without_a_size_refuse(self):
+        rows = [{"trade_date": "2026-01-01", "n": 0, "closes": {}}]
+        self.assertFalse(vr.universe_matches_calibration(rows)[0])
+
+    def test_the_store_refuses_when_the_universe_drifted(self):
+        p = store_with([("2026-01-%02d" % (i + 1),
+                         {"%06d" % (600000 + k): 10.0 for k in range(60)})
+                        for i in range(vr.MIN_SESSIONS)])
+        out = vr.regime_from_store(p)
+        self.assertEqual(out["regime"], vr.UNKNOWN)
+        self.assertIn("recalibrate", out["reason"])
+
+
+class SeedTests(unittest.TestCase):
+    """Reading today instead of next month, without pretending the seed is live.
+
+    The archive needs 21 gate sessions. That wait was an artefact of where the
+    data lived - the same universe's history was already on the panel - so a
+    seed of panel-derived returns lets the regime read now.
+
+    Returns rather than closes, so a reconstruction can never be mistaken for a
+    gate observation. That distinction is the entire subject of this module.
+    """
+
+    def seed(self, n=40, ret=0.1, size=None):
+        return {"source": "panel_backfill", "universe": "csi1000_gate_codes",
+                "universe_size": size or vr.CALIBRATION_UNIVERSE_SIZE,
+                "returns": [{"trade_date": "2026-06-%02d" % (i + 1),
+                             "ret": ret, "n": 1000} for i in range(n)]}
+
+    def test_the_shipped_seed_loads(self):
+        s = vr.load_seed()
+        self.assertIsNotNone(s, "vol_regime_seed.json should ship beside the module")
+        self.assertGreaterEqual(len(s["returns"]), vr.WINDOW)
+
+    def test_the_shipped_seed_is_the_calibrated_universe(self):
+        s = vr.load_seed()
+        self.assertAlmostEqual(s["universe_size"], vr.CALIBRATION_UNIVERSE_SIZE,
+                               delta=vr.CALIBRATION_UNIVERSE_SIZE * vr.UNIVERSE_TOLERANCE)
+
+    def test_a_seed_from_the_wrong_universe_is_refused(self):
+        """A whole-market seed against CSI 1000 thresholds is the same error
+        this module was written after."""
+        import tempfile, json as _j
+        p = Path(tempfile.mkdtemp()) / "seed.json"
+        p.write_text(_j.dumps(self.seed(size=5505)), encoding="utf-8")
+        self.assertIsNone(vr.load_seed(str(p)))
+
+    def test_a_missing_seed_is_none_not_an_error(self):
+        self.assertIsNone(vr.load_seed("/nonexistent/seed.json"))
+
+    def test_the_regime_reads_from_seed_alone(self):
+        out = vr.regime_from_store("/nonexistent/u.jsonl")
+        self.assertNotEqual(out["regime"], vr.UNKNOWN)
+        self.assertGreater(out["seeded"], 0)
+        self.assertEqual(out["archived"], 0)
+
+    def test_the_archive_wins_any_overlapping_session(self):
+        """The archive is the live measurement; the seed is reconstruction."""
+        rows = [{"trade_date": "2026-06-01", "n": 1000, "closes": {}},
+                {"trade_date": "2026-06-02", "n": 1000, "closes": {}}]
+        merged = vr.combined_returns(vr_rows_with_returns(), self.seed(n=5))
+        days = [r["trade_date"] for r in merged]
+        self.assertEqual(days, sorted(days))
+
+    def test_seeded_and_archived_are_counted_separately(self):
+        out = vr.regime_from_store("/nonexistent/u.jsonl")
+        self.assertEqual(out["seeded"] + out["archived"], out["returns"])
+
+    def test_the_window_actually_used_is_reported(self):
+        """An estimate whose window is invisible cannot be checked."""
+        out = vr.regime_from_store("/nonexistent/u.jsonl")
+        self.assertIn("window_from", out)
+        self.assertIn("window_to", out)
+        self.assertLess(out["window_from"], out["window_to"])
+
+    def test_too_few_returns_still_refuses(self):
+        import tempfile, json as _j
+        p = Path(tempfile.mkdtemp()) / "seed.json"
+        p.write_text(_j.dumps(self.seed(n=3)), encoding="utf-8")
+        out = vr.regime_from_store("/nonexistent/u.jsonl", seed_path=str(p))
+        self.assertEqual(out["regime"], vr.UNKNOWN)
+        self.assertIn("of %d returns needed" % vr.WINDOW, out["reason"])
+
+    def test_no_seed_at_all_falls_back_to_refusing(self):
+        out = vr.regime_from_store("/nonexistent/u.jsonl", seed_path=None)
+        self.assertEqual(out["regime"], vr.UNKNOWN)
+
+
+def vr_rows_with_returns():
+    """Two archived sessions whose closes produce one usable return."""
+    base = {"%06d" % (600000 + k): 10.0 for k in range(60)}
+    nxt = {k: v * 1.01 for k, v in base.items()}
+    return [{"trade_date": "2026-06-04", "n": 1000, "closes": base},
+            {"trade_date": "2026-06-05", "n": 1000, "closes": nxt}]
+
+
+class ExposurePolicyTests(unittest.TestCase):
+    """Scale how much we enter, never which names - and never silently halt.
+
+    Raising min_trade_score was the obvious lever and is the wrong one: it
+    concentrates selection into the highest-scoring names, and on realised P&L
+    the 76+ band returned -2.16% against +0.45% for sub-64 (t+2.92). Buying
+    less but worse is not an improvement.
+    """
+
+    def setUp(self):
+        self.addCleanup(setattr, vr, "VOL_REGIME_ENABLED", vr.VOL_REGIME_ENABLED)
+
+    def test_disabled_is_always_full_size(self):
+        vr.VOL_REGIME_ENABLED = False
+        for regime in (vr.CALM, vr.MID, vr.WILD, vr.UNKNOWN):
+            mult, why = vr.entry_exposure_multiplier(regime)
+            self.assertEqual(mult, 1.0)
+            self.assertIn("disabled", why)
+
+    def test_wild_takes_a_smaller_bet(self):
+        vr.VOL_REGIME_ENABLED = True
+        mult, why = vr.entry_exposure_multiplier(vr.WILD)
+        self.assertLess(mult, 1.0)
+        self.assertIn("-1.596%", why)
+
+    def test_calm_and_mid_are_untouched(self):
+        """calm measured +0.152% (t+1.47) and mid -0.284% (t-2.41) - neither
+        justifies shrinking a book already at 18-20% against a 50% design."""
+        vr.VOL_REGIME_ENABLED = True
+        self.assertEqual(vr.entry_exposure_multiplier(vr.CALM)[0], 1.0)
+        self.assertEqual(vr.entry_exposure_multiplier(vr.MID)[0], 1.0)
+
+    def test_unknown_is_full_size_not_a_halt(self):
+        """A data outage must not quietly stop the book - that failure hides."""
+        vr.VOL_REGIME_ENABLED = True
+        mult, why = vr.entry_exposure_multiplier(vr.UNKNOWN)
+        self.assertEqual(mult, 1.0)
+        self.assertIn("rather than silently halting", why)
+
+    def test_an_unrecognised_regime_is_full_size(self):
+        vr.VOL_REGIME_ENABLED = True
+        mult, why = vr.entry_exposure_multiplier("banana")
+        self.assertEqual(mult, 1.0)
+        self.assertIn("unrecognised", why)
+
+    def test_none_is_treated_as_unknown(self):
+        vr.VOL_REGIME_ENABLED = True
+        self.assertEqual(vr.entry_exposure_multiplier(None)[0], 1.0)
+
+    def test_every_regime_has_a_multiplier(self):
+        for regime in (vr.CALM, vr.MID, vr.WILD, vr.UNKNOWN):
+            self.assertIn(regime, vr.ENTRY_EXPOSURE)
+
+    def test_no_multiplier_is_negative_or_above_full(self):
+        for v in vr.ENTRY_EXPOSURE.values():
+            self.assertGreaterEqual(v, 0.0)
+            self.assertLessEqual(v, 1.0)
+
+    def test_the_reason_is_always_populated(self):
+        vr.VOL_REGIME_ENABLED = True
+        for regime in (vr.CALM, vr.MID, vr.WILD, vr.UNKNOWN, "banana", None):
+            self.assertTrue(vr.entry_exposure_multiplier(regime)[1])
 
 
 class PopulationTests(unittest.TestCase):
@@ -187,15 +413,23 @@ class PopulationTests(unittest.TestCase):
         names. A threshold calibrated on one population and applied to another
         is how ADD_POSITION_BIG_MEAT_SECTOR_SCORE came to block 77% of days."""
         src = Path(vr.__file__).read_text(encoding="utf-8")
-        self.assertIn("equal-weighted liquid", src)
+        self.assertIn("CSI 1000", src)
         self.assertIn("4.971", src)
         self.assertIn("2.294", src)
+        self.assertIn("000852cons.xls", src)
 
     def test_the_rejected_proxy_is_recorded_with_its_number(self):
         """Cross-sectional dispersion: r=0.380, tercile agreement 44.9%."""
         src = Path(vr.__file__).read_text(encoding="utf-8")
         self.assertIn("0.380", src)
         self.assertIn("44.9%", src)
+
+    def test_the_breadth_caveat_is_recorded(self):
+        """Top-300 minus next-1000 breadth ranges -18.9 to +23.1 points, so a
+        CSI 1000 reading is not a market reading and no constant corrects it."""
+        src = Path(vr.__file__).read_text(encoding="utf-8")
+        self.assertIn("-18.9", src)
+        self.assertIn("+23.1", src)
 
 
 class SafetyTests(unittest.TestCase):
