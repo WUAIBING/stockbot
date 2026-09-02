@@ -87,8 +87,36 @@ class ProfitTests(unittest.TestCase):
         self.assertFalse(ag.profit_ok(None)[0])
 
 
+class SectorGateRemovedTests(unittest.TestCase):
+    """The gate is gone. It ranked something that does not survive to T+1.
+
+        top-third membership repeats next session   36%   (random 33%)
+        buying T+1 on top-third, 5 sessions        +0.000%  t+0.01
+
+    Against the volatility regime at 93% persistence and t-11.02. Making it
+    scale-proof was the right repair to the wrong question.
+    """
+
+    def test_the_sector_no_longer_gates_an_add(self):
+        self.addCleanup(setattr, ag, "ADD_GATES_ENABLED", ag.ADD_GATES_ENABLED)
+        ag.ADD_GATES_ENABLED = True
+        weak = {"T1101": 23.6, "T0705": 72.9, "T1204": 61.0}
+        ok, checks = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
+                                     "T1101", weak, 17, tradable_codes=["002396"])
+        self.assertTrue(ok, "a bottom sector must not block a confirmed big meat")
+        self.assertNotIn("sector_rank", {c[0] for c in checks})
+
+    def test_the_checks_are_profit_and_hold_only(self):
+        self.addCleanup(setattr, ag, "ADD_GATES_ENABLED", ag.ADD_GATES_ENABLED)
+        ag.ADD_GATES_ENABLED = True
+        _ok, checks = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
+                                      "T0705", {"T0705": 72.9}, 17)
+        self.assertEqual({c[0] for c in checks}, {"profit", "hold_window"})
+
+
 class SectorRankTests(unittest.TestCase):
-    """A percentile, because the constant could not survive a scale change."""
+    """Retained as a function, not a gate - the percentile-vs-constant lesson
+    still applies to min_trade_score, which has the same disease untreated."""
 
     def test_the_strongest_sector_passes(self):
         ok, why = ag.sector_rank_ok("T0705", SECTORS)
@@ -165,8 +193,7 @@ class EvaluateTests(unittest.TestCase):
         ag.ADD_GATES_ENABLED = True
         _ok, checks = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
                                       "T0705", SECTORS, 17)
-        self.assertEqual({c[0] for c in checks},
-                         {"profit", "hold_window", "sector_rank"})
+        self.assertEqual({c[0] for c in checks}, {"profit", "hold_window"})
         for _name, _passed, why in checks:
             self.assertTrue(why)
 
@@ -174,6 +201,12 @@ class EvaluateTests(unittest.TestCase):
         ag.ADD_GATES_ENABLED = True
         ok, _ = ag.evaluate_add({"code": "603039", "profit_pct": 3.49},
                                 "T0705", SECTORS, 20)
+        self.assertFalse(ok)
+
+    def test_a_fast_mover_is_still_refused(self):
+        ag.ADD_GATES_ENABLED = True
+        ok, _ = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
+                                "T0705", SECTORS, 3)
         self.assertFalse(ok)
 
     def test_a_halted_name_is_refused_before_anything_else(self):

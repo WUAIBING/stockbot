@@ -142,14 +142,35 @@ def _f(v, d=None):
 def sector_rank_ok(sector_code, sector_scores, percentile=SECTOR_PERCENTILE):
     """Is this sector in the top (1-percentile) of today's sectors?
 
-    Scale-free on purpose. A constant threshold cannot survive a change in how
-    the score is computed, and this score has already changed once - the whole
-    reason this gate silently blocked 77% of days.
+    NOT USED AS A GATE, AND DELIBERATELY SO.
 
-    With one bucket there is no ranking to do, so this returns False rather
-    than True: a single global number carries no information about whether THIS
-    sector is strong, and passing everything on no information is how the old
-    gate came to be a market-wide switch.
+    Replacing the fixed 75 with a percentile made this scale-proof, which was
+    the right repair to the wrong question. The question never asked was
+    whether sector rank survives to the session we can actually trade. Under
+    T+1 the add executes today but everything it earns starts tomorrow, so a
+    same-day ranking has to persist to be worth anything.
+
+    It does not:
+
+        top-third membership repeated next session   36%   (random 33%)
+
+        buying at T+1 on a top-third sector, then holding
+            1 session   +0.009%   t+0.57
+            3 sessions  +0.021%   t+0.73
+            5 sessions  +0.000%   t+0.01
+           10 sessions  -0.018%   t-0.38
+
+    Nothing, at every horizon. Set against a signal that does survive - the
+    volatility regime is 93% persistent at T+1 with an effect of -1.596%
+    (t-11.02) - the contrast is the whole point. Same test, opposite verdicts.
+
+    So the gate is removed rather than repaired. A filter that costs
+    opportunities and buys nothing is worse than no filter, and the percentile
+    fix was making a decoration scale-proof.
+
+    Kept as a function because the percentile-versus-constant lesson still
+    applies elsewhere - min_trade_score steps 64/58/52 on a score whose scale
+    can drift, which is the same disease untreated.
     """
     if not sector_code or not sector_scores:
         return False, "no sector scores"
@@ -241,6 +262,6 @@ def evaluate_add(position, sector_code=None, sector_scores=None,
     checks.append(("profit", ok_p, why_p))
     ok_h, why_h = hold_window_ok(hold_sessions)
     checks.append(("hold_window", ok_h, why_h))
-    ok_s, why_s = sector_rank_ok(sector_code, sector_scores)
-    checks.append(("sector_rank", ok_s, why_s))
+    # NO SECTOR GATE. See sector_rank_ok for why it was removed rather than
+    # fixed: it ranks a thing that does not survive to the session we can trade.
     return all(c[1] for c in checks), checks
