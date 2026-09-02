@@ -553,7 +553,10 @@ def build_payload(
     for template in templates:
         metrics = template.get("metrics", {})
         candidates, vetoed_codes = select_candidates(dataset, template["params"], template.get("negative_veto"))
-        veto_name = build_veto_name(template["negative_veto"])
+        # .get, matching select_candidates on the line above and the champion
+        # branch below - a template with no negative_veto is expected, and
+        # subscripting it here is what crashed the pool build for four days.
+        veto_name = build_veto_name(template.get("negative_veto"))
         is_champion_template = bool(champion_template_name and template["template_name"] == champion_template_name)
         template_weight = _compute_template_weight(metrics)
 
@@ -729,7 +732,7 @@ def build_payload(
         {
             "template_name": item["template_name"],
             "base_template_name": item["base_template_name"],
-            "negative_veto": build_veto_name(item["negative_veto"]),
+            "negative_veto": build_veto_name(item.get("negative_veto")),
             "business_score": item.get("metrics", {}).get("business_score", 0.0),
             "profit_priority_score": item.get("metrics", {}).get("profit_priority_score", 0.0),
             "top100_hit_rate": item.get("metrics", {}).get("top100_hit_rate", 0.0),
