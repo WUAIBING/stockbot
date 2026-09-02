@@ -8,6 +8,95 @@
   - 先看本日志，确认当前做到哪一步；
   - 再看执行计划书，确认下一步按哪条路线推进。
 
+
+## 已结算的结论（先读这里，再读日志）
+
+> 下面是已经量过、不需要重复推导的东西。日志是证据，这里是结论。
+> **状态类信息（开关、持仓、净值）不放这里**——那些每天变，属于当日条目。
+> 最后更新：2026-09-02
+
+```yaml
+refuted:                      # 量过了，是死的。不要再花一天重新推导
+  - id: add-to-winners
+    claim: 给赢家加仓更划算
+    verdict: "海洋 -2.007% (t-19.24)，2015-2026，200万观测；每个持有期都为负且越拿越差"
+    caveat: "仅在 +20% 确认后的短持有例外，见 confirmed.big-meat-continuation"
+    date: 2026-09-01
+  - id: sector-score-as-ranking
+    claim: 修好板块图能改善选股排序
+    verdict: "日内 rank IC 只动 -0.023 (t-0.52)，五个持有期四个为负"
+    date: 2026-09-01
+  - id: sector-leadership-tilt
+    claim: 板块内成交额龙头更强（+0.91% 来自披露事件）
+    verdict: "在实盘候选池上反号：top 1-3 档 T+1 -0.63%、T+3 -1.45%"
+    note: "披露事件是全市场总体，候选池是已筛过的突破股——不同总体"
+    date: 2026-09-01
+  - id: sector-rank-as-add-gate
+    claim: 加仓要求板块排前三分之一
+    verdict: "T+1 只有 36% 仍在前三分之一（随机 33%），预测 +0.000% (t+0.01)"
+    date: 2026-09-02
+  - id: gap-up-profit-take
+    claim: 高开高于成本就卖一部分
+    verdict: "-1.85% 起，+5% 触发时 -6.35% (t-3.47)，且那一档 100% 本是赢家"
+    note: "64% 的高开确实回落，但另外 36% 平均多赚 +10.00pp"
+    date: 2026-09-02
+  - id: buy-back-after-drop
+    claim: 跌回来就买回
+    verdict: "任意回调 T+1/T+5/T+10 全部约零；赢家回调 T+10 -0.510% (t-2.2)"
+    note: "卖价是锚，不是信息。市场不知道我们卖在哪"
+    date: 2026-09-02
+  - id: concentration-cap
+    claim: 同日同板块并买要限制
+    verdict: "价格路径 -4.90% T+5 (t-2.39)，但实盘口径 +2.48pp (t+2.19) —— 反号"
+    note: "出场逻辑把并买的先砍掉了，所以实盘反而好。记录不强制"
+    date: 2026-09-01
+
+confirmed:                    # 量过了，是承重的
+  - id: exits-are-good
+    finding: "强制延后出场代价 -5.49pp @T+10 (t-4.35)。快砍是赚钱的行为"
+  - id: flow-gate-earns-keep
+    finding: "它拒绝的名字 -5.98pp (t-2.91)"
+  - id: volatility-switches-momentum
+    finding: "wild 档动量 -1.596% @10日 (t-11.02)，calm +0.152%；5/10/20 日单调，安慰剂变平"
+    survives_t1: "T+1 持续 93%（今天狂→明天仍狂 95%），随机基准 33%"
+    our_months: "6月 51分位 mid (+2.19%/笔)；7月 74分位、8月 77分位 wild (-1.96%, -0.22%)"
+  - id: big-meat-is-the-strategy
+    finding: "114 笔里 9 笔 +23.73%，其余 105 笔 -1.16%。那 9 笔就是策略"
+    grip: "峰值捕获随规模上升：>=+20% 捕获 75%/持 9.4天；+2~5% 只有 -40%"
+    caveat: "002428 占那 9 笔的 3 笔，而它 59% 的利润来自失败的卖单——捕获率被污染"
+  - id: no-edge-at-finding
+    finding: "P(涨到+20% | 已 +10%) 我们 38%，海洋 39%。找不到优势，握得住才是本事"
+  - id: entry-score-is-spent
+    finding: "当日 +2.15% (t+2.45)，T+1 +0.40%，T+2 -0.42%。分数描述已经走完的一天"
+
+rules:                        # 怎么干活，以及每条是被什么坑出来的
+  - id: test-on-the-ocean-first
+    rule: 先在全市场面板上测，再用账户检查效应有没有传到我们的决策
+    born_from: "同一天里两个假设在换成全市场数据后翻号；船会把出场功劳记给入场"
+    controls: "超额相对当日流动性全集；t 按交易日聚合而非股票日；基准必须落在零"
+  - id: population-before-threshold
+    rule: 定阈值之前先确认它跑在哪个总体上
+    born_from: "板块常数 75 关掉了 77% 的加仓日；vol20 在 scan CSV 上 4.971 对全集 2.294"
+    corollary: "常数活不过尺度变化，分位数可以。min_trade_score 64/58/52 仍然带病"
+  - id: does-it-survive-t1
+    rule: 任何信号都要问「明天还成立吗」，因为第一个可交易的时段是明天
+    born_from: "入场分数最锋利的是已经走完的当天；板块排名 T+1 只剩 36%"
+    test: 看持续率对随机基准，以及从 t 往后的前瞻效应
+  - id: absent-is-not-zero
+    rule: 缺失不等于零，未知要保持未知
+    born_from: '"".zfill(6) 变成 "000000"；quote.get("volume") or 0 把不完整报价判成停牌'
+    note: 同一个模块同一天犯了两次
+  - id: a-number-without-a-timestamp
+    rule: 报价格必须带取数时刻，手上最新的数字不等于当下的数字
+    born_from: "把 11:15 的缓存当午盘收盘价（7.26 对 7.18）；把 09:31 广度当 09:46 现况"
+  - id: deploy-after-market-close
+    rule: 合并与部署放在 15:00 收盘之后，午休（11:30-13:00）亦可
+    born_from: 用户规则；DO 上跑着实盘
+  - id: skip-is-not-pass
+    rule: 跳过的测试不是通过的测试
+    born_from: "ShippedDataTests 在图为空时 skip，于是路径 bug 藏了下来"
+```
+
 ---
 
 ## 2026-06-17
