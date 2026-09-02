@@ -60,6 +60,39 @@ If the gate is ever widened to the whole market, these thresholds stop applying.
 `regime_from_store` therefore checks the archived universe size against the size
 it was calibrated on and refuses rather than silently reading the wrong scale.
 
+READING TODAY INSTEAD OF NEXT MONTH
+
+The archive needs 21 gate sessions, which put the first reading a month out.
+That wait was an artefact of where the data lived: the same universe's history
+was already on the panel. vol_regime_seed.json carries 160 sessions of
+panel-derived universe returns, so the regime reads now and the archive takes
+over as it fills. Archived sessions always win an overlap, and every result
+reports how many of its returns were seeded versus archived.
+
+The seed is checked against the calibration universe size like everything else,
+and refused if it does not match.
+
+WHY THIS SURVIVES T+1, WHEN THE ENTRY SCORE DOES NOT
+
+The entry score is sharpest on a move already spent by the 14:50 decision -
+same-day +2.15% (t+2.45), then T+1 +0.40% and T+2 -0.42%. Knowing it today does
+not help, because the first tradeable session is tomorrow.
+
+Volatility is the opposite: it clusters. Today's regime is tomorrow's regime
+93.0% of the time overall, and 95.0% of the time when today is wild:
+
+    horizon   same regime   wild -> still wild
+    T+1           93.0%          95.0%
+    T+2           88.6%          91.6%
+    T+5           77.4%          83.2%
+    T+10          65.5%          72.6%      (random baseline ~33%)
+
+And the effect was always measured forward - conditioner from trailing data at
+t, outcome from t onward. Buying into a wild reading and holding: -0.049% at 1
+session (t-0.93), -0.280% at 2 (t-3.99), -0.749% at 5 (t-6.39), -1.499% at 10
+(t-10.19). Note the first session is nil; this protects holds of two sessions
+or more, which is most of them but not all.
+
 Nothing here changes scoring: it reports a regime. Gated on TLFZ_VOL_REGIME.
 """
 
@@ -90,6 +123,13 @@ WINDOW = 20
 MIN_SESSIONS = WINDOW + 1        # 21 closes -> 20 returns -> one volatility
 
 CALM, MID, WILD, UNKNOWN = "calm", "mid", "wild", "unknown"
+
+# Panel-derived history, shipped beside this module. The archive needs 21 gate
+# sessions before it can speak, which put the first reading a month out - but
+# that wait was an artefact of where the data lived, not of the measurement.
+# The same universe's history was already on the panel.
+SEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "vol_regime_seed.json")
 
 
 def snapshot_universe(tradability_payload):
@@ -144,6 +184,37 @@ def load_close_store(store_path):
     except OSError:
         return []
     return sorted(rows, key=lambda r: r.get("trade_date") or "")
+
+
+def load_seed(path=SEED_FILE):
+    """Historical universe returns, or None.
+
+    Returns rather than closes, deliberately: writing panel-derived closes into
+    the archive would blur which numbers came from the 09:31 gate and which
+    were reconstructed. Provenance has mattered repeatedly here - this whole
+    module exists because a threshold calibrated on one population was deployed
+    on another - so a seed stays visibly a seed.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("returns")
+    if not isinstance(rows, list) or not rows:
+        return None
+    size = payload.get("universe_size")
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        return None
+    lo = CALIBRATION_UNIVERSE_SIZE * (1 - UNIVERSE_TOLERANCE)
+    hi = CALIBRATION_UNIVERSE_SIZE * (1 + UNIVERSE_TOLERANCE)
+    if not (lo <= size <= hi):
+        return None
+    return payload
 
 
 def universe_returns(rows):
@@ -216,19 +287,54 @@ def universe_matches_calibration(rows, expected=CALIBRATION_UNIVERSE_SIZE,
     return True, "universe %d names, as calibrated" % int(avg)
 
 
-def regime_from_store(store_path):
+def combined_returns(rows, seed=None):
+    """Seed returns first, then archived ones, archive winning any overlap.
+
+    The archive is the live measurement and the seed is reconstruction, so where
+    both cover a session the archive is kept. They are otherwise concatenated in
+    date order - a volatility estimate over a 20-session window does not care
+    which side of the join a session came from, only that the sequence is right.
+    """
+    archived = universe_returns(rows)
+    have = {r.get("trade_date") for r in archived}
+    seeded = []
+    if seed:
+        for r in seed.get("returns") or []:
+            day = str(r.get("trade_date") or "")
+            if not day or day in have:
+                continue
+            try:
+                seeded.append({"trade_date": day, "ret": float(r["ret"]),
+                               "n": int(r.get("n") or 0), "source": "seed"})
+            except (KeyError, TypeError, ValueError):
+                continue
+    for r in archived:
+        r["source"] = "archive"
+    return sorted(seeded + archived, key=lambda r: r["trade_date"])
+
+
+def regime_from_store(store_path, seed_path=SEED_FILE):
     rows = load_close_store(store_path)
-    if len(rows) < MIN_SESSIONS:
+    seed = load_seed(seed_path) if seed_path else None
+    if rows:
+        ok, why = universe_matches_calibration(rows)
+        if not ok:
+            return {"regime": UNKNOWN, "vol": None, "sessions": len(rows),
+                    "reason": why, "enabled": VOL_REGIME_ENABLED}
+    rets = combined_returns(rows, seed)
+    n_seed = sum(1 for r in rets if r.get("source") == "seed")
+    n_arch = len(rets) - n_seed
+    if len(rets) < WINDOW:
         return {"regime": UNKNOWN, "vol": None, "sessions": len(rows),
-                "reason": "have %d of %d closes needed" % (len(rows), MIN_SESSIONS),
+                "returns": len(rets), "seeded": n_seed, "archived": n_arch,
+                "reason": ("have %d of %d returns needed (seed %d, archive %d)"
+                           % (len(rets), WINDOW, n_seed, n_arch)),
                 "enabled": VOL_REGIME_ENABLED}
-    ok, why = universe_matches_calibration(rows)
-    if not ok:
-        return {"regime": UNKNOWN, "vol": None, "sessions": len(rows),
-                "reason": why, "enabled": VOL_REGIME_ENABLED}
-    rets = universe_returns(rows)
     vol = realised_vol(rets)
     label, reason = classify(vol)
     return {"regime": label, "vol": (round(vol, 4) if vol is not None else None),
-            "sessions": len(rows), "returns": len(rets), "reason": reason,
-            "enabled": VOL_REGIME_ENABLED}
+            "sessions": len(rows), "returns": len(rets),
+            "seeded": n_seed, "archived": n_arch,
+            "window_from": rets[-WINDOW]["trade_date"],
+            "window_to": rets[-1]["trade_date"],
+            "reason": reason, "enabled": VOL_REGIME_ENABLED}

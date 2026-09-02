@@ -172,26 +172,43 @@ class ClassifyTests(unittest.TestCase):
 
 
 class RefusalTests(unittest.TestCase):
-    """Refusing to classify is the point until the history exists."""
+    """Refusing to classify is the point until the history exists.
+
+    These pass seed_path=None deliberately: they test what the ARCHIVE alone
+    does. With the shipped seed present the module has enough returns to speak,
+    which is the whole point of the seed - but it must still refuse when there
+    is genuinely nothing to read.
+    """
 
     def test_a_short_history_refuses_and_says_how_short(self):
-        p = store_with(flat_series(5))
-        out = vr.regime_from_store(p)
+        """Universe padded to the calibrated size, or the universe guard fires
+        first and we would be testing the wrong refusal."""
+        pad = vr.CALIBRATION_UNIVERSE_SIZE - 60
+        sessions = [(d, dict(c, **{"%06d" % (700000 + k): 20.0 for k in range(pad)}))
+                    for d, c in flat_series(5)]
+        out = vr.regime_from_store(store_with(sessions), seed_path=None)
         self.assertEqual(out["regime"], vr.UNKNOWN)
-        self.assertIn("5 of 21", out["reason"])
+        self.assertIn("of %d returns needed" % vr.WINDOW, out["reason"])
+
+    def test_a_wrong_sized_universe_refuses_before_counting(self):
+        """Order matters: a population mismatch is not a history shortage."""
+        out = vr.regime_from_store(store_with(flat_series(5)), seed_path=None)
+        self.assertEqual(out["regime"], vr.UNKNOWN)
+        self.assertIn("recalibrate", out["reason"])
 
     def test_enough_history_classifies(self):
         """Universe sized as calibrated, so the guard lets it through."""
         pad = vr.CALIBRATION_UNIVERSE_SIZE - 60
         sessions = [(d, dict(c, **{"%06d" % (700000 + k): 20.0 for k in range(pad)}))
                     for d, c in flat_series(vr.MIN_SESSIONS)]
-        out = vr.regime_from_store(store_with(sessions))
+        out = vr.regime_from_store(store_with(sessions), seed_path=None)
         self.assertEqual(out["regime"], vr.CALM)
         self.assertEqual(out["sessions"], vr.MIN_SESSIONS)
 
     def test_a_missing_store_refuses(self):
-        self.assertEqual(vr.regime_from_store("/nonexistent/u.jsonl")["regime"],
-                         vr.UNKNOWN)
+        self.assertEqual(
+            vr.regime_from_store("/nonexistent/u.jsonl", seed_path=None)["regime"],
+            vr.UNKNOWN)
 
 
 class UniverseGuardTests(unittest.TestCase):
@@ -237,6 +254,90 @@ class UniverseGuardTests(unittest.TestCase):
         out = vr.regime_from_store(p)
         self.assertEqual(out["regime"], vr.UNKNOWN)
         self.assertIn("recalibrate", out["reason"])
+
+
+class SeedTests(unittest.TestCase):
+    """Reading today instead of next month, without pretending the seed is live.
+
+    The archive needs 21 gate sessions. That wait was an artefact of where the
+    data lived - the same universe's history was already on the panel - so a
+    seed of panel-derived returns lets the regime read now.
+
+    Returns rather than closes, so a reconstruction can never be mistaken for a
+    gate observation. That distinction is the entire subject of this module.
+    """
+
+    def seed(self, n=40, ret=0.1, size=None):
+        return {"source": "panel_backfill", "universe": "csi1000_gate_codes",
+                "universe_size": size or vr.CALIBRATION_UNIVERSE_SIZE,
+                "returns": [{"trade_date": "2026-06-%02d" % (i + 1),
+                             "ret": ret, "n": 1000} for i in range(n)]}
+
+    def test_the_shipped_seed_loads(self):
+        s = vr.load_seed()
+        self.assertIsNotNone(s, "vol_regime_seed.json should ship beside the module")
+        self.assertGreaterEqual(len(s["returns"]), vr.WINDOW)
+
+    def test_the_shipped_seed_is_the_calibrated_universe(self):
+        s = vr.load_seed()
+        self.assertAlmostEqual(s["universe_size"], vr.CALIBRATION_UNIVERSE_SIZE,
+                               delta=vr.CALIBRATION_UNIVERSE_SIZE * vr.UNIVERSE_TOLERANCE)
+
+    def test_a_seed_from_the_wrong_universe_is_refused(self):
+        """A whole-market seed against CSI 1000 thresholds is the same error
+        this module was written after."""
+        import tempfile, json as _j
+        p = Path(tempfile.mkdtemp()) / "seed.json"
+        p.write_text(_j.dumps(self.seed(size=5505)), encoding="utf-8")
+        self.assertIsNone(vr.load_seed(str(p)))
+
+    def test_a_missing_seed_is_none_not_an_error(self):
+        self.assertIsNone(vr.load_seed("/nonexistent/seed.json"))
+
+    def test_the_regime_reads_from_seed_alone(self):
+        out = vr.regime_from_store("/nonexistent/u.jsonl")
+        self.assertNotEqual(out["regime"], vr.UNKNOWN)
+        self.assertGreater(out["seeded"], 0)
+        self.assertEqual(out["archived"], 0)
+
+    def test_the_archive_wins_any_overlapping_session(self):
+        """The archive is the live measurement; the seed is reconstruction."""
+        rows = [{"trade_date": "2026-06-01", "n": 1000, "closes": {}},
+                {"trade_date": "2026-06-02", "n": 1000, "closes": {}}]
+        merged = vr.combined_returns(vr_rows_with_returns(), self.seed(n=5))
+        days = [r["trade_date"] for r in merged]
+        self.assertEqual(days, sorted(days))
+
+    def test_seeded_and_archived_are_counted_separately(self):
+        out = vr.regime_from_store("/nonexistent/u.jsonl")
+        self.assertEqual(out["seeded"] + out["archived"], out["returns"])
+
+    def test_the_window_actually_used_is_reported(self):
+        """An estimate whose window is invisible cannot be checked."""
+        out = vr.regime_from_store("/nonexistent/u.jsonl")
+        self.assertIn("window_from", out)
+        self.assertIn("window_to", out)
+        self.assertLess(out["window_from"], out["window_to"])
+
+    def test_too_few_returns_still_refuses(self):
+        import tempfile, json as _j
+        p = Path(tempfile.mkdtemp()) / "seed.json"
+        p.write_text(_j.dumps(self.seed(n=3)), encoding="utf-8")
+        out = vr.regime_from_store("/nonexistent/u.jsonl", seed_path=str(p))
+        self.assertEqual(out["regime"], vr.UNKNOWN)
+        self.assertIn("of %d returns needed" % vr.WINDOW, out["reason"])
+
+    def test_no_seed_at_all_falls_back_to_refusing(self):
+        out = vr.regime_from_store("/nonexistent/u.jsonl", seed_path=None)
+        self.assertEqual(out["regime"], vr.UNKNOWN)
+
+
+def vr_rows_with_returns():
+    """Two archived sessions whose closes produce one usable return."""
+    base = {"%06d" % (600000 + k): 10.0 for k in range(60)}
+    nxt = {k: v * 1.01 for k, v in base.items()}
+    return [{"trade_date": "2026-06-04", "n": 1000, "closes": base},
+            {"trade_date": "2026-06-05", "n": 1000, "closes": nxt}]
 
 
 class PopulationTests(unittest.TestCase):
