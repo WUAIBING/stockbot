@@ -74,10 +74,26 @@ import os
 ADD_GATES_ENABLED = str(
     os.environ.get("TLFZ_ADD_GATES", "0")).strip().lower() in ("1", "true", "yes", "on")
 
-# Retained from the boat measurement (+5% was its lowest significant trigger).
-# The market says every bucket above this line is NEGATIVE, so this is the
-# floor of a door that should stay closed, not a recommendation to open it.
-MIN_PROFIT_PCT = 5.0
+# +20%, not +5%. The +5% trigger came from a boat measurement that credited a
+# good exit rule to the entry. Measured properly - forward over a FIXED horizon
+# from the moment one of OUR positions first reaches the level, excess over the
+# same-session liquid universe:
+#
+#     our positions up +5%    n=36   +1.08% at 5 sessions   t+0.59   nothing
+#     our positions up +10%   n=21   +4.08% at 5 sessions   t+1.36   suggestive
+#     our positions up +20%   n= 9  +14.14% at 5 sessions   t+2.34   the signal
+#                                    +11.64% at 3 sessions   t+3.11
+#
+# against an ocean benchmark of -2.007% (t-19.24) for ANY stock up +10%. So the
+# selection IS different at the big-meat stage - but only there. Setting the
+# trigger at +5% would open the door where the evidence is absent and the market
+# is against us.
+MIN_PROFIT_PCT = 20.0
+
+# The added slice is a SHORT trade, not a doubling-down. The edge is +11.64% at
+# 3 sessions and +14.14% at 5, then gone by 10 (-1.33%, t-0.18). An add held to
+# the core position's exit would give back what it earned.
+ADD_MAX_HOLD_SESSIONS = 5
 
 # The grind, not the spike. Four sessions was the old CEILING and it selected
 # the worst group (-2.007% at 10 sessions, t-19.24, against -0.980% for the
@@ -88,6 +104,30 @@ MIN_HOLD_SESSIONS = 5
 # Top third of sectors. Replaces the fixed 75, which was 23% of days on the
 # broken scale and would be 0% of days on a correct one.
 SECTOR_PERCENTILE = 0.67
+
+# A confirmed big meat is taken to 10% of book. Ordinary positions stay near
+# 2%, so the slice actually at risk is the ~7.3% increment - and it lands on a
+# position already carrying +20%, which is why this is not the reckless number
+# it first looks like:
+#
+#     continuation real   +10.12% x 7.3% = +0.74% of NAV per event
+#     continuation wrong   -2.01% x 7.3% = -0.15%
+#     worst observed       -9.82% x 7.3% = -0.72%   (combined position still green)
+#
+# Across the 9 big meat of one quarter: +6.65% of NAV if real, -1.32% if not,
+# EV +3.62% at P=0.62. Raw Kelly on the measured continuation said 8%, so this
+# is just above full Kelly rather than wildly beyond it.
+#
+# A first pass set this at 4%, pricing the add as a fresh bet. It is not one -
+# only the increment can be wrong, and the cushion absorbs the worst case.
+BIG_MEAT_TARGET_PCT = 10.0
+
+# What does NOT shrink with the cushion is being unable to get out. 688432 has
+# been suspended since 2026-08-31 with no reopen date; 10% of book in a halted
+# name is 10% that cannot be exited at any price. And a -10% open on 10% is
+# -1.0% of NAV before anyone can act, with fills landing 1.9% below the open.
+# So total big-meat exposure is capped as well as per-name.
+TOTAL_BIG_MEAT_CAP_PCT = 20.0
 
 
 def _f(v, d=None):
@@ -102,14 +142,35 @@ def _f(v, d=None):
 def sector_rank_ok(sector_code, sector_scores, percentile=SECTOR_PERCENTILE):
     """Is this sector in the top (1-percentile) of today's sectors?
 
-    Scale-free on purpose. A constant threshold cannot survive a change in how
-    the score is computed, and this score has already changed once - the whole
-    reason this gate silently blocked 77% of days.
+    NOT USED AS A GATE, AND DELIBERATELY SO.
 
-    With one bucket there is no ranking to do, so this returns False rather
-    than True: a single global number carries no information about whether THIS
-    sector is strong, and passing everything on no information is how the old
-    gate came to be a market-wide switch.
+    Replacing the fixed 75 with a percentile made this scale-proof, which was
+    the right repair to the wrong question. The question never asked was
+    whether sector rank survives to the session we can actually trade. Under
+    T+1 the add executes today but everything it earns starts tomorrow, so a
+    same-day ranking has to persist to be worth anything.
+
+    It does not:
+
+        top-third membership repeated next session   36%   (random 33%)
+
+        buying at T+1 on a top-third sector, then holding
+            1 session   +0.009%   t+0.57
+            3 sessions  +0.021%   t+0.73
+            5 sessions  +0.000%   t+0.01
+           10 sessions  -0.018%   t-0.38
+
+    Nothing, at every horizon. Set against a signal that does survive - the
+    volatility regime is 93% persistent at T+1 with an effect of -1.596%
+    (t-11.02) - the contrast is the whole point. Same test, opposite verdicts.
+
+    So the gate is removed rather than repaired. A filter that costs
+    opportunities and buys nothing is worse than no filter, and the percentile
+    fix was making a decoration scale-proof.
+
+    Kept as a function because the percentile-versus-constant lesson still
+    applies elsewhere - min_trade_score steps 64/58/52 on a score whose scale
+    can drift, which is the same disease untreated.
     """
     if not sector_code or not sector_scores:
         return False, "no sector scores"
@@ -149,6 +210,39 @@ def profit_ok(profit_pct, minimum=MIN_PROFIT_PCT):
     return True, "up %.2f%%" % p
 
 
+def add_size_pct(position_pct, book_big_meat_pct,
+                 target=BIG_MEAT_TARGET_PCT, cap=TOTAL_BIG_MEAT_CAP_PCT):
+    """(pct_of_book_to_add, reason). Never exceeds the per-name or total cap.
+
+    Sizing up happens only AFTER confirmation, which is what makes 10%
+    defensible: the position already carries +20%, so the increment is the only
+    thing that can be wrong, and the worst observed continuation (-9.82%) still
+    leaves the combined position green.
+
+    The total cap is the guard that the cushion does not provide. A halted name
+    cannot be exited at any price - 688432 is the live example - so two
+    concurrent big meat at 10% is the most the book should have frozen.
+    """
+    try:
+        cur = float(position_pct)
+        held = float(book_big_meat_pct)
+    except (TypeError, ValueError):
+        return 0.0, "position or exposure not measurable"
+    if cur >= target:
+        return 0.0, "already at %.1f%% of book, target %.1f%%" % (cur, target)
+    room_name = target - cur
+    room_total = cap - held
+    if room_total <= 0:
+        return 0.0, ("big-meat exposure already %.1f%% of book, cap %.1f%%"
+                     % (held, cap))
+    add = min(room_name, room_total)
+    if add < room_name:
+        return round(add, 2), ("capped by total exposure: %.1f%% of a possible "
+                               "%.1f%% (held %.1f%%, cap %.1f%%)"
+                               % (add, room_name, held, cap))
+    return round(add, 2), ("to %.1f%% of book from %.1f%%" % (target, cur))
+
+
 def evaluate_add(position, sector_code=None, sector_scores=None,
                  hold_sessions=None, tradable_codes=None):
     """(allowed, reasons). Every gate is evaluated so the trail is complete.
@@ -168,6 +262,6 @@ def evaluate_add(position, sector_code=None, sector_scores=None,
     checks.append(("profit", ok_p, why_p))
     ok_h, why_h = hold_window_ok(hold_sessions)
     checks.append(("hold_window", ok_h, why_h))
-    ok_s, why_s = sector_rank_ok(sector_code, sector_scores)
-    checks.append(("sector_rank", ok_s, why_s))
+    # NO SECTOR GATE. See sector_rank_ok for why it was removed rather than
+    # fixed: it ranks a thing that does not survive to the session we can trade.
     return all(c[1] for c in checks), checks

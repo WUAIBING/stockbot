@@ -66,11 +66,19 @@ class HoldWindowTests(unittest.TestCase):
 
 
 class ProfitTests(unittest.TestCase):
-    def test_the_measured_trigger_passes(self):
-        self.assertTrue(ag.profit_ok(10.41)[0])       # 600403 大有能源
+    def test_the_trigger_is_at_big_meat_not_at_any_winner(self):
+        """+5% measured +1.08% (t+0.59) on our own book - nothing. The signal
+        is at +20%: +14.14% at 5 sessions, t+2.34."""
+        self.assertEqual(ag.MIN_PROFIT_PCT, 20.0)
+        self.assertTrue(ag.profit_ok(31.57)[0])       # 002396 星网锐捷
+        self.assertFalse(ag.profit_ok(10.41)[0])      # 600403 - a winner, not big meat
 
     def test_below_the_trigger_refuses(self):
         self.assertFalse(ag.profit_ok(3.49)[0])       # 603039 泛微网络
+
+    def test_the_added_slice_is_a_short_trade(self):
+        """The edge is +11.64% at 3 sessions, +14.14% at 5, gone by 10."""
+        self.assertLessEqual(ag.ADD_MAX_HOLD_SESSIONS, 5)
 
     def test_a_loser_refuses(self):
         self.assertFalse(ag.profit_ok(-8.11)[0])      # 300747 锐科激光
@@ -79,8 +87,36 @@ class ProfitTests(unittest.TestCase):
         self.assertFalse(ag.profit_ok(None)[0])
 
 
+class SectorGateRemovedTests(unittest.TestCase):
+    """The gate is gone. It ranked something that does not survive to T+1.
+
+        top-third membership repeats next session   36%   (random 33%)
+        buying T+1 on top-third, 5 sessions        +0.000%  t+0.01
+
+    Against the volatility regime at 93% persistence and t-11.02. Making it
+    scale-proof was the right repair to the wrong question.
+    """
+
+    def test_the_sector_no_longer_gates_an_add(self):
+        self.addCleanup(setattr, ag, "ADD_GATES_ENABLED", ag.ADD_GATES_ENABLED)
+        ag.ADD_GATES_ENABLED = True
+        weak = {"T1101": 23.6, "T0705": 72.9, "T1204": 61.0}
+        ok, checks = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
+                                     "T1101", weak, 17, tradable_codes=["002396"])
+        self.assertTrue(ok, "a bottom sector must not block a confirmed big meat")
+        self.assertNotIn("sector_rank", {c[0] for c in checks})
+
+    def test_the_checks_are_profit_and_hold_only(self):
+        self.addCleanup(setattr, ag, "ADD_GATES_ENABLED", ag.ADD_GATES_ENABLED)
+        ag.ADD_GATES_ENABLED = True
+        _ok, checks = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
+                                      "T0705", {"T0705": 72.9}, 17)
+        self.assertEqual({c[0] for c in checks}, {"profit", "hold_window"})
+
+
 class SectorRankTests(unittest.TestCase):
-    """A percentile, because the constant could not survive a scale change."""
+    """Retained as a function, not a gate - the percentile-vs-constant lesson
+    still applies to min_trade_score, which has the same disease untreated."""
 
     def test_the_strongest_sector_passes(self):
         ok, why = ag.sector_rank_ok("T0705", SECTORS)
@@ -144,14 +180,20 @@ class EvaluateTests(unittest.TestCase):
                                      tradable_codes=["002396"])
         self.assertTrue(ok, checks)
 
+    def test_a_merely_good_position_is_not_big_meat(self):
+        """600403 at +10.41% is a winner. The evidence for adding is not there."""
+        ag.ADD_GATES_ENABLED = True
+        ok, _ = ag.evaluate_add({"code": "600403", "profit_pct": 10.41},
+                                "T0705", SECTORS, 20, tradable_codes=["600403"])
+        self.assertFalse(ok)
+
     def test_every_gate_reports_even_when_it_passes(self):
         """A check that only speaks when refusing leaves no way to tell a real
         pass from one that silently did nothing."""
         ag.ADD_GATES_ENABLED = True
         _ok, checks = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
                                       "T0705", SECTORS, 17)
-        self.assertEqual({c[0] for c in checks},
-                         {"profit", "hold_window", "sector_rank"})
+        self.assertEqual({c[0] for c in checks}, {"profit", "hold_window"})
         for _name, _passed, why in checks:
             self.assertTrue(why)
 
@@ -159,6 +201,12 @@ class EvaluateTests(unittest.TestCase):
         ag.ADD_GATES_ENABLED = True
         ok, _ = ag.evaluate_add({"code": "603039", "profit_pct": 3.49},
                                 "T0705", SECTORS, 20)
+        self.assertFalse(ok)
+
+    def test_a_fast_mover_is_still_refused(self):
+        ag.ADD_GATES_ENABLED = True
+        ok, _ = ag.evaluate_add({"code": "002396", "profit_pct": 31.57},
+                                "T0705", SECTORS, 3)
         self.assertFalse(ok)
 
     def test_a_halted_name_is_refused_before_anything_else(self):
@@ -169,6 +217,50 @@ class EvaluateTests(unittest.TestCase):
                                      tradable_codes=["002396"])
         self.assertFalse(ok)
         self.assertEqual(checks[0][0], "tradable")
+
+
+class SizingTests(unittest.TestCase):
+    """10% of book for confirmed big meat, capped in total.
+
+    The add lands on a position already up +20%, so only the ~7.3% increment
+    can be wrong, and the worst observed continuation (-9.82%) still leaves the
+    combined position green. Across a quarter's 9 big meat that is +6.65% of
+    NAV if real against -1.32% if not.
+    """
+
+    def test_a_small_position_is_taken_to_target(self):
+        add, why = ag.add_size_pct(2.7, 2.7)
+        self.assertAlmostEqual(add, 7.3, places=2)
+        self.assertIn("to 10.0%", why)
+
+    def test_a_position_already_at_target_adds_nothing(self):
+        add, why = ag.add_size_pct(10.0, 10.0)
+        self.assertEqual(add, 0.0)
+        self.assertIn("already at", why)
+
+    def test_the_total_cap_binds_before_the_name_cap(self):
+        """Two concurrent big meat is the most the book should have frozen -
+        688432 shows a 10% position can become unexitable overnight."""
+        add, why = ag.add_size_pct(2.0, 18.0)
+        self.assertAlmostEqual(add, 2.0, places=2)
+        self.assertIn("capped by total exposure", why)
+
+    def test_no_room_at_all_adds_nothing(self):
+        add, why = ag.add_size_pct(2.0, 20.0)
+        self.assertEqual(add, 0.0)
+        self.assertIn("cap", why)
+
+    def test_the_target_is_ten_percent(self):
+        """4% was a first pass that priced the add as a fresh bet."""
+        self.assertEqual(ag.BIG_MEAT_TARGET_PCT, 10.0)
+
+    def test_total_exposure_is_capped_at_two_names(self):
+        self.assertEqual(ag.TOTAL_BIG_MEAT_CAP_PCT,
+                         2 * ag.BIG_MEAT_TARGET_PCT)
+
+    def test_unmeasurable_input_adds_nothing(self):
+        self.assertEqual(ag.add_size_pct(None, 0)[0], 0.0)
+        self.assertEqual(ag.add_size_pct(2.0, "x")[0], 0.0)
 
 
 class SafetyTests(unittest.TestCase):
