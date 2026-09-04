@@ -905,6 +905,9 @@ def _collect_amount_snapshot(api, stocks):
     return amt_list
 
 
+DATA_DIR_FOR_FLAG = str(DATA_DIR)
+
+
 def _select_amount_candidates(amt_list):
     total_amt_yuan = sum(_to_float(row.get("latest_amt"), 0.0) for row in amt_list)
     total_amt_yi = total_amt_yuan / 1e8
@@ -918,13 +921,99 @@ def _select_amount_candidates(amt_list):
         market_regime = "正常市"
         amount_threshold = SCAN_CONFIG["min_amount_yuan"]
 
+    # WHICH END OF THE TURNOVER RANKING THE POOL COMES FROM.
+    #
+    # This sorted descending and kept the top - the highest-turnover names above
+    # the floor. Turnover is the single strongest predictor in the whole feature
+    # set, and it is NEGATIVE: rank IC -0.0968 at ten sessions, t-17.96, over
+    # 868 sessions of the gate universe with a shuffled control at zero.
+    #
+    # So the pool was chosen from the wrong end of the strongest factor, before
+    # any score, gate or sizing touched it. Measured as forward excess of the
+    # pool against the universe it is drawn from, entered T+1:
+    #
+    #     held 10 sessions   top 120 by turnover   -0.893%  t -9.35
+    #                        bottom 120            +0.068%  t +1.68
+    #     held 20 sessions   top 120               -1.723%  t-13.82
+    #                        bottom 120            +0.119%  t +2.14
+    #
+    # Same universe, same floor, same count - one sort direction apart. That is
+    # why every gate tuned downstream of it measured flat or negative: they were
+    # ranking inside a pool already 1.7 points in the hole.
+    #
+    # The gain is almost entirely in NOT bleeding rather than a new edge (+0.068%
+    # is barely above zero, and t+1.68 is weak on its own). The comparison that
+    # matters is +0.068% against -0.893%.
+    #
+    # Off by default. TLFZ_LOW_TURNOVER_POOL=1 turns it around.
+    # Read at CALL time, from a file as well as the environment.
+    #
+    # The env alone cannot turn this on during a session: stockbot-trading-day
+    # starts at 09:25 and every phase subprocess inherits the environment it had
+    # then, so editing trading-day.env changes nothing until the service
+    # restarts - and restarting mid-day disrupts the running trading day.
+    #
+    # A flag FILE is checked on every call, so the pool can be reverted between
+    # the scan and the buy node without touching the service. Deleting the file
+    # is the kill switch.
+    ascending = str(os.environ.get("TLFZ_LOW_TURNOVER_POOL", "0")).strip().lower() \
+        in ("1", "true", "yes", "on")
+    if not ascending:
+        try:
+            ascending = os.path.exists(os.path.join(
+                DATA_DIR_FOR_FLAG, "TLFZ_LOW_TURNOVER_POOL"))
+        except Exception:
+            ascending = False
     filtered = [row for row in amt_list if _to_float(row.get("latest_amt"), 0.0) >= amount_threshold]
-    filtered.sort(key=lambda row: _to_float(row.get("latest_amt"), 0.0), reverse=True)
+    filtered.sort(key=lambda row: _to_float(row.get("latest_amt"), 0.0),
+                  reverse=not ascending)
     if len(filtered) > SCAN_CONFIG["max_stocks"]:
         filtered = filtered[:SCAN_CONFIG["max_stocks"]]
     elif len(filtered) < SCAN_CONFIG["min_stocks"]:
-        all_sorted = sorted(amt_list, key=lambda row: _to_float(row.get("latest_amt"), 0.0), reverse=True)
-        filtered = all_sorted[:SCAN_CONFIG["min_stocks"]]
+        # THIS BRANCH IS THE ONE THAT USUALLY FIRES, and the first version of
+        # this change left it untouched - which made the whole change inert.
+        #
+        # On 2026-09-04 the market read 清淡市, so the floor was 3亿, fewer than
+        # min_stocks passed it, and this ran. The resulting pool had a median of
+        # 1.1亿 and a minimum of 0.60亿 - far below its own threshold - because
+        # the old code abandoned the floor entirely and took the top 100 by
+        # turnover from the whole universe. The most aggressive possible
+        # selection from the wrong end of the strongest factor, on exactly the
+        # days the market is thin.
+        #
+        # So relax the floor instead of abandoning it: step it down until enough
+        # names qualify, then apply the same direction as above. A liquidity
+        # floor still exists; it just is not "whatever the busiest 100 names
+        # happen to be".
+        # Relax until min_stocks qualify, and do NOT pin a higher floor to
+        # "protect" the measured population. An earlier attempt pinned this at
+        # 1亿 and the pool collapsed from 100 names to 60 - which throttles the
+        # engine rather than turning it, and is not what was asked for.
+        #
+        # The pin was also unnecessary on the evidence. The liquidity sweep
+        # tested floors from 20M upward and the effect held at every one:
+        #
+        #     floor    excess @10 sessions        t
+        #      20M          +0.573%            +9.43
+        #      50M          +0.429%            +7.16
+        #     100M          +0.427%            +6.41
+        #     200M          +0.530%            +6.53
+        #
+        # So names at 0.39亿 are INSIDE the tested population, not outside it.
+        # And a 20k position against 39M of daily turnover is 0.05% of volume -
+        # the fill concern was invented, not measured.
+        floor = amount_threshold
+        for _ in range(6):
+            floor *= 0.6
+            widened = [row for row in amt_list
+                       if _to_float(row.get("latest_amt"), 0.0) >= floor]
+            if len(widened) >= SCAN_CONFIG["min_stocks"]:
+                break
+        else:
+            widened = list(amt_list)
+        widened.sort(key=lambda row: _to_float(row.get("latest_amt"), 0.0),
+                     reverse=not ascending)
+        filtered = widened[:SCAN_CONFIG["min_stocks"]]
     return filtered, total_amt_yi, market_regime, amount_threshold
 
 
