@@ -6080,12 +6080,105 @@ def load_track_record(*, positions=None, decision_reference=None):
     return [_normalize_record(r) for r in (closed_records + holding_records)]
 
 
+BIG_MEAT_OUTCOME_FIELDS = (
+    'big_meat_state', 'big_meat_score', 'big_meat_aggressive_score',
+    'big_meat_first_seen_at', 'big_meat_confirmed_at',
+    'holding_big_meat_score', 'holding_big_meat_promoted_at',
+)
+
+
+def _seal_big_meat_outcome(records):
+    """Copy the big-meat label onto a trade at the moment it closes.
+
+    The label lived ONLY in v10_position_state.json. That file keeps
+    status=='holding' rows and nothing else, so the entry was pruned in the
+    same pass the trade closed, and the runtime view - which injects these
+    fields from the state file - had nothing left to inject. The persisted
+    record never carried them at all.
+
+    The cost was silence. Across 160 closed records in three separate stores,
+    big_meat_state is empty in every one, while eight live positions carry
+    'big_meat_candidate' right now. So the system has been labelling
+    candidates for months and has never once scored one against its outcome:
+    the label could predict big winners, average trades or losers, and nothing
+    in the record could tell the difference. An unfalsifiable flag is worse
+    than no flag, because the sizing logic reads it.
+
+    THE ENTRY MUST BE THE SAME EPISODE, NOT MERELY THE SAME STOCK.
+
+    The state file is keyed by code and holds only what is open NOW. Sealing on
+    a code match alone would graft today's label onto every past trade in the
+    same name - and because every one of those 160 records is currently blank,
+    the first run would have back-filled fabricated history wholesale. A stock
+    we bought in July, closed in August and hold again today would acquire a
+    label it never had. So identity is checked before anything is copied:
+    decision_id when both carry one, otherwise the buy date and time.
+
+    Sealing happens before the prune below, because this is the last point
+    where the closing record and its surviving state entry coexist. Only
+    closed records are touched, only blank fields are filled, and a record
+    that already carries a state is left alone entirely.
+    """
+    previous = _load_position_state()
+    if not previous:
+        return 0
+    sealed = 0
+    for raw in records or []:
+        record = raw if isinstance(raw, dict) else {}
+        if str(record.get('status', '')).strip() != 'closed':
+            continue
+        if str(record.get('big_meat_state', '')).strip():
+            continue
+        code = str(record.get('code', '')).zfill(6)
+        entry = previous.get(code) or {}
+        if not entry or not _is_same_episode(record, entry):
+            continue
+        touched = False
+        for field in BIG_MEAT_OUTCOME_FIELDS:
+            if str(record.get(field, '')).strip():
+                continue
+            value = str(entry.get(field, '')).strip()
+            if value:
+                record[field] = value
+                touched = True
+        if touched:
+            sealed += 1
+    return sealed
+
+
+def _is_same_episode(record, entry):
+    """Is this state entry the same open position as this closing record?
+
+    decision_id is the strongest tie and is preferred whenever both sides carry
+    one. Falling back to buy date plus buy time covers records written before
+    decision ids were threaded through. When neither side offers enough to
+    judge, the answer is no: an unlabelled trade is a gap in the data, but a
+    wrongly labelled one is a lie the learning layer would read as evidence.
+    """
+    left = str(record.get('decision_id', '')).strip()
+    right = str(entry.get('decision_id', '')).strip()
+    if left and right:
+        return left == right
+    date_l = str(record.get('date', '')).strip()
+    date_r = str(entry.get('date', '')).strip()
+    if not date_l or not date_r or date_l != date_r:
+        return False
+    time_l = str(record.get('buy_time', '')).strip()
+    time_r = str(entry.get('buy_time', '')).strip()
+    if time_l and time_r:
+        return time_l == time_r
+    return True
+
+
 def save_track_record(records):
     """保存持仓策略状态。
 
     账户账本以 mx moni 为准，这里只持久化本地策略语义字段，
     供下次从 mx moni 实仓重建当前持仓视图。
     """
+    sealed = _seal_big_meat_outcome(records)
+    if sealed:
+        print(f" 大肉标签已随平仓封存: {sealed} 笔")
     entries = {}
     for raw in records or []:
         record = _normalize_record(raw)
