@@ -344,6 +344,7 @@ DAILY_EVOLUTION_BUNDLE_FILE = str(DATA_DIR / 'v10_daily_evolution_bundle_latest.
 ENGINEERING_REVIEW_FILE = str(DATA_DIR / 'v10_engineering_review_latest.json')
 ENGINEERING_MANUAL_INCIDENTS_FILE = str(DATA_DIR / 'v10_engineering_manual_incidents_latest.json')
 TRADE_EPISODE_HISTORY_FILE = str(DATA_DIR / 'v10_trade_episode_history_latest.json')
+BIG_MEAT_OBSERVATIONS_FILE = str(DATA_DIR / 'v10_big_meat_observations.jsonl')
 
 # === 成交记录校正 (broker fill correction) ===
 # The episode history recorded what the system BELIEVED it paid, resolved from a
@@ -6087,87 +6088,129 @@ BIG_MEAT_OUTCOME_FIELDS = (
 )
 
 
-def _seal_big_meat_outcome(records):
-    """Copy the big-meat label onto a trade at the moment it closes.
+def _big_meat_episode_key(code, date, buy_time=''):
+    """Identity of one open position: stock plus the day it was opened.
 
-    The label lived ONLY in v10_position_state.json. That file keeps
-    status=='holding' rows and nothing else, so the entry was pruned in the
-    same pass the trade closed, and the runtime view - which injects these
-    fields from the state file - had nothing left to inject. The persisted
-    record never carried them at all.
-
-    The cost was silence. Across 160 closed records in three separate stores,
-    big_meat_state is empty in every one, while eight live positions carry
-    'big_meat_candidate' right now. So the system has been labelling
-    candidates for months and has never once scored one against its outcome:
-    the label could predict big winners, average trades or losers, and nothing
-    in the record could tell the difference. An unfalsifiable flag is worse
-    than no flag, because the sizing logic reads it.
-
-    THE ENTRY MUST BE THE SAME EPISODE, NOT MERELY THE SAME STOCK.
-
-    The state file is keyed by code and holds only what is open NOW. Sealing on
-    a code match alone would graft today's label onto every past trade in the
-    same name - and because every one of those 160 records is currently blank,
-    the first run would have back-filled fabricated history wholesale. A stock
-    we bought in July, closed in August and hold again today would acquire a
-    label it never had. So identity is checked before anything is copied:
-    decision_id when both carry one, otherwise the buy date and time.
-
-    Sealing happens before the prune below, because this is the last point
-    where the closing record and its surviving state entry coexist. Only
-    closed records are touched, only blank fields are filled, and a record
-    that already carries a state is left alone entirely.
+    Not the code alone. The same stock is bought, closed and bought again, and
+    a code-only key would hand an old trade the label of a later one.
     """
-    previous = _load_position_state()
-    if not previous:
-        return 0
-    sealed = 0
+    code = str(code or '').zfill(6)
+    date = str(date or '').strip()
+    if not code or not date:
+        return ''
+    return '%s|%s' % (code, date)
+
+
+def _record_big_meat_observations(records):
+    """Append today's label for every position still holding it.
+
+    WHY A LOG AND NOT A FIELD ON THE RECORD.
+
+    Two things defeated the obvious approach, and both are visible in the live
+    data rather than theoretical:
+
+    1. Nothing persists a closed record. _build_runtime_trade_records rebuilds
+       every one from the broker fill index and the decision log on each run,
+       so a field written onto a record in memory is gone when the process
+       exits. An earlier version of this fix did exactly that and was inert:
+       002605 carried big_meat_candidate score 6.0, sold 2026-09-09 10:15, and
+       lost the label anyway.
+
+    2. The label is recomputed every run, not sticky. 600649 was
+       big_meat_candidate score 6.0 on 09-08 and blank on 09-09 while still
+       held. So even a working seal that read the label AT CLOSE would capture
+       nothing for a position that was a candidate for days and closed cold.
+
+    An append-only log fixes both: it survives the state file being pruned, and
+    it keeps every observation rather than the last one, so a trade can be
+    scored on whether it was EVER a candidate and how strong the label got.
+
+    One line per position per day. Re-running a phase does not duplicate.
+    """
+    rows = []
+    seen = set()
+    today = _market_today()
     for raw in records or []:
         record = raw if isinstance(raw, dict) else {}
-        if str(record.get('status', '')).strip() != 'closed':
+        if str(record.get('status', '')).strip() != 'holding':
             continue
-        if str(record.get('big_meat_state', '')).strip():
+        state = str(record.get('big_meat_state', '')).strip()
+        if not state:
             continue
-        code = str(record.get('code', '')).zfill(6)
-        entry = previous.get(code) or {}
-        if not entry or not _is_same_episode(record, entry):
+        key = _big_meat_episode_key(record.get('code'), record.get('date'))
+        if not key or key in seen:
             continue
-        touched = False
-        for field in BIG_MEAT_OUTCOME_FIELDS:
-            if str(record.get(field, '')).strip():
-                continue
-            value = str(entry.get(field, '')).strip()
-            if value:
-                record[field] = value
-                touched = True
-        if touched:
-            sealed += 1
-    return sealed
+        seen.add(key)
+        rows.append({
+            'key': key,
+            'code': str(record.get('code', '')).zfill(6),
+            'date': str(record.get('date', '')).strip(),
+            'buy_time': str(record.get('buy_time', '')).strip(),
+            'decision_id': str(record.get('decision_id', '')).strip(),
+            'observed_on': today,
+            'big_meat_state': state,
+            'big_meat_score': str(record.get('big_meat_score', '')).strip(),
+            'big_meat_aggressive_score': str(record.get('big_meat_aggressive_score', '')).strip(),
+            'big_meat_first_seen_at': str(record.get('big_meat_first_seen_at', '')).strip(),
+            'big_meat_confirmed_at': str(record.get('big_meat_confirmed_at', '')).strip(),
+        })
+    if not rows:
+        return 0
+    existing = set()
+    for item in _read_jsonl(BIG_MEAT_OBSERVATIONS_FILE, limit=20000) or []:
+        existing.add((str(item.get('key', '')), str(item.get('observed_on', ''))))
+    fresh = [r for r in rows if (r['key'], r['observed_on']) not in existing]
+    if not fresh:
+        return 0
+    try:
+        with open(BIG_MEAT_OBSERVATIONS_FILE, 'a', encoding='utf-8') as handle:
+            for row in fresh:
+                handle.write(json.dumps(row, ensure_ascii=False) + '\n')
+    except OSError:
+        return 0
+    return len(fresh)
 
 
-def _is_same_episode(record, entry):
-    """Is this state entry the same open position as this closing record?
+def _load_big_meat_observation_index():
+    """key -> summary of every label this position ever carried."""
+    index = {}
+    for item in _read_jsonl(BIG_MEAT_OBSERVATIONS_FILE, limit=20000) or []:
+        key = str(item.get('key', '')).strip()
+        if not key:
+            continue
+        entry = index.setdefault(key, {
+            'states': [], 'peak_score': 0.0, 'days': 0,
+            'first_seen_at': '', 'confirmed_at': '',
+        })
+        state = str(item.get('big_meat_state', '')).strip()
+        if state:
+            entry['states'].append(state)
+        entry['days'] += 1
+        entry['peak_score'] = max(entry['peak_score'],
+                                  _fnum(item.get('big_meat_score', 0.0), 0.0))
+        for field, target in (('big_meat_first_seen_at', 'first_seen_at'),
+                              ('big_meat_confirmed_at', 'confirmed_at')):
+            value = str(item.get(field, '')).strip()
+            if value and not entry[target]:
+                entry[target] = value
+    return index
 
-    decision_id is the strongest tie and is preferred whenever both sides carry
-    one. Falling back to buy date plus buy time covers records written before
-    decision ids were threaded through. When neither side offers enough to
-    judge, the answer is no: an unlabelled trade is a gap in the data, but a
-    wrongly labelled one is a lie the learning layer would read as evidence.
-    """
-    left = str(record.get('decision_id', '')).strip()
-    right = str(entry.get('decision_id', '')).strip()
-    if left and right:
-        return left == right
-    date_l = str(record.get('date', '')).strip()
-    date_r = str(entry.get('date', '')).strip()
-    if not date_l or not date_r or date_l != date_r:
-        return False
-    time_l = str(record.get('buy_time', '')).strip()
-    time_r = str(entry.get('buy_time', '')).strip()
-    if time_l and time_r:
-        return time_l == time_r
-    return True
+
+def _big_meat_history_for(record, index):
+    """What this closing trade was ever labelled, or {} when never labelled."""
+    key = _big_meat_episode_key(record.get('code'), record.get('date'))
+    entry = index.get(key) if key else None
+    if not entry or not entry['states']:
+        return {}
+    states = entry['states']
+    state = BIG_MEAT_STATE_CONFIRMED if BIG_MEAT_STATE_CONFIRMED in states else states[-1]
+    return {
+        'big_meat_state': state,
+        'big_meat_peak_score': '%.2f' % entry['peak_score'],
+        'big_meat_observed_days': str(entry['days']),
+        'big_meat_first_seen_at': entry['first_seen_at'],
+        'big_meat_confirmed_at': entry['confirmed_at'],
+    }
 
 
 def save_track_record(records):
@@ -6176,9 +6219,9 @@ def save_track_record(records):
     账户账本以 mx moni 为准，这里只持久化本地策略语义字段，
     供下次从 mx moni 实仓重建当前持仓视图。
     """
-    sealed = _seal_big_meat_outcome(records)
-    if sealed:
-        print(f" 大肉标签已随平仓封存: {sealed} 笔")
+    observed = _record_big_meat_observations(records)
+    if observed:
+        print(f" 大肉标签已记录: {observed} 笔 -> {BIG_MEAT_OBSERVATIONS_FILE}")
     entries = {}
     for raw in records or []:
         record = _normalize_record(raw)
@@ -8172,6 +8215,7 @@ def _build_trade_episode_history(records, *, decision_reference=None):
     decision_reference = decision_reference if isinstance(decision_reference, dict) else _build_selected_decision_reference([])
     fill_index = _build_trade_fill_index()
     smart_sell_reason_index = _load_smart_sell_trigger_reason_index()
+    big_meat_index = _load_big_meat_observation_index()
     alpha_loss_history = _collect_alpha_loss_events()
     alpha_loss_by_code = {}
     for item in alpha_loss_history:
@@ -8202,7 +8246,13 @@ def _build_trade_episode_history(records, *, decision_reference=None):
         ]
         execution_damaged = bool(alpha_events)
         build_note = str(record.get('build_note', '')).strip()
-        big_meat_state = str(record.get('big_meat_state', '')).strip()
+        # The rebuilt record almost never carries this: closed records are
+        # reconstructed from broker fills and the decision log, neither of
+        # which knows about labels, and the state file has already dropped the
+        # position. The observation log is the only surviving witness.
+        big_meat_history = _big_meat_history_for(record, big_meat_index)
+        big_meat_state = (str(record.get('big_meat_state', '')).strip()
+                          or big_meat_history.get('big_meat_state', ''))
         opening_shock_profit_expansion_miss = (
             pnl_pct >= LEARNING_BIG_MEAT_SUCCESS_PNL_PCT
             and hold_days <= 3
@@ -8290,7 +8340,12 @@ def _build_trade_episode_history(records, *, decision_reference=None):
             'build_note': build_note,
             'close_reason': close_reason,
             'big_meat_state': big_meat_state,
-            'big_meat_confirmed_at': str(record.get('big_meat_confirmed_at', '')).strip(),
+            'big_meat_peak_score': big_meat_history.get('big_meat_peak_score', ''),
+            'big_meat_observed_days': big_meat_history.get('big_meat_observed_days', ''),
+            'big_meat_first_seen_at': (str(record.get('big_meat_first_seen_at', '')).strip()
+                                       or big_meat_history.get('big_meat_first_seen_at', '')),
+            'big_meat_confirmed_at': (str(record.get('big_meat_confirmed_at', '')).strip()
+                                      or big_meat_history.get('big_meat_confirmed_at', '')),
             'big_meat_success_flag': bool(big_meat_success),
             'false_selection_flag': bool(false_selection.get('flag')),
             'falsify_level': str(false_selection.get('level', '')).strip(),
