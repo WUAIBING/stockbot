@@ -366,12 +366,14 @@ def _main_strategy_debug_emit(hypothesis_id: str, location: str, msg: str, data:
         pass
 # #endregion
 
-TDX_HOSTS = [
-    ("218.75.126.9", 7709),
-    ("60.191.117.167", 7709),
-    ("39.105.251.234", 7709),
-    ("119.147.212.83", 7709),
-]
+try:
+    import tdx_hosts as _tdx_hosts
+except ImportError:  # run from another cwd
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tdx_hosts as _tdx_hosts
+# One list for the whole system, verified by price rather than by connection.
+# See tdx_hosts.py for the 2026-09-10 outage this replaced.
+TDX_HOSTS = _tdx_hosts.TDX_HOSTS
 # ── Dynamic scan range (not fixed Top N) ──
 # 核心原则：量比质（牛市多撒网），质比量（熊市只打最确定的）
 # 灵活调整依据：中证1000总成交额 + 个股成交额阈值 + 信号密度
@@ -444,28 +446,22 @@ def market_from_exchange(exchange):
     return 0 if "深圳" in str(exchange) else 1
 
 def connect_tdx():
-    for _ in range(3):
-        for host, port in TDX_HOSTS:
-            api = TdxHq_API(heartbeat=True)
-            try:
-                if api.connect(host, port, time_out=3.0):
-                    # #region debug-point A:scanner-connect-ok
-                    _main_strategy_debug_emit(
-                        "A",
-                        "scanner_v10.py:connect_tdx",
-                        "[DEBUG] scanner connected to tdx",
-                        {"host": host, "port": port},
-                    )
-                    # #endregion
-                    return api
-            except Exception:
-                pass
-            try:
-                api.disconnect()
-            except Exception:
-                pass
-        time.sleep(0.5)
-    raise RuntimeError("Cannot connect to pytdx")
+    """A server that returns prices, or a loud failure. Never a server that
+    merely connects: that is how 09-10 and 09-11 scanned nothing silently."""
+    try:
+        api, where = _tdx_hosts.connect_verified(TdxHq_API, time_out=3.0, heartbeat=True)
+    except _tdx_hosts.TdxDataUnavailable as exc:
+        print(f"[ERROR] 行情数据不可用，拒绝扫描: {exc}")
+        raise RuntimeError(f"Cannot get prices from pytdx: {exc}") from exc
+    # #region debug-point A:scanner-connect-ok
+    _main_strategy_debug_emit(
+        "A",
+        "scanner_v10.py:connect_tdx",
+        "[DEBUG] scanner connected to tdx",
+        {"host": where},
+    )
+    # #endregion
+    return api
 
 def get_stock_list():
     cons = pd.read_excel(CONS_FILE)
@@ -631,16 +627,8 @@ def _resync_after_protocol_error(api, where, code=""):
         api.disconnect()
     except Exception:
         pass
-    for host, port in TDX_HOSTS:
-        try:
-            if api.connect(host, port):
-                return True
-        except Exception:
-            continue
-        try:
-            api.disconnect()
-        except Exception:
-            pass
+    if _tdx_hosts.reconnect_verified(api, log=None):
+        return True
     print("[ERROR] pytdx reconnect failed on every host - "
           "remaining rows this run cannot be trusted")
     return False
@@ -902,6 +890,17 @@ def _collect_amount_snapshot(api, stocks):
             _resync_after_protocol_error(api, "quote_batch", f"batch{batch_number}")
             continue
         amt_list.extend(batch_snapshot)
+    # NO DATA IS NOT A QUIET MARKET.
+    # On 09-10 and 09-11 every batch came back empty. This returned [], the
+    # regime logic summed it to 0亿, called the market 清淡市, raised the floor
+    # to 3亿 and scanned nothing - two sessions without a single entry and
+    # without a single error. Refuse instead, so the phase fails visibly.
+    priced = sum(1 for row in amt_list if _to_float(row.get("last_close"), 0.0) > 0)
+    if not amt_list or priced * 2 < len(stock_rows):
+        print(f"[ERROR] 行情数据不可用: 请求{len(stock_rows)}只，有价格{priced}只 - "
+              f"这不是清淡市，是没有数据，拒绝按冷市扫描")
+        raise _tdx_hosts.TdxDataUnavailable(
+            f"quote snapshot priced {priced} of {len(stock_rows)} requested")
     return amt_list
 
 

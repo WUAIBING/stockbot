@@ -10086,12 +10086,13 @@ def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT, code=''):
 
 # ─── TDX 连接（信号衰减检测用） ───
 
-TDX_HOSTS = [
-    ("218.75.126.9", 7709),
-    ("60.191.117.167", 7709),
-    ("39.105.251.234", 7709),
-    ("119.147.212.83", 7709),
-]
+try:
+    import tdx_hosts as _tdx_hosts
+except ImportError:  # run from another cwd
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tdx_hosts as _tdx_hosts
+# One list for the whole system, verified by price rather than by connection.
+TDX_HOSTS = _tdx_hosts.TDX_HOSTS
 
 BUY_WINDOW = ((14, 50), (14, 57))
 MIDDAY_BUY_WINDOW = ((13, 0), (13, 30))
@@ -10240,20 +10241,18 @@ def ensure_trade_window(action, *, dry_run=False):
 
 
 def connect_tdx():
-    """连接TDX行情服务器"""
-    for _ in range(3):
-        for host, port in TDX_HOSTS:
-            api = TdxHq_API(heartbeat=True)
-            try:
-                if api.connect(host, port, time_out=3.0):
-                    return api
-            except Exception:
-                pass
-            try:
-                api.disconnect()
-            except Exception:
-                pass
-    return None
+    """连接TDX行情服务器 - only one that actually returns prices.
+
+    Returning a connected-but-empty server is what let smart-sell evaluate 13
+    positions against empty charts from 09-10, report every one as 信号完好,
+    and sell nothing for three sessions.
+    """
+    try:
+        api, where = _tdx_hosts.connect_verified(TdxHq_API, time_out=3.0, heartbeat=True)
+        return api
+    except _tdx_hosts.TdxDataUnavailable as exc:
+        print(f"[ERROR] 行情数据不可用，信号衰减规则无法评估: {exc}")
+        return None
 
 
 def market_from_code(code):
@@ -10482,7 +10481,10 @@ def evaluate_signal_decay_detail(api, code, entry_price, buy_mode, *, profit_pct
 
     return {
         'should_sell': bool(should_sell),
-        'reason': " | ".join(reasons) if reasons else "信号完好",
+        # Without daily bars no rule above could fire, so "信号完好" would be a
+        # claim about evidence nobody saw. Say what actually happened.
+        'reason': " | ".join(reasons) if reasons else ("信号完好" if daily_bars else "行情数据缺失，未能评估"),
+        'data_unavailable': not bool(daily_bars),
         'score': decay_score,
         'evidence': evidence,
         'families': list(families.values()),
@@ -11620,6 +11622,9 @@ def _do_sell_core(smart=False, dry_run=False):
         tdx_started_at = time.perf_counter()
         #endregion
         tdx_api = connect_tdx()
+        if smart and not tdx_api:
+            print(" [ERROR] 行情数据不可用: 本轮信号衰减规则全部失效，只有 T+N 兜底仍在工作。"
+                  "下面的「继续持有」不代表信号完好。")
         if smart:
             #region debug-point smart-sell-connect-tdx-done
             _debug_report_smart_sell(
@@ -11640,6 +11645,7 @@ def _do_sell_core(smart=False, dry_run=False):
     skipped_count = 0
     trade_failed_count = 0
     hold_count = 0
+    data_blind_count = 0
     state_changed = False
     tradability_exclusions = _load_today_tradability_exclusions()
     sell_retry_queue = []
@@ -11782,6 +11788,8 @@ def _do_sell_core(smart=False, dry_run=False):
             should_sell = bool(decay_detail.get('should_sell'))
             decay_reason = str(decay_detail.get('reason', '信号完好'))
             decay_score = _fnum(decay_detail.get('score', 0.0), 0.0)
+            if decay_detail.get('data_unavailable'):
+                data_blind_count += 1
             if smart:
                 #region debug-point smart-sell-decay-done
                 _debug_report_smart_sell(
@@ -12137,6 +12145,9 @@ def _do_sell_core(smart=False, dry_run=False):
         f"  卖单受理: {sold_count} 只 | 已闭合: {confirmed_count} 只 | "
         f"继续持有: {hold_count} 只 | 跳过: {skipped_count} 只 | 失败: {trade_failed_count} 只"
     )
+    if data_blind_count:
+        print(f"  [ERROR] 行情缺失: {data_blind_count} 只持仓拿不到K线，信号衰减未评估 - "
+              f"这些「继续持有」是没有数据，不是信号完好")
     print(f"{'='*50}")
     if smart:
         #region debug-point smart-sell-core-exit
