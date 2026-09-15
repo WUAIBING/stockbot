@@ -935,6 +935,22 @@ TIER_CONFIG = {
        # T3=观察试错池：满仓5万/只，首次建仓60%=3万
 }
 
+def _book_slots():
+    """Total slots the book is designed for: the sum of TIER_CONFIG max_stocks.
+
+    TIER_CONFIG was sized as a 25-slot book (50% of NAV at 2% a name), but
+    max_stocks only ever limited candidates PER BUY ROUND - nothing stopped the
+    book growing past it. That was harmless while exits closed positions in
+    ~6 sessions. The trailing exit holds ~25 while the decision still opens 6-8
+    names a day, so the declared size now has to be enforced, or the book fills
+    to ~50 names and full investment within weeks, in a regime where the
+    full-market test found pool-like entries losing under every exit. The size
+    itself is the existing design, not a measured edge; the backtest assumed
+    unlimited capital.
+    """
+    return sum(_inum(cfg.get('max_stocks', 0), 0) for cfg in TIER_CONFIG.values())
+
+
 # 超级大行情标志：当V9_full信号+多模式共振时可满仓首建
 # 在信号CSV中 mode=='V9_full' 时自动检测
 PARTIAL_ROLLBACK_DISABLE_FULL_V9_BUILD = True
@@ -10093,6 +10109,11 @@ except ImportError:  # run from another cwd
     import tdx_hosts as _tdx_hosts
 # One list for the whole system, verified by price rather than by connection.
 TDX_HOSTS = _tdx_hosts.TDX_HOSTS
+try:
+    import trail_exit as _trail_exit
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import trail_exit as _trail_exit
 
 BUY_WINDOW = ((14, 50), (14, 57))
 MIDDAY_BUY_WINDOW = ((13, 0), (13, 30))
@@ -10254,6 +10275,57 @@ def connect_tdx():
         print(f"[ERROR] 行情数据不可用，信号衰减规则无法评估: {exc}")
         return None
 
+
+
+def _trail_exit_enabled():
+    """Read at CALL time, like the pool switch, so it can be flipped mid-day.
+
+    On when DATA_DIR/TLFZ_TRAIL_EXIT exists (or the env var says so). Deleting
+    the file restores the candle-rule exits on the next smart-sell run.
+    """
+    env = str(os.environ.get('TLFZ_TRAIL_EXIT', '')).strip().lower()
+    if env in ('0', 'false', 'off', 'no'):
+        return False
+    if env in ('1', 'true', 'on', 'yes'):
+        return True
+    try:
+        return (DATA_DIR / 'TLFZ_TRAIL_EXIT').exists()
+    except Exception:
+        return False
+
+
+def _trail_exit_verdict(api, code, buy_date, entry_price):
+    """Judge a position on COMPLETED daily closes after its entry session.
+
+    Excludes today's bar while it is still forming. The candle exit read that
+    bar fifteen minutes into the session and sold 688432 on the opening dip;
+    the rule measured on the whole market used finished closes only.
+    """
+    try:
+        rows = api.get_security_bars(9, market_from_code(code), str(code).zfill(6), 0,
+                                     _trail_exit.MAX_HOLD_SESSIONS + 20) or []
+        df = api.to_df(rows) if rows else None
+    except Exception:
+        df = None
+    closes = []
+    if df is not None and len(df):
+        df = df.sort_values('datetime')
+        start = str(buy_date or '').strip()
+        for _, bar in df.iterrows():
+            day = str(bar.get('datetime', ''))[:10]
+            if not start or day <= start:
+                continue
+            if _bar_is_provisional(bar.get('datetime'), period='daily'):
+                continue
+            closes.append(bar.get('close'))
+    verdict = _trail_exit.evaluate(closes, entry_price)
+    if df is not None and len(df) and not closes and _fnum(entry_price, 0.0) > 0:
+        # Bars arrived; there just is no finished session after the buy yet.
+        # That is a young position, not missing data - counting it as blind
+        # would raise a false 行情缺失 alarm for every buy on its first morning.
+        verdict['data_unavailable'] = False
+        verdict['reason'] = '买入后尚无完成交易日，跟踪止盈待启动'
+    return verdict
 
 def market_from_code(code):
     """从股票代码推断市场: 6xx=沪(1), 其他=深(0)"""
@@ -11243,6 +11315,35 @@ def _do_buy_core(dry_run=False):
         print(f" 已按09:31当日流动性门过滤: {', '.join(skipped_today_exclusion)}")
     if pending_summary.get('active_buy_codes'):
         print(f" 当前存在未完成买单: {', '.join(pending_summary['active_buy_codes'])}")
+    if buy_list and _trail_exit_enabled():
+        held_count = len(set(active_pos_map) | holding_codes | set(pending_summary.get('active_buy_codes', []) or []))
+        book_slots = _book_slots()
+        room = max(book_slots - held_count, 0)
+        if len(buy_list) > room:
+            ranked_for_room = sorted(
+                buy_list,
+                key=lambda item: (
+                    _inum(item.get('big_meat_priority_rank', 0), 0),
+                    _fnum(item.get('big_meat_seed_score', 0.0), 0.0),
+                    _fnum(item.get('ranking_score', 0.0), 0.0),
+                ),
+                reverse=True,
+            )
+            skipped_concurrency = [str(item['code']).zfill(6) for item in ranked_for_room[room:]]
+            buy_list = ranked_for_room[:room]
+            print(
+                f" 持仓数上限{book_slots}(TIER_CONFIG): 当前持有/在途{held_count}只，"
+                f"本轮开{len(buy_list)}只，跳过 {', '.join(skipped_concurrency[:10])}"
+            )
+            if not buy_list:
+                _write_buy_diagnostic(
+                    'concurrent_position_cap',
+                    candidate_count=len(skipped_concurrency),
+                    held_count=held_count,
+                    book_slots=book_slots,
+                    skipped_concurrency=skipped_concurrency,
+                )
+                return EXIT_NO_ACTION
     if not buy_list:
         print(" 买入候选已被现有持仓或未完成买单过滤，尾盘不再重复报单")
         _write_buy_diagnostic(
@@ -11760,6 +11861,8 @@ def _do_sell_core(smart=False, dry_run=False):
 
         sell_reason = None
         sell_action = ''
+        trail_on = bool(smart) and _trail_exit_enabled()
+        trail_verdict = _trail_exit_verdict(tdx_api, code, buy_date, entry_price) if (trail_on and tdx_api) else None
 
         # ── 规则0: 硬止损 ──
         # Checked before the time backstop: with the decay rules silenced this
@@ -11768,8 +11871,16 @@ def _do_sell_core(smart=False, dry_run=False):
             sell_reason = f"硬止损{pnl_pct:+.1f}%(上限{INTRADAY_HARD_STOP_PCT:.0f}%)"
             sell_action = BIG_MEAT_ACTION_HARD_EXIT
 
+        # ── 规则0.5: 跟踪止盈/收盘止损 (TLFZ_TRAIL_EXIT) ──
+        # Replaces the candle rules as the exit for everything short of the
+        # intraday hard stop. On the whole CSI 1000 it booked +20% on 10.2% of
+        # pool-like entries against 2.3% for the candle rules; see trail_exit.py.
+        elif trail_verdict and trail_verdict.get('should_exit'):
+            sell_reason = f"trail_exit[{trail_verdict.get('reason', '')}](持仓{hold_days}天)"
+            sell_action = BIG_MEAT_ACTION_HARD_EXIT
+
         # ── 规则1: T+N兜底 ──
-        elif hold_days_for_exit >= MAX_HOLD_DAYS:
+        elif hold_days_for_exit >= (_trail_exit.MAX_HOLD_SESSIONS if trail_on else MAX_HOLD_DAYS):
             sell_reason = (
                 f"T+{MAX_HOLD_DAYS}到期(交易日{hold_days_for_exit}天/自然日{hold_days}天)"
                 if hold_sessions is not None
@@ -11790,6 +11901,17 @@ def _do_sell_core(smart=False, dry_run=False):
             decay_score = _fnum(decay_detail.get('score', 0.0), 0.0)
             if decay_detail.get('data_unavailable'):
                 data_blind_count += 1
+            if trail_on:
+                # The candle rules still run - they feed the big-meat labels
+                # and the observation log - but they no longer sell. Every
+                # decay exit (信号衰减, hard_exit[...], risk_trim[...]) passes
+                # through should_sell, and risk_trim sold the stocks that went
+                # on to beat the index by +4.57% over the next 10 sessions.
+                should_sell = False
+                if trail_verdict:
+                    decay_reason = f"{decay_reason} | {trail_verdict.get('reason', '')}"
+                    if trail_verdict.get('data_unavailable'):
+                        data_blind_count += 1
             if smart:
                 #region debug-point smart-sell-decay-done
                 _debug_report_smart_sell(
