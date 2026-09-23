@@ -2337,6 +2337,31 @@ class AddPositionAggressiveTests(unittest.TestCase):
         self.assertIn("超加仓上限", " ".join(capped["notes"]))
 
     def test_do_add_position_uses_extended_target_for_big_meat_candidate(self) -> None:
+        """The sizing of an add, for the day add_gates lets one through.
+
+        Adds are shut by add_gates as shipped (chasing a riser measured -2.007%
+        at 10 sessions, t-19.24), so the gate is opened here explicitly - this
+        test is about what an add is sized to, not whether one should happen.
+        """
+        code, trade_mock, write_mock = self._big_meat_add_scenario(gate_open=True)
+        self.assertEqual(code, trader.EXIT_OK)
+        self.assertEqual(trade_mock.call_args.args[2], 2000)
+        execution_result = write_mock.call_args.kwargs["execution_result"]
+        self.assertEqual(execution_result["aggressive_add_count"], 0)
+        self.assertEqual(execution_result["aggressive_add_codes"], [])
+        self.assertEqual(execution_result["aggressive_add_items"], [])
+
+    def test_do_add_position_places_no_add_while_add_gates_are_shut(self) -> None:
+        """The same big-meat candidate, gate as shipped: no order goes out."""
+        code, trade_mock, _write_mock = self._big_meat_add_scenario(gate_open=False)
+        self.assertEqual(code, trader.EXIT_NO_ACTION)
+        trade_mock.assert_not_called()
+
+    def _big_meat_add_scenario(self, gate_open):
+        if gate_open:
+            original_eval = trader._add_gates.evaluate_add
+            trader._add_gates.evaluate_add = lambda *a, **k: (True, [("unit", True, "gate opened for a sizing test")])
+            self.addCleanup(setattr, trader._add_gates, "evaluate_add", original_eval)
         # This test is about the extended target for big meat, not about whether
         # the book is full enough to justify adding at all - the breadth gate has
         # its own tests in test_add_position_gates. Set outside the with-block
@@ -2425,13 +2450,7 @@ class AddPositionAggressiveTests(unittest.TestCase):
             patch.object(trader, "write_account_artifacts") as write_mock,
         ):
             code = trader.do_add_position(dry_run=False)
-
-        self.assertEqual(code, trader.EXIT_OK)
-        self.assertEqual(trade_mock.call_args.args[2], 2000)
-        execution_result = write_mock.call_args.kwargs["execution_result"]
-        self.assertEqual(execution_result["aggressive_add_count"], 0)
-        self.assertEqual(execution_result["aggressive_add_codes"], [])
-        self.assertEqual(execution_result["aggressive_add_items"], [])
+        return code, trade_mock, write_mock
 
     def test_big_meat_add_profile_uses_identity_and_trend_score(self) -> None:
         class FakeApi:
