@@ -10269,7 +10269,10 @@ def connect_tdx():
     and sell nothing for three sessions.
     """
     try:
-        api, where = _tdx_hosts.connect_verified(TdxHq_API, time_out=3.0, heartbeat=True)
+        # heartbeat=False: pytdx's heartbeat thread writes to the same socket
+        # without a lock, a known source of replies arriving for the wrong
+        # request. A sell run lasts minutes; it does not need keep-alives.
+        api, where = _tdx_hosts.connect_verified(TdxHq_API, time_out=3.0, heartbeat=False)
         return api
     except _tdx_hosts.TdxDataUnavailable as exc:
         print(f"[ERROR] 行情数据不可用，信号衰减规则无法评估: {exc}")
@@ -10294,32 +10297,117 @@ def _trail_exit_enabled():
         return False
 
 
-def _trail_exit_verdict(api, code, buy_date, entry_price):
+def _board_limit_pct(code):
+    """Daily price limit for the board, in percent."""
+    code = str(code).zfill(6)
+    if code.startswith(('688', '689', '300', '301')):
+        return 20.0
+    if code.startswith(('8', '4', '92')):
+        return 30.0
+    return 10.0
+
+
+def _bars_belong_to(code, rows, quote, live_price=None):
+    """(ok, why): do these daily bars really belong to `code`?
+
+    THE FAILURE THIS GUARDS. In the 14:45 sell runs of 09-21 and 09-22 every
+    position was scored on the PREVIOUS position's bars: one pytdx request timed
+    out, pytdx returned None instead of raising, the late reply stayed in the
+    socket, and every later request read the answer to the one before. 华谊集团
+    (cost 8.49, broker price 8.52) read 通裕重工's 2.78 and logged a -67.3% stop;
+    神农集团 read -82.4%. Nine sell orders went out on prices that were not
+    those stocks'. Real fills were -1.2% to +2.8%.
+
+    Two independent checks, because either source alone can be wrong:
+      * the same connection's quote must carry this code - a shifted
+        connection answers with the wrong code, or with a reply the quote
+        parser cannot read
+      * the latest bar must sit within the board's daily limit (+2% slack) of
+        both that quote and the broker's own price, which never touches pytdx
+
+    Ex-rights days (送转, big dividends) can fail the second check because the
+    bars are unadjusted. That fails SAFE - the position is held for the day and
+    the broker-P&L hard stop still guards it.
+    """
+    code6 = str(code).zfill(6)
+    if not rows:
+        return False, 'no bars'
+    if not isinstance(quote, dict):
+        return False, 'no quote'
+    qcode = str(quote.get('code', '') or '').strip().zfill(6)
+    if qcode != code6:
+        return False, 'quote for %s answered as %s' % (code6, qcode or '?')
+    try:
+        latest = sorted(rows, key=lambda b: str(b.get('datetime', '')))[-1]
+        last = float(latest.get('close') or 0)
+    except Exception:
+        return False, 'unreadable bars'
+    if last <= 0:
+        return False, 'no close in bars'
+    tolerance = _board_limit_pct(code6) + 2.0
+    for label, ref in (('quote', quote.get('price')), ('broker', live_price)):
+        try:
+            ref = float(ref or 0)
+        except (TypeError, ValueError):
+            ref = 0.0
+        if ref > 0 and abs(last / ref - 1) * 100 > tolerance:
+            return False, 'bars close %.2f vs %s %.2f' % (last, label, ref)
+    return True, ''
+
+
+def _trail_exit_verdict(api, code, buy_date, entry_price, live_price=None):
     """Judge a position on COMPLETED daily closes after its entry session.
 
     Excludes today's bar while it is still forming. The candle exit read that
     bar fifteen minutes into the session and sold 688432 on the opening dip;
     the rule measured on the whole market used finished closes only.
+
+    Before any of that, the bars must be proven to belong to this stock
+    (_bars_belong_to). A mismatch triggers one reconnect, which flushes the
+    stale reply out of the socket, and one retry. Still wrong -> no data, which
+    holds the position rather than selling it on another stock's prices.
     """
-    try:
-        rows = api.get_security_bars(9, market_from_code(code), str(code).zfill(6), 0,
-                                     _trail_exit.MAX_HOLD_SESSIONS + 20) or []
-        df = api.to_df(rows) if rows else None
-    except Exception:
-        df = None
+    market = market_from_code(code)
+    code6 = str(code).zfill(6)
+    rows, why = [], 'not fetched'
+    for attempt in (1, 2):
+        try:
+            rows = api.get_security_bars(9, market, code6, 0, _trail_exit.MAX_HOLD_SESSIONS + 20) or []
+            quotes = api.get_security_quotes([(market, code6)]) or []
+            quote = quotes[0] if quotes else None
+        except Exception as exc:
+            rows, quote = [], None
+            why = 'request failed: %s' % str(exc)[:60]
+        else:
+            ok, why = _bars_belong_to(code6, rows, quote, live_price)
+            if ok:
+                break
+        rows = []
+        print(f"  [WARN] {code6} 行情校验失败({why})" + ("，重连后重试" if attempt == 1 else "，本轮不评估跟踪止盈"))
+        if attempt == 1:
+            try:
+                _tdx_hosts.reconnect_verified(api, log=None)
+            except Exception:
+                pass
+    if not rows:
+        verdict = _trail_exit.evaluate([], entry_price)
+        verdict['data_unavailable'] = True
+        verdict['reason'] = f'行情校验失败({why})，跟踪止盈未评估'
+        return verdict
+
+    df = api.to_df(rows)
     closes = []
-    if df is not None and len(df):
-        df = df.sort_values('datetime')
-        start = str(buy_date or '').strip()
-        for _, bar in df.iterrows():
-            day = str(bar.get('datetime', ''))[:10]
-            if not start or day <= start:
-                continue
-            if _bar_is_provisional(bar.get('datetime'), period='daily'):
-                continue
-            closes.append(bar.get('close'))
+    df = df.sort_values('datetime')
+    start = str(buy_date or '').strip()
+    for _, bar in df.iterrows():
+        day = str(bar.get('datetime', ''))[:10]
+        if not start or day <= start:
+            continue
+        if _bar_is_provisional(bar.get('datetime'), period='daily'):
+            continue
+        closes.append(bar.get('close'))
     verdict = _trail_exit.evaluate(closes, entry_price)
-    if df is not None and len(df) and not closes and _fnum(entry_price, 0.0) > 0:
+    if not closes and _fnum(entry_price, 0.0) > 0:
         # Bars arrived; there just is no finished session after the buy yet.
         # That is a young position, not missing data - counting it as blind
         # would raise a false 行情缺失 alarm for every buy on its first morning.
@@ -11862,7 +11950,7 @@ def _do_sell_core(smart=False, dry_run=False):
         sell_reason = None
         sell_action = ''
         trail_on = bool(smart) and _trail_exit_enabled()
-        trail_verdict = _trail_exit_verdict(tdx_api, code, buy_date, entry_price) if (trail_on and tdx_api) else None
+        trail_verdict = _trail_exit_verdict(tdx_api, code, buy_date, entry_price, live_price=cur_price) if (trail_on and tdx_api) else None
 
         # ── 规则0: 硬止损 ──
         # Checked before the time backstop: with the decay rules silenced this
