@@ -344,6 +344,7 @@ DAILY_EVOLUTION_BUNDLE_FILE = str(DATA_DIR / 'v10_daily_evolution_bundle_latest.
 ENGINEERING_REVIEW_FILE = str(DATA_DIR / 'v10_engineering_review_latest.json')
 ENGINEERING_MANUAL_INCIDENTS_FILE = str(DATA_DIR / 'v10_engineering_manual_incidents_latest.json')
 TRADE_EPISODE_HISTORY_FILE = str(DATA_DIR / 'v10_trade_episode_history_latest.json')
+BIG_MEAT_OBSERVATIONS_FILE = str(DATA_DIR / 'v10_big_meat_observations.jsonl')
 
 # === 成交记录校正 (broker fill correction) ===
 # The episode history recorded what the system BELIEVED it paid, resolved from a
@@ -6080,12 +6081,147 @@ def load_track_record(*, positions=None, decision_reference=None):
     return [_normalize_record(r) for r in (closed_records + holding_records)]
 
 
+BIG_MEAT_OUTCOME_FIELDS = (
+    'big_meat_state', 'big_meat_score', 'big_meat_aggressive_score',
+    'big_meat_first_seen_at', 'big_meat_confirmed_at',
+    'holding_big_meat_score', 'holding_big_meat_promoted_at',
+)
+
+
+def _big_meat_episode_key(code, date, buy_time=''):
+    """Identity of one open position: stock plus the day it was opened.
+
+    Not the code alone. The same stock is bought, closed and bought again, and
+    a code-only key would hand an old trade the label of a later one.
+    """
+    code = str(code or '').zfill(6)
+    date = str(date or '').strip()
+    if not code or not date:
+        return ''
+    return '%s|%s' % (code, date)
+
+
+def _record_big_meat_observations(records):
+    """Append today's label for every position still holding it.
+
+    WHY A LOG AND NOT A FIELD ON THE RECORD.
+
+    Two things defeated the obvious approach, and both are visible in the live
+    data rather than theoretical:
+
+    1. Nothing persists a closed record. _build_runtime_trade_records rebuilds
+       every one from the broker fill index and the decision log on each run,
+       so a field written onto a record in memory is gone when the process
+       exits. An earlier version of this fix did exactly that and was inert:
+       002605 carried big_meat_candidate score 6.0, sold 2026-09-09 10:15, and
+       lost the label anyway.
+
+    2. The label is recomputed every run, not sticky. 600649 was
+       big_meat_candidate score 6.0 on 09-08 and blank on 09-09 while still
+       held. So even a working seal that read the label AT CLOSE would capture
+       nothing for a position that was a candidate for days and closed cold.
+
+    An append-only log fixes both: it survives the state file being pruned, and
+    it keeps every observation rather than the last one, so a trade can be
+    scored on whether it was EVER a candidate and how strong the label got.
+
+    One line per position per day. Re-running a phase does not duplicate.
+    """
+    rows = []
+    seen = set()
+    today = _market_today()
+    for raw in records or []:
+        record = raw if isinstance(raw, dict) else {}
+        if str(record.get('status', '')).strip() != 'holding':
+            continue
+        state = str(record.get('big_meat_state', '')).strip()
+        if not state:
+            continue
+        key = _big_meat_episode_key(record.get('code'), record.get('date'))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            'key': key,
+            'code': str(record.get('code', '')).zfill(6),
+            'date': str(record.get('date', '')).strip(),
+            'buy_time': str(record.get('buy_time', '')).strip(),
+            'decision_id': str(record.get('decision_id', '')).strip(),
+            'observed_on': today,
+            'big_meat_state': state,
+            'big_meat_score': str(record.get('big_meat_score', '')).strip(),
+            'big_meat_aggressive_score': str(record.get('big_meat_aggressive_score', '')).strip(),
+            'big_meat_first_seen_at': str(record.get('big_meat_first_seen_at', '')).strip(),
+            'big_meat_confirmed_at': str(record.get('big_meat_confirmed_at', '')).strip(),
+        })
+    if not rows:
+        return 0
+    existing = set()
+    for item in _read_jsonl(BIG_MEAT_OBSERVATIONS_FILE, limit=20000) or []:
+        existing.add((str(item.get('key', '')), str(item.get('observed_on', ''))))
+    fresh = [r for r in rows if (r['key'], r['observed_on']) not in existing]
+    if not fresh:
+        return 0
+    try:
+        with open(BIG_MEAT_OBSERVATIONS_FILE, 'a', encoding='utf-8') as handle:
+            for row in fresh:
+                handle.write(json.dumps(row, ensure_ascii=False) + '\n')
+    except OSError:
+        return 0
+    return len(fresh)
+
+
+def _load_big_meat_observation_index():
+    """key -> summary of every label this position ever carried."""
+    index = {}
+    for item in _read_jsonl(BIG_MEAT_OBSERVATIONS_FILE, limit=20000) or []:
+        key = str(item.get('key', '')).strip()
+        if not key:
+            continue
+        entry = index.setdefault(key, {
+            'states': [], 'peak_score': 0.0, 'days': 0,
+            'first_seen_at': '', 'confirmed_at': '',
+        })
+        state = str(item.get('big_meat_state', '')).strip()
+        if state:
+            entry['states'].append(state)
+        entry['days'] += 1
+        entry['peak_score'] = max(entry['peak_score'],
+                                  _fnum(item.get('big_meat_score', 0.0), 0.0))
+        for field, target in (('big_meat_first_seen_at', 'first_seen_at'),
+                              ('big_meat_confirmed_at', 'confirmed_at')):
+            value = str(item.get(field, '')).strip()
+            if value and not entry[target]:
+                entry[target] = value
+    return index
+
+
+def _big_meat_history_for(record, index):
+    """What this closing trade was ever labelled, or {} when never labelled."""
+    key = _big_meat_episode_key(record.get('code'), record.get('date'))
+    entry = index.get(key) if key else None
+    if not entry or not entry['states']:
+        return {}
+    states = entry['states']
+    state = BIG_MEAT_STATE_CONFIRMED if BIG_MEAT_STATE_CONFIRMED in states else states[-1]
+    return {
+        'big_meat_state': state,
+        'big_meat_peak_score': '%.2f' % entry['peak_score'],
+        'big_meat_observed_days': str(entry['days']),
+        'big_meat_first_seen_at': entry['first_seen_at'],
+        'big_meat_confirmed_at': entry['confirmed_at'],
+    }
+
+
 def save_track_record(records):
     """保存持仓策略状态。
 
     账户账本以 mx moni 为准，这里只持久化本地策略语义字段，
     供下次从 mx moni 实仓重建当前持仓视图。
     """
+    observed = _record_big_meat_observations(records)
+    if observed:
+        print(f" 大肉标签已记录: {observed} 笔 -> {BIG_MEAT_OBSERVATIONS_FILE}")
     entries = {}
     for raw in records or []:
         record = _normalize_record(raw)
@@ -8079,6 +8215,7 @@ def _build_trade_episode_history(records, *, decision_reference=None):
     decision_reference = decision_reference if isinstance(decision_reference, dict) else _build_selected_decision_reference([])
     fill_index = _build_trade_fill_index()
     smart_sell_reason_index = _load_smart_sell_trigger_reason_index()
+    big_meat_index = _load_big_meat_observation_index()
     alpha_loss_history = _collect_alpha_loss_events()
     alpha_loss_by_code = {}
     for item in alpha_loss_history:
@@ -8109,7 +8246,13 @@ def _build_trade_episode_history(records, *, decision_reference=None):
         ]
         execution_damaged = bool(alpha_events)
         build_note = str(record.get('build_note', '')).strip()
-        big_meat_state = str(record.get('big_meat_state', '')).strip()
+        # The rebuilt record almost never carries this: closed records are
+        # reconstructed from broker fills and the decision log, neither of
+        # which knows about labels, and the state file has already dropped the
+        # position. The observation log is the only surviving witness.
+        big_meat_history = _big_meat_history_for(record, big_meat_index)
+        big_meat_state = (str(record.get('big_meat_state', '')).strip()
+                          or big_meat_history.get('big_meat_state', ''))
         opening_shock_profit_expansion_miss = (
             pnl_pct >= LEARNING_BIG_MEAT_SUCCESS_PNL_PCT
             and hold_days <= 3
@@ -8197,7 +8340,12 @@ def _build_trade_episode_history(records, *, decision_reference=None):
             'build_note': build_note,
             'close_reason': close_reason,
             'big_meat_state': big_meat_state,
-            'big_meat_confirmed_at': str(record.get('big_meat_confirmed_at', '')).strip(),
+            'big_meat_peak_score': big_meat_history.get('big_meat_peak_score', ''),
+            'big_meat_observed_days': big_meat_history.get('big_meat_observed_days', ''),
+            'big_meat_first_seen_at': (str(record.get('big_meat_first_seen_at', '')).strip()
+                                       or big_meat_history.get('big_meat_first_seen_at', '')),
+            'big_meat_confirmed_at': (str(record.get('big_meat_confirmed_at', '')).strip()
+                                      or big_meat_history.get('big_meat_confirmed_at', '')),
             'big_meat_success_flag': bool(big_meat_success),
             'false_selection_flag': bool(false_selection.get('flag')),
             'falsify_level': str(false_selection.get('level', '')).strip(),
@@ -9938,12 +10086,13 @@ def calc_buy_quantity(entry_price, amount=BUY_AMOUNT_DEFAULT, code=''):
 
 # ─── TDX 连接（信号衰减检测用） ───
 
-TDX_HOSTS = [
-    ("218.75.126.9", 7709),
-    ("60.191.117.167", 7709),
-    ("39.105.251.234", 7709),
-    ("119.147.212.83", 7709),
-]
+try:
+    import tdx_hosts as _tdx_hosts
+except ImportError:  # run from another cwd
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import tdx_hosts as _tdx_hosts
+# One list for the whole system, verified by price rather than by connection.
+TDX_HOSTS = _tdx_hosts.TDX_HOSTS
 
 BUY_WINDOW = ((14, 50), (14, 57))
 MIDDAY_BUY_WINDOW = ((13, 0), (13, 30))
@@ -10092,20 +10241,18 @@ def ensure_trade_window(action, *, dry_run=False):
 
 
 def connect_tdx():
-    """连接TDX行情服务器"""
-    for _ in range(3):
-        for host, port in TDX_HOSTS:
-            api = TdxHq_API(heartbeat=True)
-            try:
-                if api.connect(host, port, time_out=3.0):
-                    return api
-            except Exception:
-                pass
-            try:
-                api.disconnect()
-            except Exception:
-                pass
-    return None
+    """连接TDX行情服务器 - only one that actually returns prices.
+
+    Returning a connected-but-empty server is what let smart-sell evaluate 13
+    positions against empty charts from 09-10, report every one as 信号完好,
+    and sell nothing for three sessions.
+    """
+    try:
+        api, where = _tdx_hosts.connect_verified(TdxHq_API, time_out=3.0, heartbeat=True)
+        return api
+    except _tdx_hosts.TdxDataUnavailable as exc:
+        print(f"[ERROR] 行情数据不可用，信号衰减规则无法评估: {exc}")
+        return None
 
 
 def market_from_code(code):
@@ -10334,7 +10481,10 @@ def evaluate_signal_decay_detail(api, code, entry_price, buy_mode, *, profit_pct
 
     return {
         'should_sell': bool(should_sell),
-        'reason': " | ".join(reasons) if reasons else "信号完好",
+        # Without daily bars no rule above could fire, so "信号完好" would be a
+        # claim about evidence nobody saw. Say what actually happened.
+        'reason': " | ".join(reasons) if reasons else ("信号完好" if daily_bars else "行情数据缺失，未能评估"),
+        'data_unavailable': not bool(daily_bars),
         'score': decay_score,
         'evidence': evidence,
         'families': list(families.values()),
@@ -11472,6 +11622,9 @@ def _do_sell_core(smart=False, dry_run=False):
         tdx_started_at = time.perf_counter()
         #endregion
         tdx_api = connect_tdx()
+        if smart and not tdx_api:
+            print(" [ERROR] 行情数据不可用: 本轮信号衰减规则全部失效，只有 T+N 兜底仍在工作。"
+                  "下面的「继续持有」不代表信号完好。")
         if smart:
             #region debug-point smart-sell-connect-tdx-done
             _debug_report_smart_sell(
@@ -11492,6 +11645,7 @@ def _do_sell_core(smart=False, dry_run=False):
     skipped_count = 0
     trade_failed_count = 0
     hold_count = 0
+    data_blind_count = 0
     state_changed = False
     tradability_exclusions = _load_today_tradability_exclusions()
     sell_retry_queue = []
@@ -11634,6 +11788,8 @@ def _do_sell_core(smart=False, dry_run=False):
             should_sell = bool(decay_detail.get('should_sell'))
             decay_reason = str(decay_detail.get('reason', '信号完好'))
             decay_score = _fnum(decay_detail.get('score', 0.0), 0.0)
+            if decay_detail.get('data_unavailable'):
+                data_blind_count += 1
             if smart:
                 #region debug-point smart-sell-decay-done
                 _debug_report_smart_sell(
@@ -11989,6 +12145,9 @@ def _do_sell_core(smart=False, dry_run=False):
         f"  卖单受理: {sold_count} 只 | 已闭合: {confirmed_count} 只 | "
         f"继续持有: {hold_count} 只 | 跳过: {skipped_count} 只 | 失败: {trade_failed_count} 只"
     )
+    if data_blind_count:
+        print(f"  [ERROR] 行情缺失: {data_blind_count} 只持仓拿不到K线，信号衰减未评估 - "
+              f"这些「继续持有」是没有数据，不是信号完好")
     print(f"{'='*50}")
     if smart:
         #region debug-point smart-sell-core-exit

@@ -32,12 +32,13 @@ except Exception:  # pragma: no cover - 环境缺依赖时留错误证据即可
 STATUS_DIR = DATA_DIR / "automation_status"
 LATEST_FILE = DATA_DIR / "v10_data_freshness_latest.json"
 HISTORY_FILE = STATUS_DIR / "data_freshness_history.jsonl"
-TDX_HOSTS = [
-    ("218.75.126.9", 7709),
-    ("60.191.117.167", 7709),
-    ("39.105.251.234", 7709),
-    ("119.147.212.83", 7709),
-]
+try:
+    import tdx_hosts as _tdx_hosts
+except ImportError:  # run from another cwd
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import tdx_hosts as _tdx_hosts
+TDX_HOSTS = _tdx_hosts.TDX_HOSTS
 SAMPLE_STOCK = {"market": 1, "code": "600519", "name": "贵州茅台"}
 SAMPLE_INDEX = {"market": 1, "code": "000852", "name": "中证1000"}
 PHASE_RULES = {
@@ -100,11 +101,16 @@ def _connect_first_available() -> tuple[object | None, dict]:
             "detail": "pytdx is not available",
         }
 
-    for host, port in TDX_HOSTS:
+    for host, port in _tdx_hosts._ordered_candidates():
         api = TdxHq_API(heartbeat=True)
         item = {"host": host, "port": port, "connected": False, "error": ""}
         try:
             if api.connect(host, port, time_out=1.5):
+                # Measure the server the trading code would actually pick. A
+                # host that connects but returns no prices is not "available".
+                if not _tdx_hosts.serves_prices(api):
+                    item["error"] = "connected but returned no prices"
+                    raise ConnectionError(item["error"])
                 item["connected"] = True
                 attempts.append(item)
                 return api, {
@@ -324,7 +330,11 @@ def _evaluate_probe(
         **quote,
     }
 
-    if any(item["code"] in {"tdx_min5_missing", "tdx_min5_date_stale", "tdx_min5_lagged"} for item in payload["issues"]):
+    # Missing daily bars or quotes was only a "warning" - 33 times across the
+    # 09-10 outage, while the scanner and smart-sell ran blind. Without them
+    # neither can decide anything, so they rank with stale 5-minute bars.
+    if any(item["code"] in {"tdx_min5_missing", "tdx_min5_date_stale", "tdx_min5_lagged",
+                            "tdx_daily_missing", "tdx_quote_missing"} for item in payload["issues"]):
         payload["status"] = "degraded"
         payload["tdx_review"]["status"] = "degraded"
     elif payload["issues"]:

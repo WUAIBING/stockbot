@@ -186,19 +186,22 @@ class LiveTests(unittest.TestCase):
         self.assertIn("CST", got["fetched_at"])
         self.assertLess(lq.age_seconds(got), 30)
 
-    def test_a_halted_name_is_detected_by_volume_not_price(self):
-        """688432 有研硅, suspended since 2026-08-31.
+    def test_a_resumed_name_is_released_by_the_halt_guard(self):
+        """688432 有研硅: suspended 2026-09-01 to 09-09, trading again by 09-14.
 
-        THE BUG THIS REPLACES: the first version asserted price == 0.0, which
-        held during the session and broke after it. The feed quoted 0.00 at
-        12:27 and 45.22 at 15:07 on the same suspended day, so a price check
-        sees a normal-looking stock at a normal-looking price for something
-        that cannot be traded. Volume is zero either way.
+        This test used to assert 688432 WAS halted. It went on "passing" as a
+        skip from 09-10, because the price feed was dead - so nobody saw that
+        the fixture had gone stale when the stock resumed. The zero-volume rule
+        itself is covered by the synthetic-quote tests above; what only a live
+        check can show is that a stock coming back is not held as halted
+        forever. If it suspends again this skips, and says why.
         """
         q = lq.get_quotes(["688432"])
         if not q:
             self.skipTest("no TDX host reachable from here")
-        self.assertTrue(lq.is_halted(q["688432"]))
+        if not (q["688432"].get("volume") or 0):
+            self.skipTest("688432 is suspended again - fixture needs a current name")
+        self.assertFalse(lq.is_halted(q["688432"]))
 
     def test_a_trading_name_is_not_halted(self):
         q = lq.get_quotes(["600403"])

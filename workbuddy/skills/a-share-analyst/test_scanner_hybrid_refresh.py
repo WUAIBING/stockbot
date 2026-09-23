@@ -227,11 +227,15 @@ class ScannerHybridRefreshTests(unittest.TestCase):
                 return [{"amount": 1000.0, "price": 10.0}]
 
         buf = io.StringIO()
+        # The partial batch is still rejected - but an all-rejected snapshot no
+        # longer returns []. On 2026-09-10 that [] became a 0亿 "清淡市" and two
+        # sessions scanned nothing without an error. Now it refuses outright.
         with redirect_stdout(buf):
-            snapshot = scanner._collect_amount_snapshot(FakeApi(), stocks)
+            with self.assertRaises(scanner._tdx_hosts.TdxDataUnavailable):
+                scanner._collect_amount_snapshot(FakeApi(), stocks)
 
-        self.assertEqual(snapshot, [])
         self.assertIn("uncoded response count 1 != request count 2", buf.getvalue())
+        self.assertIn("不是清淡市", buf.getvalue())
 
     def test_collect_amount_snapshot_treats_null_codes_as_uncoded_positional_response(self) -> None:
         stocks = pd.DataFrame([

@@ -42,12 +42,13 @@ from datetime import datetime, timedelta, timezone
 # the same bug in smaller print - the stamp must say which market minute it is.
 CHINA = timezone(timedelta(hours=8))
 
-TDX_HOSTS = [
-    ("119.147.212.81", 7709),
-    ("119.147.212.83", 7709),
-    ("114.80.63.12", 7709),
-    ("180.153.18.170", 7709),
-]
+try:
+    import tdx_hosts as _tdx_hosts
+except ImportError:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import tdx_hosts as _tdx_hosts
+TDX_HOSTS = _tdx_hosts.TDX_HOSTS
 
 CONNECT_TIMEOUT = 3.0
 RETRIES = 2
@@ -81,20 +82,12 @@ def market_of(code):
 
 def _connect():
     from pytdx.hq import TdxHq_API
-    for _ in range(RETRIES):
-        for host, port in TDX_HOSTS:
-            api = TdxHq_API(heartbeat=True)
-            try:
-                if api.connect(host, port, time_out=CONNECT_TIMEOUT):
-                    return api, "%s:%d" % (host, port)
-            except Exception:
-                pass
-            try:
-                api.disconnect()
-            except Exception:
-                pass
-        time.sleep(0.3)
-    return None, None
+    # A quote tool that returns a connected-but-empty server returns nothing
+    # useful; accept only a host proven to price.
+    try:
+        return _tdx_hosts.connect_verified(TdxHq_API, time_out=CONNECT_TIMEOUT, heartbeat=True, log=None)
+    except _tdx_hosts.TdxDataUnavailable:
+        return None, None
 
 
 def get_quotes(codes):

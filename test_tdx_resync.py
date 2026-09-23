@@ -25,8 +25,10 @@ for 16/16 codes at counts 3, 50, 120 and 250, and both reachable hosts agreed.
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SKILL = Path(__file__).resolve().parent / "workbuddy" / "skills" / "a-share-analyst"
 sys.path.insert(0, str(SKILL))
@@ -37,9 +39,10 @@ import scanner_v10 as s  # noqa: E402
 class FakeApi:
     """Minimal pytdx stand-in that can fail a call and record reconnects."""
 
-    def __init__(self, fail_on=(), connect_ok=True):
+    def __init__(self, fail_on=(), connect_ok=True, serves_prices=True):
         self.fail_on = set(fail_on)
         self.connect_ok = connect_ok
+        self.serves = serves_prices
         self.calls = 0
         self.disconnects = 0
         self.connects = 0
@@ -58,9 +61,15 @@ class FakeApi:
     def disconnect(self):
         self.disconnects += 1
 
-    def connect(self, host, port):
+    def connect(self, host, port, time_out=None):
         self.connects += 1
         return self.connect_ok
+
+    def get_security_quotes(self, securities):
+        # A reconnect now has to prove the server prices, not just answers.
+        if not self.serves:
+            return []
+        return [{"code": c, "price": 10.0} for _m, c in securities]
 
 
 def reset_log():
@@ -71,6 +80,10 @@ class ResyncHelperTests(unittest.TestCase):
     def setUp(self):
         reset_log()
         self.addCleanup(reset_log)
+        cache = Path(tempfile.mkdtemp()) / "last_good.json"
+        p = mock.patch.object(s._tdx_hosts, "CACHE_FILE", cache)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_reconnects_and_reports_success(self):
         api = FakeApi()
@@ -81,7 +94,14 @@ class ResyncHelperTests(unittest.TestCase):
     def test_returns_false_when_every_host_refuses(self):
         api = FakeApi(connect_ok=False)
         self.assertFalse(s._resync_after_protocol_error(api, "test", "600519"))
-        self.assertEqual(api.connects, len(s.TDX_HOSTS))
+        self.assertEqual(api.connects, len(s._tdx_hosts._ordered_candidates()))
+
+    def test_a_host_that_connects_but_serves_nothing_is_not_a_recovery(self):
+        """2026-09-10: every host connected and returned empty. Reconnecting to
+        one of those and reporting success is how rows went on being trusted."""
+        api = FakeApi(serves_prices=False)
+        self.assertFalse(s._resync_after_protocol_error(api, "test", "600519"))
+        self.assertGreaterEqual(api.connects, 1)
 
     def test_each_resync_is_recorded(self):
         api = FakeApi()

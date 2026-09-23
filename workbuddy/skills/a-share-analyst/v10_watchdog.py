@@ -66,12 +66,13 @@ DATA_DIR = str(DATA_DIR)
 SCAN_CSV = os.path.join(DATA_DIR, 'v10_scan_full.csv')
 TRACK_FILE = os.path.join(DATA_DIR, 'v10_track_record.csv')
 
-TDX_HOSTS = [
-    ('218.75.126.9', 7709),
-    ('60.191.117.167', 7709),
-    ('112.74.214.43', 7727),
-    ('221.231.141.60', 7709),
-]
+try:
+    import tdx_hosts as _tdx_hosts
+except ImportError:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import tdx_hosts as _tdx_hosts
+TDX_HOSTS = _tdx_hosts.TDX_HOSTS
 
 # 通达信行业板块代码 → 名称映射（沪市 880xxx）
 SECTOR_MAP = {
@@ -136,14 +137,11 @@ CONFLUENCE_LOW = 20      # >=20 观察
 # ============================================================
 def connect_tdx():
     """连接TDX行情服务器"""
-    api = TdxHq_API()
-    for host, port in TDX_HOSTS:
-        try:
-            if api.connect(host, port):
-                return api
-        except Exception:
-            continue
-    return None
+    try:
+        api, _where = _tdx_hosts.connect_verified(TdxHq_API, heartbeat=False, log=None)
+        return api
+    except _tdx_hosts.TdxDataUnavailable:
+        return None
 
 
 def market_from_code(code):
