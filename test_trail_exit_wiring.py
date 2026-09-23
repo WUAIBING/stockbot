@@ -59,6 +59,11 @@ class FakeApi:
     def get_security_bars(self, category, market, code, start, count):
         return self.bars
 
+    def get_security_quotes(self, securities):
+        """A healthy server: answers with the requested code, priced at the latest bar."""
+        last = sorted(self.bars, key=lambda b: b["datetime"])[-1]["close"] if self.bars else 0
+        return [{"code": c, "price": last} for _m, c in securities]
+
     def to_df(self, rows):
         return pd.DataFrame(rows)
 
@@ -96,7 +101,9 @@ class VerdictTests(unittest.TestCase):
         class Broken(FakeApi):
             def get_security_bars(self, *a, **k):
                 raise OSError("reset")
-        v = mt._trail_exit_verdict(Broken([]), "600000", "2026-09-02", 100.0)
+        no_reconnect = mock.patch.object(mt._tdx_hosts, "reconnect_verified", return_value=False)
+        with no_reconnect, mock.patch("builtins.print"):
+            v = mt._trail_exit_verdict(Broken([]), "600000", "2026-09-02", 100.0)
         self.assertFalse(v["should_exit"])
         self.assertTrue(v["data_unavailable"])
 

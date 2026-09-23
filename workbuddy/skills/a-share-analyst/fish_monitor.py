@@ -137,7 +137,7 @@ def run(write=True):
     if not watch:
         print("watchlist is empty: %s" % WATCHLIST_FILE)
         return 0
-    api, where = tdx_hosts.connect_verified(log=None)
+    api, where = tdx_hosts.connect_verified(log=None, heartbeat=False)
     before = previous_states()
     items, alerts = [], []
     try:
