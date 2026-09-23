@@ -10114,6 +10114,7 @@ try:
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import trail_exit as _trail_exit
+import add_gates as _add_gates
 
 BUY_WINDOW = ((14, 50), (14, 57))
 MIDDAY_BUY_WINDOW = ((13, 0), (13, 30))
@@ -13007,6 +13008,26 @@ def do_add_position(dry_run=False):
                     print(f"  [SKIP] {code} {name} 跳过加仓: 需保留新机会预留现金")
                 continue
             cost = qty * cur_price
+
+        # ADDS STAY SHUT. Every add passes add_gates, which refuses unless
+        # TLFZ_ADD_GATES is on - and it is off, on purpose. Asked of 2.0M
+        # liquid stock-sessions (2015-2026), buying a stock that has just risen
+        # +10% underperforms at every horizon: -2.007% at 10 sessions (t-19.24),
+        # -5.325% at 60. This path added at about +4.5% (大肉激进加仓, target
+        # 1.6x) and in September took three names to 5-6.5% of NAV against the
+        # 2% build cap. With the trailing exit a winner is held anyway; adding
+        # to it bought the measured-negative part.
+        # If the gate is ever enabled (+20% profit, 5+ sessions held), note it
+        # cannot pass while ADD_POSITION_MAX_HOLD_DAYS keeps adds to days 1-4.
+        gate_ok, gate_checks = _add_gates.evaluate_add(
+            {'code': code, 'profit_pct': profit_pct},
+            hold_sessions=_hold_sessions(code, r.get('date', '')),
+        )
+        if not gate_ok:
+            why = '; '.join(str(c[2]) for c in gate_checks if not c[1]) or 'refused'
+            skipped_yield_new.append(f"{code}({mode} add_gate)")
+            print(f"  [SKIP] {code} {name} 跳过加仓: add_gates({why}) - 追涨加仓全市场实测为负")
+            continue
 
         add_list.append({
             'code': code,
