@@ -113,15 +113,22 @@ class SellRuleOrderTests(unittest.TestCase):
         self.assertIn("pnl_pct <= INTRADAY_HARD_STOP_PCT", SRC)
 
     def test_backstop_uses_the_constant_not_a_literal(self):
-        # The gate now measures TRADING sessions, not calendar days.
-        self.assertIn("hold_days_for_exit >= MAX_HOLD_DAYS", SRC)
+        # The gate now measures TRADING sessions, not calendar days. Since
+        # 2026-09-15 the trailing exit stretches the backstop to its own
+        # 40-session horizon when TLFZ_TRAIL_EXIT is on - still a named
+        # constant either way, which is what this test protects.
+        import re
+        self.assertRegex(SRC, r"elif hold_days_for_exit >= \(?(?:_trail_exit\.MAX_HOLD_SESSIONS if trail_on else )?MAX_HOLD_DAYS\)?:")
         self.assertNotIn("if hold_days >= 5:\n            sell_reason", SRC)
 
     def test_the_two_rules_are_mutually_exclusive(self):
         """elif, so a stopped-out position is not also labelled an expiry."""
         i = SRC.find("pnl_pct <= INTRADAY_HARD_STOP_PCT")
-        window = SRC[i:i + 700]
-        self.assertIn("elif hold_days_for_exit >= MAX_HOLD_DAYS", window)
+        # Wider than it was: the trailing-exit rule now sits between the stop
+        # and the backstop, in the same elif chain.
+        window = SRC[i:i + 2500]
+        self.assertRegex(window, r"elif hold_days_for_exit >= \(?(?:_trail_exit\.MAX_HOLD_SESSIONS if trail_on else )?MAX_HOLD_DAYS\)?:")
+        self.assertIn("elif trail_verdict and trail_verdict.get('should_exit'):", window)
 
 
 if __name__ == "__main__":

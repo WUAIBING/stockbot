@@ -116,8 +116,12 @@ rules:                        # 怎么干活，以及每条是被什么坑出来
     rule: 回测不得假设能在封死的涨跌停价成交；模拟第一个真正可成交的价格
     born_from: "复牌研究天真版 +12.78%，按真实成交 -7.83%——同一批事件，结论反号"
   - id: tests-never-touch-live-data
-    rule: 在服务器上跑测试必须指向数据副本并先断言隔离
+    rule: 测试运行时数据目录默认是空临时目录；指向实盘的数据目录直接拒绝
     born_from: "09-14 从软链的 /tmp 目录跑测试，package_paths 顺着软链写进实盘，覆盖了 13 个持仓的策略状态"
+    enforced_by: "package_paths.running_under_test_runner / is_live_path（2026-10-03 起由代码强制，不再靠记忆）"
+  - id: a-red-test-must-mean-something
+    rule: 全部测试必须常绿；失败要查清是代码、测试还是环境，不能挂着当「旧问题」
+    born_from: "12 个「历史失败」挂了数周：5 个是测试环境没带模块，5 个测已删除的功能，2 个读了服务器真实配置——没有一个是交易代码的错，但它们让真回归无处可见"
   - id: deploy-after-market-close
     rule: 合并与部署放在 15:00 收盘之后，午休（11:30-13:00）亦可
     born_from: 用户规则；DO 上跑着实盘

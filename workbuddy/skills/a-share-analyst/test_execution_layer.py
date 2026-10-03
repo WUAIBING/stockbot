@@ -1649,6 +1649,12 @@ class ExternalMarketReviewTests(unittest.TestCase):
             tmpdir_path = Path(tmpdir)
             (tmpdir_path / ".mx_apikey").write_text("demo-fallback-key\n", encoding="utf-8")
             with (
+                # Only the temp files. The real candidate list also reads the working
+                # directory and /etc/stockbot/trading-day.env, so on the droplet this
+                # resolved the live MX_API_URL and failed - the code was right, the
+                # test was not sealed.
+                patch.object(mx_api_env, "_candidate_files",
+                             return_value=[tmpdir_path / ".mx_apikey", tmpdir_path / ".env"]),
                 patch.object(mx_api_env, "REPO_ROOT", tmpdir_path),
                 patch.dict("os.environ", {"MX_APIKEY": "", "MX_API_URL": ""}, clear=False),
             ):
@@ -2045,6 +2051,13 @@ class SmartSellApplyTests(unittest.TestCase):
         # point of this test is that crossing the backstop refreshes live state
         # before artifacts are written, not the specific threshold.
         old_date = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+        # 14 calendar days used to mean ~10 trading sessions. Across National
+        # Day it is 8, the backstop did not fire, and this test failed on
+        # 2026-10-03 for reasons unrelated to what it checks. Pin the session
+        # count instead of trusting the calendar.
+        original_sessions = trader._hold_sessions
+        trader._hold_sessions = lambda *a, **k: trader.MAX_HOLD_DAYS + 2
+        self.addCleanup(setattr, trader, "_hold_sessions", original_sessions)
         holding_record = {
             "code": "688206",
             "name": "概伦电子",
