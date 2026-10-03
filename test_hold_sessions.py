@@ -127,7 +127,9 @@ class WiringTests(unittest.TestCase):
     SRC = (SKILL / "v10_moni_trader.py").read_text(encoding="utf-8")
 
     def test_the_exit_uses_the_session_count(self):
-        self.assertIn("hold_days_for_exit >= MAX_HOLD_DAYS", self.SRC)
+        # Either form counts sessions: the trailing exit (2026-09-15) only
+        # swaps which constant is compared.
+        self.assertRegex(self.SRC, r"elif hold_days_for_exit >= \(?(?:_trail_exit\.MAX_HOLD_SESSIONS if trail_on else )?MAX_HOLD_DAYS\)?:")
 
     def test_it_falls_back_to_calendar_days_when_unknown(self):
         """None means not knowable; the old behaviour is kept rather than guessed."""

@@ -39,17 +39,13 @@ class EntryQuantityTests(unittest.TestCase):
         self.assertEqual(trader.calc_buy_quantity(10.0, 0), 0)
         self.assertEqual(trader.calc_buy_quantity(10.0, -100), 0)
 
-    def test_override_amount_replaces_default(self):
-        qty = trader.calc_buy_quantity(10.0, amount=100000, override_amount=2000)
-        self.assertEqual(qty, 200)
-
-    def test_override_amount_zero_falls_back_to_zero(self):
-        qty = trader.calc_buy_quantity(10.0, amount=50000, override_amount=0)
-        self.assertEqual(qty, 0)
-
-    def test_override_none_uses_default_amount(self):
-        qty = trader.calc_buy_quantity(10.0, amount=5000, override_amount=None)
-        self.assertEqual(qty, 500)
+    # The three override_amount tests that lived here were removed on
+    # 2026-10-03. They tested a parameter the Kelly sizer used, and the sizer
+    # was deleted from calc_buy_quantity on 2026-08-07 inside commit 127f7ce
+    # ("Fix MX API blackhole hang...", which does not mention it). It sat
+    # behind MEP_USE_KELLY_SIZER, which was never set in production, so
+    # nothing live changed - these tests had been failing for eight weeks
+    # against a feature that no longer existed.
 
     def test_high_price_yields_fewer_shares(self):
         cheap = trader.calc_buy_quantity(5.0, 50000)
@@ -279,15 +275,9 @@ class StateManagementTests(unittest.TestCase):
 class KellyIntegrationTests(unittest.TestCase):
     """Verify the Kelly sizing integration points don't break existing contracts."""
 
-    def test_calc_buy_quantity_accepts_override_kwarg(self):
-        import inspect
-        sig = inspect.signature(trader.calc_buy_quantity)
-        self.assertIn("override_amount", sig.parameters)
-
-    def test_override_amount_has_default_none(self):
-        import inspect
-        sig = inspect.signature(trader.calc_buy_quantity)
-        self.assertIsNone(sig.parameters["override_amount"].default)
+    # Two signature tests for override_amount were removed with the three
+    # above, for the same reason. position_sizer itself is still importable and
+    # still tested below; nothing in the trader calls it.
 
     def test_position_sizer_importable_from_trader(self):
         from position_sizer import compute_position_weights, SizerConfig

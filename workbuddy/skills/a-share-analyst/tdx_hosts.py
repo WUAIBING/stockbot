@@ -71,10 +71,15 @@ TDX_HOSTS = VERIFIED_HOSTS + [h for h in LEGACY_HOSTS if h not in VERIFIED_HOSTS
 PROBE_SECURITIES = [(0, "000001"), (1, "600000")]
 PROBE_BAR_SECURITY = (1, "600000")
 
-CACHE_FILE = Path(os.environ.get(
-    "TDX_HOST_CACHE_FILE",
-    str(Path(__file__).resolve().parent.parent.parent / "a-share-analyst" / "tdx_host_last_good.json"),
-))
+# Through package_paths, so a test run gets its temp data dir and can never
+# write the live cache. This file used to build the path itself - which is how
+# a guard on package_paths alone would have been bypassed.
+try:
+    from package_paths import DATA_DIR as _DATA_DIR
+    _DEFAULT_CACHE = _DATA_DIR / "tdx_host_last_good.json"
+except Exception:  # standalone use outside the package
+    _DEFAULT_CACHE = Path(__file__).resolve().parent.parent.parent / "a-share-analyst" / "tdx_host_last_good.json"
+CACHE_FILE = Path(os.environ.get("TDX_HOST_CACHE_FILE", str(_DEFAULT_CACHE)))
 
 
 class TdxDataUnavailable(RuntimeError):
