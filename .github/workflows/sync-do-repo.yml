@@ -11,6 +11,11 @@ on:
         required: true
         default: false
         type: boolean
+      deploy_now:
+        description: Emergency only - deploy during a trading session instead of waiting for 15:05 China.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -25,7 +30,9 @@ jobs:
       - self-hosted
       - linux
       - stockbot-do
-    timeout-minutes: 30
+    # A push at 09:00 China on a trading day waits until 15:05 before syncing:
+    # up to ~365 minutes, plus the sync itself.
+    timeout-minutes: 400
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,6 +46,21 @@ jobs:
             "$GITHUB_WORKSPACE" \
             "$GITHUB_SHA" \
             "${{ github.ref_name }}"
+
+      # Merging to master deploys. Never into a running trading day: on a
+      # trading day the push waits until 15:05 China time, then syncs. Pushes
+      # queue behind each other (concurrency above), so the newest master is
+      # the last one deployed. Manual dry runs and an explicit deploy_now skip
+      # the wait; the push trigger never does.
+      - name: Wait for the market to close
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.deploy_now != 'true' }}
+        shell: bash
+        run: |
+          WAIT=$(python3 "$GITHUB_WORKSPACE/scripts/github-actions/deploy_window.py" "$GITHUB_WORKSPACE/workbuddy/skills/a-share-analyst")
+          if [ "${WAIT:-0}" -gt 0 ]; then
+            echo "Trading session in progress - deploying at 15:05 China, in ${WAIT}s."
+            sleep "$WAIT"
+          fi
 
       - name: Sync checkout to /opt/stockbot
         shell: bash
