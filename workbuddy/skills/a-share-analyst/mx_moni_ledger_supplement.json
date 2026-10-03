@@ -17,7 +17,8 @@
       "per_10_bonus": 4,
       "per_10_cash": 3,
       "time": 1781654400,
-      "source": "10转4派3元, credited to shareholders 2026-06-17; the stock opened 87.98 against a 124.54 close that morning"
+      "source": "10转4派3元, credited to shareholders 2026-06-17; the stock opened 87.98 against a 124.54 close that morning; broker credited 419 not 420 - the account sold 400 on 06-22 and 19 on 06-24 and the position was closed",
+      "resulting_quantity": 419
     }
   ]
 }

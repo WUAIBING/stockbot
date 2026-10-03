@@ -79,6 +79,18 @@ simulator charges no meaningful fees; that reconciliation only looked clean
 because a -11,717.70 error on 瑞可达 was cancelling it. Reasoning backwards from
 a gap produces a number that fits and is wrong.
 
+CORRECTION, 2026-10-03: THE SIMULATOR DOES CHARGE FEES.
+
+"No meaningful fees" above was inferred from one position, and the 191 left
+over on it was itself fee-sized. Measured from the balance endpoint across 37
+trading days (true cash = total_assets - total_pos_value, against the fills of
+each day), costs are 0.094% of buys and 0.157% of sells - ordinary commission
+plus stamp duty - and came to 6,575 on 5.85M of turnover between 2026-07-10 and
+2026-09-30. Realised P&L in this module is GROSS of them; account_books.py
+measures them and closes NAV change = realised + unrealised change - costs to
+the cent. The 12,090 residual quoted above predates that and should be read as
+unexplained-including-fees, not as evidence of hidden round trips.
+
 So: from 2026-06-01 the record is complete and authoritative. Before it, only
 positions still open INTO the window are visible at all.
 
@@ -182,8 +194,9 @@ def build_episodes(orders: Iterable[Mapping],
         002423 中粮资本, 9,000 bought 2026-03-20 at 11.06, sold 2026-06-04 at
         9.02. That single position is a 18,360 loss, and it accounts for 18,360
         of the 18,551 that otherwise separates rebuilt P&L from the account
-        lifetime figure - leaving 191, which also settles that this simulator
-        charges no meaningful commission or stamp duty.
+        lifetime figure - leaving 191. (That 191 was read as "no meaningful
+        fees". It is the fee: about 0.1% a side on a 180,000 round trip. See
+        the correction in the module docstring.)
 
     A sell still lacking an open lot is reported as unpaired rather than
     dropped, because a silently short ledger is what made the old one
@@ -229,7 +242,8 @@ def build_episodes(orders: Iterable[Mapping],
             res = apply_corporate_action(
                 list(lots[code]),
                 float(act.get("per_10_bonus") or 0.0),
-                float(act.get("per_10_cash") or 0.0))
+                float(act.get("per_10_cash") or 0.0),
+                act.get("resulting_quantity"))
             lots[code] = collections.deque(res["lots"])
             if res["cash_dividend"]:
                 dividends.append({"code": code, "time": act.get("time"),
@@ -291,7 +305,8 @@ def build_episodes(orders: Iterable[Mapping],
 
 
 def apply_corporate_action(lots: Sequence[Mapping], per_10_bonus: float,
-                           per_10_cash: float) -> dict:
+                           per_10_cash: float,
+                           resulting_quantity: int | None = None) -> dict:
     """Restate open lots across an ex date. A-share terms read 每10股转X派Y元.
 
     688800 瑞可达 was 10转4派3元: every ten shares became fourteen, and every ten
@@ -307,6 +322,13 @@ def apply_corporate_action(lots: Sequence[Mapping], per_10_bonus: float,
     Cash is returned separately rather than folded into the basis, because a
     dividend is realised money the moment it is paid, whether or not the position
     is ever closed.
+
+    resulting_quantity is the total the BROKER credited, when that is known and
+    differs from the formula. 瑞可达 on 300 shares should be 420; the account
+    then sold 400 and 19 and the position was gone, so it held 419. Without the
+    override the ledger carries one phantom share forever and can never match
+    the broker's positions - and a check that always fails is a check nobody
+    reads. Cost is preserved; only the count moves.
     """
     if per_10_bonus < 0 or per_10_cash < 0:
         raise ValueError("corporate action terms cannot be negative")
@@ -329,6 +351,15 @@ def apply_corporate_action(lots: Sequence[Mapping], per_10_bonus: float,
         adjusted["price"] = round(price * qty / new_qty, 6) if new_qty else price
         adjusted["corporate_action"] = "10转%g派%g" % (per_10_bonus, per_10_cash)
         out.append(adjusted)
+    if resulting_quantity is not None:
+        diff = int(resulting_quantity) - sum(int(l.get("remaining", 0) or 0) for l in out)
+        for lot in reversed(out):          # newest lot absorbs the difference
+            qty = int(lot.get("remaining", 0) or 0)
+            if diff and qty > 0 and qty + diff > 0:
+                cost = qty * float(lot["price"])
+                lot["remaining"] = lot["quantity"] = qty + diff
+                lot["price"] = round(cost / (qty + diff), 6)
+                break
     return {"lots": out, "cash_dividend": round(cash, 2)}
 
 
@@ -374,6 +405,55 @@ def share_count_anomalies(orders: Iterable[Mapping]) -> list[dict]:
                               else "bonus or capitalisation issue"),
             ))
     return sorted(out, key=lambda x: -x["extra_shares"])
+
+
+def closes(episodes: Sequence[Mapping]) -> list[dict]:
+    """One row per SELL ORDER - the unit a person means by "a trade".
+
+    build_episodes pairs fills lot by lot, so a sell that closes two buys comes
+    out as two rows. Anything keyed on the sell order then sees only the first:
+    智度股份 on 2026-08-17 was one sell of two lots, -2,680 in total, and the
+    episode history recorded -550 because the correction matched a single row.
+    Across the third quarter that under-reported losses by 3,293.
+
+    entry_price is the cost-weighted average of the lots consumed; pnl and
+    pnl_pct are computed on the totals, never averaged across rows.
+    """
+    grouped: dict[str, dict] = {}
+    for e in episodes:
+        key = str(e.get("sell_order_id") or "") or "noid:%s:%s" % (e.get("code"), e.get("sell_time"))
+        qty = int(e.get("quantity") or 0)
+        c = grouped.get(key)
+        if c is None:
+            c = grouped[key] = {
+                "sell_order_id": str(e.get("sell_order_id") or ""),
+                "code": e.get("code"), "name": e.get("name"),
+                "quantity": 0, "cost": 0.0, "proceeds": 0.0, "lots": 0,
+                "buy_time": e.get("buy_time"), "sell_time": e.get("sell_time"),
+                "exit_price": e.get("exit_price"), "buy_order_ids": [],
+                "source": "broker_fill",
+            }
+        c["quantity"] += qty
+        c["cost"] += float(e.get("entry_price") or 0) * qty
+        c["proceeds"] += float(e.get("exit_price") or 0) * qty
+        c["lots"] += 1
+        c["buy_time"] = min(c["buy_time"], e.get("buy_time"))
+        if e.get("buy_order_id") not in c["buy_order_ids"]:
+            c["buy_order_ids"].append(e.get("buy_order_id"))
+        if e.get("source") == "opening_lot":
+            c["source"] = "opening_lot"     # a hand-typed basis stays labelled
+    out = []
+    for c in grouped.values():
+        qty, cost = c["quantity"], c["cost"]
+        c["entry_price"] = round(cost / qty, 4) if qty else None
+        c["pnl"] = round(c["proceeds"] - cost, 2)
+        c["pnl_pct"] = round((c["proceeds"] / cost - 1.0) * 100.0, 4) if cost else None
+        c["hold_seconds"] = max(0, int(c["sell_time"] or 0) - int(c["buy_time"] or 0))
+        c["cost"] = round(cost, 2)
+        c["proceeds"] = round(c["proceeds"], 2)
+        out.append(c)
+    out.sort(key=lambda c: (c["sell_time"], c["sell_order_id"]))
+    return out
 
 
 def summarise(episodes: Sequence[Mapping]) -> dict:
