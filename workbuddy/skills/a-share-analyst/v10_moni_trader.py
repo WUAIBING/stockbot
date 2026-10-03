@@ -446,6 +446,19 @@ def _correct_episodes_from_broker_fills(episodes):
 
     Any failure leaves the episodes untouched. A wrong price is bad; a
     close-node phase that dies on the way to writing the day results is worse.
+
+    MATCHING IS ON THE SELL ORDER FIRST. An episode that carries its sell order
+    id takes that sale's numbers and no other's, summed across every buy lot the
+    sale closed. Matching by code and quantity - the only way before - gave a
+    two-lot sale the first lot alone: 智度股份 on 2026-08-17 lost 2,680 and was
+    recorded at -550, and across the third quarter that under-reported losses by
+    3,293. The looser match survives only for episodes with no usable id, and
+    only against sales nobody claimed by id.
+
+    The return value also counts 'unattributed' closes: sales the broker filled,
+    from the first episode's date on, that no episode covers. They are not added
+    to the file - there is no strategy context to attach - but 12 of them worth
+    -5,139 were invisible in Q3, and a total nobody can see cannot be reconciled.
     """
     episodes = [e for e in (episodes or []) if isinstance(e, dict)]
     if not episodes:
@@ -465,31 +478,47 @@ def _correct_episodes_from_broker_fills(episodes):
         opening, actions = _load_ledger_supplement()
         broker = _ledger.build_episodes(orders, opening_lots=opening,
                                         corporate_actions=actions)['episodes']
-        rebuilt = _ledger.rebuild_episode_history(broker, episodes)
+        closes = _ledger.closes(broker)
+        by_id = {c['sell_order_id']: c for c in closes if c['sell_order_id']}
+        claimed = {}
+        for index, episode in enumerate(episodes):
+            sid = str(episode.get('sell_order_id', '') or '').strip()
+            if sid and sid in by_id and sid not in claimed:
+                claimed[sid] = index
+        exact = {index: by_id[sid] for sid, index in claimed.items()}
+        loose = [e for index, e in enumerate(episodes) if index not in exact]
+        unclaimed = [b for b in broker if str(b.get('sell_order_id') or '') not in claimed]
+        rebuilt = _ledger.rebuild_episode_history(unclaimed, loose)
+        day_of = _ledger._day
     except Exception as exc:  # noqa: BLE001 - reported, never raised into close-node
         for e in episodes:
             e['price_verified'] = False
         return {'corrected': 0, 'unverified': len(episodes),
                 'reason': 'correction failed: %s' % exc}
 
-    by_sell_order = {}
-    for row in rebuilt.get('episodes', []):
-        if row.get('metadata_source') == 'local_episode' and row.get('sell_order_id'):
-            by_sell_order.setdefault(str(row['sell_order_id']), row)
-
     corrected = 0
     changed = []
-    matched_rows = [r for r in rebuilt.get('episodes', [])
-                    if r.get('metadata_source') == 'local_episode']
-    pool = list(matched_rows)
-    for episode in episodes:
+    pool = [r for r in rebuilt.get('episodes', [])
+            if r.get('metadata_source') == 'local_episode']
+    loosely_matched = set()
+    for index, episode in enumerate(episodes):
         code = str(episode.get('code', '')).zfill(6)
         hit = None
-        for i, row in enumerate(pool):
-            if str(row.get('code', '')).zfill(6) != code:
-                continue
-            hit = pool.pop(i)
-            break
+        close = exact.get(index)
+        if close is not None:
+            hit = {
+                'entry_price': close['entry_price'], 'sell_price': close['exit_price'],
+                'pnl': close['pnl'], 'pnl_pct': close['pnl_pct'], 'quantity': close['quantity'],
+                'buy_date': day_of(close['buy_time']), 'sell_date': day_of(close['sell_time']),
+                'hold_days': max(0, close['hold_seconds'] // 86400),
+            }
+        else:
+            for i, row in enumerate(pool):
+                if str(row.get('code', '')).zfill(6) != code:
+                    continue
+                hit = pool.pop(i)
+                loosely_matched.add(str(hit.get('sell_order_id') or ''))
+                break
         if hit is None:
             episode['price_verified'] = False
             continue
@@ -507,8 +536,314 @@ def _correct_episodes_from_broker_fills(episodes):
             changed.append('%s %.4f->%.4f' % (code, before, after))
 
     unverified = sum(1 for e in episodes if not e.get('price_verified'))
+    days = sorted(d for d in (str(e.get('sell_date', '') or '')[:10] for e in episodes) if d)
+    stray = [c for c in closes
+             if days and day_of(c['sell_time']) >= days[0]
+             and c['sell_order_id'] not in claimed and c['sell_order_id'] not in loosely_matched]
     return {'corrected': corrected, 'unverified': unverified,
-            'changed': changed[:20], 'reason': 'ok'}
+            'changed': changed[:20], 'reason': 'ok',
+            'unattributed': {'count': len(stray), 'pnl': round(sum(c['pnl'] for c in stray), 2)}}
+
+
+# === 账本核对 (books from broker fills) ===
+# The printed scoreboard summed local records whose entry prices came from
+# quotes: for Q3 2026 it claimed +31,591 while the account lost 35,887. The
+# episode history had been corrected in August, but the records themselves -
+# which feed the scoreboard, the tier and mode tables, the NAV log and the
+# model - never were. So they are settled against the broker where they are
+# LOADED, by exact sell order id, and the full books are reconciled once a day
+# at the close. See account_books.py.
+BOOKS_FILE = str(DATA_DIR / 'v10_account_books_latest.json')
+# The order archive is refreshed at 15:02 and the close report runs at 15:06.
+# Positions can only be checked share for share against a ledger that already
+# holds the day's fills, so an archive older than this is reported, not trusted.
+BOOKS_ARCHIVE_FRESH_SECONDS = 3600
+_BROKER_LEDGER_CACHE = {}
+
+
+def _file_stamp(path):
+    try:
+        st = os.stat(path)
+        return (str(path), st.st_mtime, st.st_size)
+    except OSError:
+        return (str(path), None, None)
+
+
+def _unfilled_sell_orders(orders, ledger_module):
+    """Sell orders the broker lists with nothing filled: {order id: China day}."""
+    out = {}
+    for o in orders:
+        if not isinstance(o, dict) or o.get('drt') != ledger_module.DRT_SELL or ledger_module.is_filled(o):
+            continue
+        try:
+            day = datetime.fromtimestamp(int(o.get('time')), MARKET_TZ).strftime('%Y-%m-%d')
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+        if o.get('id'):
+            out[str(o['id'])] = day
+    return out
+
+
+def _broker_ledger():
+    """Broker fills paired into closes, or {} when the archive is unusable.
+
+    Cached on the archive and supplement files' stamps: load_track_record runs
+    several times in a phase and the archive changes once a day.
+    """
+    key = (_file_stamp(MX_ORDERS_ARCHIVE_FILE), _file_stamp(MX_LEDGER_SUPPLEMENT_FILE))
+    if _BROKER_LEDGER_CACHE.get('key') == key:
+        return _BROKER_LEDGER_CACHE.get('value') or {}
+    value = {}
+    try:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import mx_moni_ledger as _ledger
+
+        archive = _read_json(MX_ORDERS_ARCHIVE_FILE) or {}
+        orders = archive.get('orders') if isinstance(archive, dict) else None
+        if orders:
+            opening, actions = _load_ledger_supplement()
+            full = _ledger.build_episodes(orders, opening_lots=opening, corporate_actions=actions)
+            closes = _ledger.closes(full['episodes'])
+            value = {
+                'orders': orders, 'opening': opening, 'actions': actions, 'closes': closes,
+                'by_sell_order': {c['sell_order_id']: c for c in closes if c['sell_order_id']},
+                'unfilled_sells': _unfilled_sell_orders(orders, _ledger),
+            }
+    except Exception as exc:  # noqa: BLE001 - reported, never raised into a trading phase
+        print(f" [WARN] 券商成交账本不可用: {exc}")
+        value = {}
+    _BROKER_LEDGER_CACHE['key'] = key
+    _BROKER_LEDGER_CACHE['value'] = value
+    return value
+
+
+def _usable_close(close):
+    return bool(close) and bool(close.get('quantity')) and close.get('pnl_pct') is not None
+
+
+def _write_close_onto_record(record, close):
+    """One broker close's numbers onto one record. Returns how far the PnL moved."""
+    before = _fnum(record.get('pnl', 0.0), 0.0)
+    record['entry_price'] = f"{close['entry_price']:.4f}"
+    record['sell_price'] = f"{close['exit_price']:.4f}"
+    record['quantity'] = str(close['quantity'])
+    record['buy_amount'] = f"{close['cost']:.2f}"
+    record['pnl'] = f"{close['pnl']:.2f}"
+    record['pnl_pct'] = f"{close['pnl_pct']:.4f}"
+    record['price_source'] = 'broker_fill'
+    return abs(before - close['pnl'])
+
+
+def _real_sales_for_dead_orders(records, ledger, today):
+    """Pair records whose sell order never filled with the sale that did happen.
+
+    A sell order the broker accepted and then never filled has been booked as a
+    sale: 城投控股 was recorded sold on 2026-09-09 at 3.97 (-212) by an order
+    that died unfilled, and was really sold on 09-15 at 3.76 (-1,325) by an order
+    no record carried. The record is the right trade with the wrong sale on it,
+    and the real sale showed up as a loss "with no local record".
+
+    A record is re-pointed only when all of this holds, and is otherwise left:
+      - the broker lists its sell order, from an EARLIER session, with nothing
+        filled - an order that can no longer become the sale. An id the archive
+        has never seen proves nothing: today's sales are not in it until 15:02;
+      - exactly one sale that no record cites sold the same quantity out of the
+        record's own buy orders;
+      - no other such record wants that sale.
+    Returns [(record, close)].
+    """
+    dead = {oid for oid, day in (ledger.get('unfilled_sells') or {}).items() if day < today}
+    if not dead:
+        return []
+    cited = {str(r.get('sell_order_id', '')).strip() for r in records}
+    free = [c for c in ledger.get('closes') or []
+            if _usable_close(c) and c['sell_order_id'] and c['sell_order_id'] not in cited]
+    wanted = {}
+    for record in records:
+        if str(record.get('sell_order_id', '')).strip() not in dead:
+            continue
+        buys = set(_split_order_ids(record.get('buy_order_ids', '')))
+        quantity = _inum(record.get('quantity', 0), 0)
+        code = str(record.get('code', '')).strip().zfill(6)
+        if not buys or quantity <= 0:
+            continue
+        hits = [c for c in free
+                if str(c.get('code', '')).zfill(6) == code and c['quantity'] == quantity
+                and set(c['buy_order_ids']) <= buys]
+        if len(hits) == 1:
+            wanted.setdefault(hits[0]['sell_order_id'], []).append((record, hits[0]))
+    return [pairs[0] for pairs in wanted.values() if len(pairs) == 1]
+
+
+def _settle_closed_records_from_broker(closed_records, today=None):
+    """Overwrite closed records' execution fields with what the broker filled.
+
+    Matched on the sell order id, exactly - no fuzzy matching, so a record can
+    only ever take the numbers of its own sale. A sell that closed several buys
+    is one close with a cost-weighted entry. Records the broker cannot vouch for
+    are left as they are and labelled, never dropped: today's sales are not in
+    the archive until 15:02, and they settle on the next load after that.
+
+    The one exception is a record whose sell order the broker says never filled:
+    see _real_sales_for_dead_orders. Its sale fields (order id, date, time, hold
+    days) are re-pointed to the sale that really closed it, and the dead order's
+    id is kept in 'sell_order_id_unfilled'.
+
+    Strategy fields (mode, tier, reasons, buy date) are not touched.
+    """
+    result = {'settled': 0, 'changed': 0, 'unverified': 0, 'repointed': 0, 'reason': 'ok'}
+    ledger = _broker_ledger() or {}
+    by_id = ledger.get('by_sell_order') or {}
+    if not by_id:
+        result['reason'] = 'no broker ledger'
+        return result
+    seen = Counter(str(r.get('sell_order_id', '')).strip() for r in closed_records)
+    pending = []
+    for record in closed_records:
+        sid = str(record.get('sell_order_id', '')).strip()
+        close = by_id.get(sid) if sid and seen[sid] == 1 else None
+        if not _usable_close(close):
+            pending.append(record)
+            continue
+        result['settled'] += 1
+        if _write_close_onto_record(record, close) > 0.5:
+            result['changed'] += 1
+    # Every record's citation counts, settled or not: a sale any record already
+    # names is never handed to another.
+    repointed = _real_sales_for_dead_orders(closed_records, ledger, today or _market_today())
+    for record, close in repointed:
+        sold = datetime.fromtimestamp(int(close['sell_time']), MARKET_TZ)
+        record['sell_order_id_unfilled'] = str(record.get('sell_order_id', '')).strip()
+        record['sell_order_id'] = close['sell_order_id']
+        record['sell_date'] = sold.strftime('%Y-%m-%d')
+        record['sell_time'] = sold.strftime('%H:%M:%S')
+        try:
+            bought = datetime.strptime(str(record.get('date', '')).strip(), '%Y-%m-%d')
+            record['hold_days'] = str(max((sold.date() - bought.date()).days, 0))
+        except ValueError:
+            pass
+        result['settled'] += 1
+        result['repointed'] += 1
+        if _write_close_onto_record(record, close) > 0.5:
+            result['changed'] += 1
+    done = {id(record) for record, _close in repointed}
+    for record in pending:
+        if id(record) not in done:
+            record['price_source'] = 'local_unverified'
+            result['unverified'] += 1
+    return result
+
+
+def _nav_snapshots():
+    """Balance snapshots from the NAV log, stamped as epoch seconds.
+
+    The log is written with datetime.now(), so its clock is this process's own
+    local time - UTC on the server. mktime reads it back the same way.
+    """
+    out = []
+    for row in _read_csv_rows(NAV_FILE, strip_bom=True):
+        try:
+            stamp = datetime.strptime(f"{row.get('date', '')} {row.get('time', '')}", '%Y-%m-%d %H:%M:%S')
+            out.append({'ts': int(time.mktime(stamp.timetuple())),
+                        'total_assets': row.get('total_assets'),
+                        'total_pos_value': row.get('total_pos_value')})
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return out
+
+
+def _refresh_account_books(account, positions, records=None):
+    """Reconcile the account at the close and write BOOKS_FILE. Never raises.
+
+    NAV change = realised + unrealised change + dividends - costs, every term
+    from the broker. Positions are checked share for share only when the order
+    archive already holds today's fills; a stale archive is reported as a
+    problem rather than quietly compared against.
+    """
+    try:
+        import account_books as _books
+
+        ledger = _broker_ledger()
+        if not ledger:
+            return {}
+        snapshots = _nav_snapshots()
+        snapshots.append({'ts': int(time.time()),
+                          'total_assets': (account or {}).get('total_assets'),
+                          'total_pos_value': (account or {}).get('total_pos_value')})
+        archive_age = time.time() - (_file_stamp(MX_ORDERS_ARCHIVE_FILE)[1] or 0)
+        fresh = archive_age <= BOOKS_ARCHIVE_FRESH_SECONDS
+        books = _books.books(
+            ledger['orders'], snapshots,
+            opening_lots=ledger['opening'], corporate_actions=ledger['actions'],
+            positions=(positions or []) if fresh else None,
+        )
+        if not fresh and 'window' in books:
+            books['verified'] = False
+            books.setdefault('problems', []).append(
+                '成交归档已 %.1f 小时未更新，未做逐股核对' % (archive_age / 3600.0))
+        if records is not None and 'window' in books:
+            known = {str(r.get('sell_order_id', '')).strip()
+                     for r in records if str(r.get('status', '')).strip() == 'closed'}
+            lo, hi = books['window']['from_ts'], books['window']['to_ts']
+            stray = [c for c in ledger['closes']
+                     if lo < c['sell_time'] <= hi and c['sell_order_id'] not in known]
+            books['unattributed'] = {
+                'count': len(stray), 'pnl': round(sum(c['pnl'] for c in stray), 2),
+                'items': [{'code': c['code'], 'name': c['name'], 'pnl': c['pnl'],
+                           'sell_order_id': c['sell_order_id']} for c in stray[:30]],
+            }
+            closed = [r for r in records if str(r.get('status', '')).strip() == 'closed']
+            books['local_records'] = {
+                'closed': len(closed),
+                'broker_fill': sum(1 for r in closed if r.get('price_source') == 'broker_fill'),
+                'repointed': sum(1 for r in closed if r.get('sell_order_id_unfilled')),
+                'unverified': sum(1 for r in closed if r.get('price_source') != 'broker_fill'),
+            }
+        books['generated_at'] = _now_str()
+        _write_json_atomic(BOOKS_FILE, books)
+        return books
+    except Exception as exc:  # noqa: BLE001 - the close report must still be written
+        print(f" [WARN] 账本核对失败: {exc}")
+        return {}
+
+
+def _books_lines(books):
+    """The reconciliation as the lines the status and close report print."""
+    if not isinstance(books, dict) or 'window' not in books:
+        return []
+    closes = books.get('closes') or {}
+    verdict = '通过' if books.get('verified') else '未通过'
+    lines = [
+        f" 账本核对（券商成交口径）{books['window']['from_day']} → {books['window']['to_day']}: {verdict}",
+        f"  净值变动 ¥{books['nav_change']:+,.0f} = 已实现 {books['realised_pnl']:+,.0f}"
+        f" + 浮动变动 {books['unrealised_change']:+,.0f} + 分红 {books['dividends']:+,.0f}"
+        f" − 成本 {books['costs']:,.0f}（差额 {books['residual']:+.2f}）",
+    ]
+    if closes.get('count'):
+        lines.append(
+            f"  平仓 {closes['count']} 笔 | 胜率 {closes['win_rate_pct']:.1f}% | 平均 {closes['avg_return_pct']:+.2f}%"
+            f" | 扣成本后 ¥{closes['realised_after_costs']:+,.0f}（成本占成交额 {books['cost_rate_pct']:.3f}%）")
+    local = books.get('local_records') or {}
+    if local.get('unverified') or local.get('repointed'):
+        parts = [f"{local.get('broker_fill', 0)} 笔按券商成交结算"]
+        if local.get('repointed'):
+            parts.append(f"其中 {local['repointed']} 笔原卖单未成交、已改记到真实卖出")
+        if local.get('unverified'):
+            parts.append(f"{local['unverified']} 笔未能核实")
+        lines.append(f"  本地记录 {local.get('closed', 0)} 笔: " + '，'.join(parts))
+    stray = books.get('unattributed') or {}
+    if stray.get('count'):
+        lines.append(f"  另有 {stray['count']} 笔券商平仓本地无记录（{stray['pnl']:+,.0f}），已计入上面的已实现")
+    for day in (books.get('unusual_days') or [])[:5]:
+        lines.append(f"  异常现金 {day['day']}: {day['cash_gap']:+,.2f}"
+                     f"（{'无成交日' if not day.get('had_fills') else '有成交日'}，疑似分红或漏记）")
+    for problem in (books.get('problems') or [])[:5]:
+        lines.append(f"  [问题] {problem}")
+    return lines
+
+
 LEARNING_ACTIONS_FILE = str(DATA_DIR / 'v10_learning_actions_latest.json')
 REGIME_EXECUTION_HISTORY_FILE = str(DATA_DIR / 'v10_regime_execution_history.jsonl')
 OPENING_TRADABILITY_FILE = str(DATA_DIR / 'opening_tradability_latest.json')
@@ -1553,11 +1888,25 @@ def _append_regime_execution_history(review, *, source='close_node'):
     })
 
 
-def _read_csv_rows(path):
+def _read_csv_rows(path, *, strip_bom=False):
+    """Rows of a CSV as dicts.
+
+    KNOWN DEFECT, LEFT IN PLACE ON PURPOSE. The default tries plain utf-8 first,
+    and that "succeeds" on a file with a byte-order mark - so the first column
+    comes back named '<U+FEFF>date' or '<U+FEFF>code' and row.get('date') is None.
+    Every CSV this system writes carries that mark. Two close-node learners have
+    therefore been reading nothing: the missed-opportunity review (scan snapshots
+    keyed by an empty code, which zfill turns into '000000') and the recent-NAV
+    execution review.
+
+    strip_bom=True reads correctly, and new code must pass it. The default is
+    not flipped here because doing so switches those two learners on, and what
+    they would then feed back into trading has not been measured yet.
+    """
     csv_path = Path(path)
     if not csv_path.exists():
         return []
-    for encoding in ('utf-8', 'utf-8-sig'):
+    for encoding in (('utf-8-sig', 'utf-8') if strip_bom else ('utf-8', 'utf-8-sig')):
         try:
             with csv_path.open('r', encoding=encoding, newline='') as f:
                 return [dict(row) for row in csv.DictReader(f)]
@@ -6088,6 +6437,10 @@ def load_track_record(*, positions=None, decision_reference=None):
     active_positions = positions if positions is not None else get_positions()
     state_map = _load_position_state()
     closed_records, open_records = _build_runtime_trade_records(decision_reference=reference)
+    # Settle against the broker HERE, where every consumer loads from: the
+    # scoreboard, the tier and mode tables, the NAV log and the model all sum
+    # these records, and their entry prices came from quotes.
+    _settle_closed_records_from_broker(closed_records)
     holding_records = _build_runtime_holding_records(
         positions=active_positions,
         decision_reference=reference,
@@ -7002,6 +7355,11 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
     )
     # #endregion
     floating_pnl = account['floating_pnl']
+    # Reconciled once a day, at the close report: that is the one moment the
+    # order archive (15:02) already holds every fill behind the positions.
+    books = _refresh_account_books(account, positions, records) if (account_live and tag == 'report') else {}
+    if not books:
+        books = _read_json(BOOKS_FILE) or {}
     nav_row = {
         'date': now.strftime('%Y-%m-%d'),
         'time': now.strftime('%H:%M:%S'),
@@ -7073,6 +7431,7 @@ def write_account_artifacts(tag='snapshot', *, balance=None, positions=None, rec
             'all_holding_count': stats['all_holding_count'],
             'all_closed_count': stats['all_closed_count'],
         },
+        'books': books,
         'tier_summary': tier_summary,
         'mode_summary_top10': mode_summary[:10],
         'learning_notes': learning_notes or ["样本不足，继续积累成交并观察模式表现。"],
@@ -8552,6 +8911,7 @@ def _build_daily_evolution_bundle(*, summary, records, trade_date=None):
     elif _fill_correction.get('reason') != 'ok':
         print(f" [WARN] 成交记录校正未执行: {_fill_correction.get('reason')}")
     history_summary = _summarize_trade_episode_history(trade_episode_history)
+    history_summary['unattributed_broker_closes'] = _fill_correction.get('unattributed') or {}
     today_episodes = [
         dict(item)
         for item in trade_episode_history
@@ -12410,6 +12770,10 @@ def _print_stats(records):
                 tier_wr = len(tier_wins) / len(tier_trades) * 100 if tier_trades else 0
                 tier_avg = sum(_fnum(r.get('pnl_pct', 0.0), 0.0) for r in tier_trades) / len(tier_trades)
                 print(f"  T{tier}: {len(tier_trades)}笔 | 胜率{tier_wr:.0f}% | 平均{tier_avg:+.2f}%")
+    # The lines above cover the trades the local records know about. These are
+    # the whole account, from the broker, and say whether the two agree.
+    for line in _books_lines(_read_json(BOOKS_FILE) or {}):
+        print(line)
 
 
 def do_status():
@@ -13685,11 +14049,12 @@ def repair_closed_episode_from_mx_orders(code, *, buy_order_ids, sell_order_id):
     # too. Without this, running a fill repair silently republishes uncorrected
     # prices over the corrected ones - and the learning layer would go straight
     # back to believing vol_breakout averages +161% when it averages +0.11%.
-    _correct_episodes_from_broker_fills(episodes)
+    _repair_correction = _correct_episodes_from_broker_fills(episodes)
     _write_json_atomic(TRADE_EPISODE_HISTORY_FILE, {
         'generated_at': _now_str(),
         'trade_date': _market_today(),
-        'summary': _summarize_trade_episode_history(episodes),
+        'summary': dict(_summarize_trade_episode_history(episodes),
+                        unattributed_broker_closes=_repair_correction.get('unattributed') or {}),
         'episodes': episodes,
     })
     balance = get_balance()
